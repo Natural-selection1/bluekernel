@@ -14,6 +14,9 @@
 
 #![no_std]
 
+#[cfg(armv7m)]
+pub mod application;
+
 pub mod syscalls {
     //! BlueOS's syscall calling convention is compatible with Linux.
     // FIXME: We should really consider stable syscall nr.
@@ -31,6 +34,7 @@ pub mod syscalls {
         AtomicWake,
         AllocMem,
         FreeMem,
+        ReallocMem,
         Write,
         Close,
         Read,
@@ -91,6 +95,14 @@ pub mod syscalls {
         TimerSetTime,
         TimerGetOverrun,
         Rename,
+        #[cfg(armv7m)]
+        ApplicationLaunch,
+        #[cfg(armv7m)]
+        ApplicationInitComplete,
+        #[cfg(armv7m)]
+        ApplicationBeginExit,
+        #[cfg(armv7m)]
+        ApplicationFinishExit,
         LastNR,
     }
 }

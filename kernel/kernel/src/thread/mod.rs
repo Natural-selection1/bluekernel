@@ -44,6 +44,11 @@ use core::{
 mod builder;
 pub use builder::*;
 
+/// Retirement cleanups that have to run outside the context-switch path.
+/// Only a configuration with a drainer compiles it.
+#[cfg(all(enable_vfs, dynamic_loader))]
+pub mod deferred;
+
 pub type ThreadNode = Arc<Thread>;
 
 pub enum Entry {
@@ -53,6 +58,11 @@ pub enum Entry {
         *mut core::ffi::c_void,
     ),
     Closure(Box<dyn FnOnce()>),
+    /// A runtime-resolved code address plus its first argument. The caller is
+    /// responsible for preserving any architecture-specific entry-mode bits.
+    /// The address is installed directly as the initial PC without a
+    /// trampoline, so the target must terminate the thread itself.
+    Raw(usize, *mut core::ffi::c_void),
 }
 
 impl core::fmt::Debug for Entry {
@@ -88,14 +98,7 @@ impl Stack {
     #[inline]
     pub fn from_size(size: usize) -> Option<Self> {
         let layout = Layout::from_size_align(size, core::mem::align_of::<Context>()).ok()?;
-        let storage = Storage::from_layout(layout);
-        // Storage::from_layout does not check for allocation failure (it returns
-        // a Storage holding a null base). Detect that here so callers can fail
-        // gracefully via Option instead of silently creating a thread with a
-        // null stack, which would crash/hang the scheduler with no diagnostics.
-        if storage.base().is_null() {
-            return None;
-        }
+        let storage = Storage::try_from_layout(layout)?;
         Some(Self(storage))
     }
 
@@ -197,7 +200,8 @@ pub struct Thread {
     // Cleanup function will be invoked when retiring.
     cleanup: Option<Entry>,
     kind: ThreadKind,
-    // Thread owns Stack::Alloc. It calls dealloc when dropping its self.
+    // The stack backing records its own generic ownership policy and is
+    // released only after the scheduler has switched away from this thread.
     stack: Stack,
     // If saved_sp is 0, the thread should be in RUNNING state. Otherwise, it's
     // switching context or is in a non RUNNING state.
@@ -635,6 +639,7 @@ impl Thread {
                 .set_return_address(run_posix as *const () as usize)
                 .set_arg(0, unsafe { f as usize })
                 .set_arg(1, unsafe { arg as usize }),
+            Entry::Raw(pc, arg) => ctx.set_return_address(pc).set_arg(0, arg as usize),
         };
         self
     }

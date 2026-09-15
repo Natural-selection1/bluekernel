@@ -249,4 +249,3 @@ SECTIONS
 
 EXTERN(handle_hardfault);
 PROVIDE(handle_memfault = handle_hardfault);
-
