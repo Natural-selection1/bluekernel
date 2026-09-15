@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(not(dynamic_image))]
 extern crate librs;
+#[cfg(not(dynamic_image))]
 extern crate rsrt;
 use std::{
     io::{self, Write},
@@ -20,6 +22,7 @@ use std::{
 };
 
 mod commands;
+mod platform;
 use commands::COMMANDS;
 
 #[cfg(not(enable_vfs))]

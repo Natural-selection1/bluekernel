@@ -22,7 +22,7 @@
 //! no ordinary kernel Rust/C symbol is referenced.
 //!
 //! It is pulled in exclusively by the `blueos_dso("libc")` target via the
-//! `librs_dso` cfg; every other `librs` target compiles it out.
+//! `dynamic_image` cfg; every other `librs` target compiles it out.
 
 use core::alloc::{GlobalAlloc, Layout};
 

@@ -62,7 +62,7 @@ run_clippy("librs_swi_clippy") {
   deps = [ ":librs_swi" ]
 }
 
-if (defined(dynamic_loader) && dynamic_loader) {
+if (dynamic_loader) {
   if (defined(dynamic_atomic)) {
     # RV32IMC has no hardware atomics. Reuse the kernel's IRQ-protected
     # helpers, with a PIC machine-mode IRQ adapter for the flat application ABI.
@@ -80,7 +80,7 @@ if (defined(dynamic_loader) && dynamic_loader) {
     crate_name = "librs"
     soname = "libc.so.1"
     sources = [ "src/lib.rs" ]
-    cfgs = _thumb_cfgs + [ "librs_dso" ]
+    cfgs = _thumb_cfgs
     deps = [
       "//external/vendor/spin-0.9.8:spin",
       "//kernel/header:blueos_header",

@@ -29,6 +29,7 @@ import("//build/templates/rust.gni")
 # is linked whole and first so `_start` becomes the PIE entry.
 #
 # Produces :<name>, the linked `bin/<name>` (ET_DYN PIE).
+# Adds `cfg(dynamic_image)` for code shared with static application targets.
 template("dynamic_app") {
   assert(defined(invoker.sources), "dynamic_app requires `sources`")
 
@@ -42,6 +43,10 @@ template("dynamic_app") {
                              "start_object",
                            ])
     crate_type = "bin"
+    if (!defined(cfgs)) {
+      cfgs = []
+    }
+    cfgs += [ "dynamic_image" ]
     configs += [ "//build/boards/${board}:dynamic_config" ]
 
     # A dynamic application brings its own `blueos_scrt1` start object; the

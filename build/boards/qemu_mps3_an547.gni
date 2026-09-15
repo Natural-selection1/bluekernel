@@ -21,8 +21,8 @@ qemu_extra_args = []
 qemu_net_args = []
 qemu_block_args = []
 
-dynamic_loader = true
-boot_dynamic_seed = true
+board_dynamic_loader = true
+board_boot_dynamic_seed = true
 
 board_deps = [
   "//build/boards/${board}:default_linker_script",

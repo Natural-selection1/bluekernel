@@ -13,35 +13,80 @@
 # limitations under the License.
 
 import("//build/boards/${board}.gni")
+import("//build/templates/build_template.gni")
+import("//build/templates/dynamic_app.gni")
 import("//build/templates/reload_autoconf_and_build.gni")
-import("//build/templates/rust.gni")
 import("//build/toolchain/blueos.gni")
 
-reload_autoconf_and_build("shell") {
-  app_conf = [ "app.conf" ]
-  crate_name = "shell"
-  crate_type = "bin"
-  sources = [ "src/main.rs" ]
-  deps = [
-    "//external/vendor/phf-0.12.1:phf",
-    "//kernel/kconfig:generate_rustflags_file",
-    "//kernel/rsrt:rsrt_std",
-    "//libc",
-    "//librs",
-  ]
-  linker_script = default_linker_script
-  configs = [
-    "//build/boards/${board}:kernel_config",
-    "//kernel/kconfig:kconfigs",
-  ]
+if (dynamic_loader) {
+  # Share the std shell with static builds; only its startup and libc linkage
+  # differ.
+  dynamic_app("shell") {
+    sources = [ "src/main.rs" ]
+    configs = [
+      "//build/config:${build_type}",
+      "//kernel/kconfig:kconfigs",
+    ]
+    start_object = "//librs:blueos_scrt1"
+    deps = [
+      "//external/vendor/phf-0.12.1:phf",
+      "//kernel/kconfig:generate_rustflags_file",
+      "//libc",
+      "//librs:blueos_scrt1",
+    ]
+    data_deps = [ "//librs:libc" ]
+    _lib_dir = rebase_path("${root_out_dir}/lib")
+    rustflags = [
+      "-Clink-arg=-L${_lib_dir}",
+      "-Clink-arg=-l:liblibrs.so",
+      "-Clink-arg=-Wl,--export-dynamic-symbol=main",
+    ]
+  }
+} else {
+  reload_autoconf_and_build("shell") {
+    app_conf = [ "app.conf" ]
+    crate_name = "shell"
+    crate_type = "bin"
+    sources = [ "src/main.rs" ]
+    deps = [
+      "//external/vendor/phf-0.12.1:phf",
+      "//kernel/kconfig:generate_rustflags_file",
+      "//kernel/rsrt:rsrt_std",
+      "//libc",
+      "//librs",
+    ]
+    linker_script = default_linker_script
+    configs = [
+      "//build/boards/${board}:kernel_config",
+      "//kernel/kconfig:kconfigs",
+    ]
+  }
 }
 
-gen_qemu_runner("shell_runner") {
-  img = ":shell"
-  qemu = "$qemu_exe"
-  machine = "$qemu_machine"
-  qemu_args = qemu_extra_args
-  net_args = qemu_net_args
-  block_img = "shell_block.img"
-  block_args = qemu_block_args
+# A dynamic shell is an application artifact. Its QEMU runner additionally
+# needs the seeded boot image; boards with another installation path can still
+# build :shell with boot_dynamic_seed=false.
+if (!dynamic_loader || boot_dynamic_seed) {
+  gen_qemu_runner("shell_runner") {
+    if (dynamic_loader) {
+      img = "//kernel/kernel:kernel_image"
+      semihosting = true
+    } else {
+      img = ":shell"
+    }
+    qemu = "$qemu_exe"
+    machine = "$qemu_machine"
+    qemu_args = qemu_extra_args
+    net_args = qemu_net_args
+    block_img = "shell_block.img"
+    block_args = qemu_block_args
+  }
+}
+
+group("shell_default") {
+  if (!dynamic_loader || boot_dynamic_seed) {
+    deps = [ ":shell_runner" ]
+  } else {
+    deps = [ ":shell" ]
+  }
 }

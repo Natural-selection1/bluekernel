@@ -23,6 +23,7 @@ import("//build/templates/rust.gni")
 # path-addressed DSO that intentionally has none.
 #
 # Produces :<name>, the linked `lib/lib<crate_name>.so`.
+# Adds `cfg(dynamic_image)` for code shared with static library targets.
 template("blueos_dso") {
   assert(defined(invoker.sources), "blueos_dso requires `sources`")
 
@@ -45,6 +46,10 @@ template("blueos_dso") {
                              "soname",
                            ])
     crate_type = "cdylib"
+    if (!defined(cfgs)) {
+      cfgs = []
+    }
+    cfgs += [ "dynamic_image" ]
     if (defined(dynamic_atomic)) {
       if (!defined(deps)) {
         deps = []

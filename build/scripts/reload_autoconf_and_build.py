@@ -32,11 +32,11 @@ def reload_kconfig(kconfig_path, autoconf_path, app_conf_path):
     kconf.write_config(autoconf_path)
 
 
-def gen_ninja_workspace(ninja_dir, board, build_type, defconfig_files):
-    gn_cmd = ['gn', 'gen', ninja_dir]
-    gn_cmd += [
-        f'--args=board=\"{board}\" defconfig_files=\"{defconfig_files}\" build_type=\"{build_type}\"'
-    ]
+def gen_ninja_workspace(
+        ninja_dir, board, build_type, defconfig_files, extra_gn_args=""):
+    gn_args = (f'board="{board}" defconfig_files="{defconfig_files}" '
+               f'build_type="{build_type}" {extra_gn_args}')
+    gn_cmd = ['gn', 'gen', ninja_dir, f'--args={gn_args}']
     subprocess.run(gn_cmd, check=True)
 
 
@@ -52,12 +52,13 @@ if __name__ == "__main__":
     parser.add_argument("--build_type", help="build type")
     parser.add_argument("--ninja_dir", help="ninja build directory")
     parser.add_argument("--output_dir", help="output dir path")
+    parser.add_argument("--extra_gn_args", default="", help="GN argument overrides")
     parser.add_argument("target_name", help="ninja target name")
     args = parser.parse_args()
 
     try:
         gen_ninja_workspace(args.ninja_dir, args.board, args.build_type,
-                            args.defconfig_files)
+                            args.defconfig_files, args.extra_gn_args)
         build_with_ninja(args.ninja_dir, args.target_name)
         target_name = args.target_name[:-len("_pass")]
         bin_file = args.ninja_dir + '/bin/' + args.target_name + '.bin'

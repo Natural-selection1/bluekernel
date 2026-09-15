@@ -205,7 +205,7 @@ pub extern "C" fn dlerror() -> *mut c_char {
     error.bytes.as_mut_ptr().cast()
 }
 
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 pub(crate) fn close_at_exit() {
     let mut plan = BlueOsDlPlan::empty();
     if bk_syscall!(DlExit, &mut plan as *mut BlueOsDlPlan) as isize >= 0 {

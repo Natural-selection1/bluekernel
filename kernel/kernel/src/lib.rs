@@ -63,6 +63,10 @@
 // blueos_test_macro::test_only!();
 
 extern crate alloc;
+
+#[cfg(all(dynamic_loader, not(enable_vfs)))]
+compile_error!("dynamic_loader requires CONFIG_ENABLE_VFS=y");
+
 pub mod allocator;
 #[cfg(all(enable_vfs, dynamic_loader))]
 pub mod application;

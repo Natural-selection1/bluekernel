@@ -36,15 +36,15 @@ extern crate alloc;
 #[cfg(test)]
 extern crate rsrt;
 
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 use crate::application_context::LibcApplicationContext;
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 use blueos_header::syscalls::NR::{
     ApplicationBeginExit, ApplicationFinishExit, ApplicationInitComplete,
 };
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 use blueos_scal::bk_syscall;
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 use core::ffi::{c_char, c_int};
 
 // We don't expose any interfaces or types externally, rust-lang/libc is doing that.
@@ -60,7 +60,7 @@ pub mod c_str;
 pub mod ctype;
 pub mod direct;
 pub mod dlfcn;
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 mod dso_rt;
 pub mod errno;
 pub mod fcntl;
@@ -73,7 +73,7 @@ pub mod pthread;
 pub mod sched;
 pub mod semaphore;
 pub mod signal;
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 pub mod spawn;
 pub mod stat;
 pub mod stdio;
@@ -94,7 +94,7 @@ pub mod unistd;
 /// Compiled out of the shared libc: it calls the application's `main` symbol
 /// directly, which a DSO must not reference (the dynamic entry receives `main`
 /// as a parameter instead).
-#[cfg(not(librs_dso))]
+#[cfg(not(dynamic_image))]
 #[no_mangle]
 pub extern "C" fn __librs_start_main_static() {
     crate::stdio::init();
@@ -117,7 +117,7 @@ pub extern "C" fn __librs_start_main_static() {
 /// → `ApplicationBeginExit` → atexit/fini → `ApplicationFinishExit` — and never
 /// returns; the last step performs the retirement a trailing `ExitThread` would
 /// otherwise do.
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 #[no_mangle]
 pub extern "C" fn __librs_start_main(
     main: extern "C" fn(
@@ -190,7 +190,7 @@ pub extern "C" fn __librs_start_main(
 /// Validate the start-info block and return a shared reference to it, or `None`
 /// when the version, prefix size, or a nested count/pointer pair is inconsistent.
 /// A `None` result is a fatal setup error: the entry parks.
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 fn validate_start_info(
     info: *const blueos_header::application::BlueOsApplicationStartInfo,
 ) -> Option<&'static blueos_header::application::BlueOsApplicationStartInfo> {
@@ -228,7 +228,7 @@ fn validate_start_info(
 /// Validate a constructor/destructor plan's versioned prefix. A
 /// non-empty plan must be backed by a non-null target array; an empty plan needs
 /// none (the array may still be present, so `count == 0` accepts either).
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 fn plan_valid(plan: &blueos_header::application::BlueOsFunctionPlan) -> bool {
     use blueos_header::application::FUNCTION_PLAN_ABI_VERSION;
     if plan.abi_version != FUNCTION_PLAN_ABI_VERSION {
@@ -244,7 +244,7 @@ fn plan_valid(plan: &blueos_header::application::BlueOsFunctionPlan) -> bool {
 /// audited librs boundary that re-materialises the loader's
 /// `usize` targets as function pointers; the Thumb bit is part of
 /// the stored address and is preserved by the `transmute`.
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 fn run_plan(plan: &blueos_header::application::BlueOsFunctionPlan) {
     for i in 0..plan.count {
         // SAFETY: `entries` is the kernel-pinned target array; `i < count` and
@@ -261,7 +261,7 @@ fn run_plan(plan: &blueos_header::application::BlueOsFunctionPlan) {
 /// Terminal landing pad: park the core. Used on unrecoverable setup errors and
 /// as the trailing `-> !` of the entry; `ApplicationFinishExit` retires before
 /// this is ever reached on the normal path.
-#[cfg(librs_dso)]
+#[cfg(dynamic_image)]
 fn park() -> ! {
     loop {
         core::hint::spin_loop();

@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use librs::direct;
+use crate::platform;
 use std::ffi::CString;
 
-// std not support, call librs
+// umount is outside std's filesystem API.
 pub fn command(args: &[&str]) -> Result<(), String> {
     if args.len() != 1 {
         return Err("Usage: unmount <target>".to_string());
     }
 
     let target = CString::new(args[0]).map_err(|e| e.to_string())?;
-    let result = unsafe { direct::umount(target.as_ptr()) };
+    let result = unsafe { platform::umount(target.as_ptr()) };
 
     if result != 0 {
         println!("mount failed (error code: {})", result);

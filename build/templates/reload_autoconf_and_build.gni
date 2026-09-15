@@ -54,6 +54,8 @@ template("reload_autoconf_and_build") {
       rebase_path("${target_gen_dir}"),
       "--output_dir",
       rebase_path("${root_build_dir}/bin"),
+      "--extra_gn_args",
+      "dynamic_loader=${dynamic_loader} boot_dynamic_seed=${boot_dynamic_seed}",
       "${pass}",
     ]
     deps = [ "//kernel/kconfig:generate_autoconf" ]

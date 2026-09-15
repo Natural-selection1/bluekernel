@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use librs::direct;
+use crate::platform;
 use std::{ffi::CString, ptr};
 
-// std not support, call librs
+// mount is outside std's filesystem API.
 pub fn command(args: &[&str]) -> Result<(), String> {
     if args.len() != 2 {
         return Err("Usage: mount <path> <fstype>".to_string());
@@ -24,7 +24,7 @@ pub fn command(args: &[&str]) -> Result<(), String> {
     let target = CString::new(args[0]).map_err(|e| e.to_string())?;
     let fs_type = CString::new(args[1]).map_err(|e| e.to_string())?;
     let result = unsafe {
-        direct::mount(
+        platform::mount(
             ptr::null(),
             target.as_ptr(),
             fs_type.as_ptr(),
