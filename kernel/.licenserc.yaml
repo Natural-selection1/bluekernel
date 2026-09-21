@@ -60,6 +60,7 @@ header: # `header` section is configurations for source codes license header.
       - "tests/dynamic_scope_bad_test/src/test.rs"
       - "tests/dynamic_scope_test/src/test.rs"
       - "tests/dynamic_sequence_test/src/test.rs"
+      - "tests/dynamic_stack_reclaim_test/src/test.rs"
       - "tests/dynamic_tls_test/src/test.rs"
       - "adapter/rt_thread/include/rt_thread_wrapper.inc"
       - "kernel/src/sync/futex.rs"
