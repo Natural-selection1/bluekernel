@@ -14,7 +14,7 @@
 
 #![no_std]
 
-#[cfg(any(armv7m, armv8m))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
 pub mod application;
 
 pub mod syscalls {
@@ -95,13 +95,13 @@ pub mod syscalls {
         TimerSetTime,
         TimerGetOverrun,
         Rename,
-        #[cfg(any(armv7m, armv8m))]
+        #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
         ApplicationLaunch,
-        #[cfg(any(armv7m, armv8m))]
+        #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
         ApplicationInitComplete,
-        #[cfg(any(armv7m, armv8m))]
+        #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
         ApplicationBeginExit,
-        #[cfg(any(armv7m, armv8m))]
+        #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
         ApplicationFinishExit,
         LastNR,
     }

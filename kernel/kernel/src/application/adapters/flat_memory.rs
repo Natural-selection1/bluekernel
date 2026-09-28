@@ -121,7 +121,7 @@ impl Clone for FlatImageMemory {
 
 impl ImageMemory for FlatImageMemory {
     fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
-        // Thumb dynamic images are movable ET_DYN objects loaded from the
+        // Dynamic images are movable ET_DYN objects loaded from the
         // shared heap. A fixed placement cannot be honoured against this heap
         // backing and is rejected rather than silently redirected.
         if request.placement() != Placement::Anywhere {

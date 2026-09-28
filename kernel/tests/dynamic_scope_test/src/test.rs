@@ -2,6 +2,7 @@
 // ASSERT-SUCC: Dynamic scope test ended
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*
+// ASSERT-FAIL: scope: concurrent gate timeout
 // COUNT: DSO_LOAD path=/system/lib/libscope_sys\.so\.1 == 3
 // COUNT: DSO_LOAD path=/system/lib/libc\.so\.1 == 1
 // COUNT: DSO_REUSE path=/system/lib/libscope_sys\.so\.1 == 1
@@ -29,7 +30,7 @@
 #![reexport_test_harness_main = "dynamic_scope_test_main"]
 
 //! scope/visibility end-to-end test: the frozen application scope
-//! decisions, observed through real Thumb ELF artifacts.
+//! decisions, observed through real dynamically linked ELF artifacts.
 //!
 //! The scope corpus bundle (`apps/example/dynamic/scope_demo`) exercises:
 //!
@@ -129,9 +130,15 @@ extern "C" fn concurrent_launcher(flag: *mut core::ffi::c_void) {
     let service = ApplicationService::get().expect("service assembled");
     let mut argv = Vec::new();
     argv.push(b"/apps/scope_demo/app.elf".to_vec());
+    // Keep both application leases alive until both spawns return. Without
+    // this rendezvous a fast guest can reap the first app before the second
+    // worker is scheduled, so the intended concurrent case becomes serial.
+    argv.push(b"--test-gate".to_vec());
+    argv.push(alloc::format!("{:x}", core::ptr::addr_of!(CONCURRENT_READY) as usize).into_bytes());
     let handle = service
         .spawn("/apps/scope_demo/app.elf", argv, Vec::new())
         .expect("concurrent spawn");
+    CONCURRENT_READY.fetch_add(1, Ordering::AcqRel);
     static WAIT_ATOM: AtomicUsize = AtomicUsize::new(0);
     for _ in 0..600 {
         if !service.manager().contains(handle) {
@@ -147,11 +154,15 @@ extern "C" fn concurrent_launcher(flag: *mut core::ffi::c_void) {
     panic!("concurrent app was not reaped");
 }
 
+static CONCURRENT_READY: AtomicUsize = AtomicUsize::new(0);
+
 fn concurrent_system_closure() {
     const LINKER_WORKER_STACK_SIZE: usize = 64 << 10;
     static DONE_A: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     static DONE_B: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     static WAIT_ATOM: AtomicUsize = AtomicUsize::new(0);
+
+    CONCURRENT_READY.store(0, Ordering::Release);
 
     let a = Builder::new(Entry::Posix(
         concurrent_launcher,

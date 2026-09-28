@@ -16,7 +16,7 @@ use goblin::elf;
 
 use crate::{
     identity::{ElfClass, ElfMachine},
-    relocation::{AddendEncoding, ArchRelocator},
+    relocation::{AddendEncoding, ArchRelocator, RelocationKind},
 };
 
 #[derive(Clone, Copy)]
@@ -58,5 +58,14 @@ impl ArchRelocator for Riscv32Relocator {
 
     fn addend_encoding(&self) -> AddendEncoding {
         AddendEncoding::Explicit
+    }
+
+    fn classify_relocation(&self, raw_type: u32) -> Option<RelocationKind> {
+        match raw_type {
+            elf::reloc::R_RISCV_RELATIVE => Some(RelocationKind::Relative),
+            elf::reloc::R_RISCV_32 => Some(RelocationKind::Absolute),
+            elf::reloc::R_RISCV_JUMP_SLOT => Some(RelocationKind::JumpSlot),
+            _ => None,
+        }
     }
 }

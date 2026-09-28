@@ -32,7 +32,7 @@ use crate::{
 
 pub use crate::sync::posix_mqueue;
 use alloc::boxed::Box;
-#[cfg(any(armv7m, armv8m))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
 use blueos_header::application::{
     BlueOsApplicationLaunchRequest, BlueOsStringView, APPLICATION_LAUNCH_REQUEST_ABI_VERSION,
 };
@@ -1121,7 +1121,10 @@ mod application_syscalls {
     }
 }
 
-#[cfg(all(any(armv7m, armv8m), not(all(enable_vfs, dynamic_loader))))]
+#[cfg(all(
+    any(armv7m, armv8m, target_arch = "riscv32"),
+    not(all(enable_vfs, dynamic_loader))
+))]
 mod application_syscalls {
     use super::*;
 
@@ -1142,22 +1145,22 @@ mod application_syscalls {
     }
 }
 
-#[cfg(any(armv7m, armv8m))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
 define_syscall_handler!(application_launch(request: *const BlueOsApplicationLaunchRequest) -> c_long {
     application_syscalls::launch(request)
 });
 
-#[cfg(any(armv7m, armv8m))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
 define_syscall_handler!(application_init_complete() -> c_long {
     application_syscalls::init_complete()
 });
 
-#[cfg(any(armv7m, armv8m))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
 define_syscall_handler!(application_begin_exit(status: c_int) -> c_long {
     application_syscalls::begin_exit(status)
 });
 
-#[cfg(any(armv7m, armv8m))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
 define_syscall_handler!(application_finish_exit() -> c_long {
     application_syscalls::finish_exit()
 });
@@ -1237,13 +1240,13 @@ syscall_table! {
     (MqTimedReceive, mq_timedreceive),
     (MqGetSetAttr, mq_getsetattr),
     (Ioctl, ioctl),
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
     (ApplicationLaunch, application_launch),
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
     (ApplicationInitComplete, application_init_complete),
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
     (ApplicationBeginExit, application_begin_exit),
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
     (ApplicationFinishExit, application_finish_exit),
 }
 

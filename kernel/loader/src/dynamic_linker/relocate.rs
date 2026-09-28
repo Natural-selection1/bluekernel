@@ -41,8 +41,8 @@ use crate::{
 
 /// The set of relocation kinds a profile's engine understands.
 ///
-/// The `ARM32` set contains the four relocation kinds supported by eager
-/// binding. Other profiles expose an empty set until they gain an engine.
+/// Each architecture exposes only the word relocation kinds supported by its
+/// eager binding engine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RelocationTypeSet(u8);
 
@@ -69,6 +69,10 @@ impl RelocationTypeSet {
         Self(Self::RELATIVE | Self::ABSOLUTE | Self::GLOBAL_DATA | Self::JUMP_SLOT)
     }
 
+    const fn riscv_now() -> Self {
+        Self(Self::RELATIVE | Self::ABSOLUTE | Self::JUMP_SLOT)
+    }
+
     #[inline]
     const fn contains(self, kind: RelocationKind) -> bool {
         self.0 & Self::bit(kind) != 0
@@ -90,11 +94,11 @@ pub(crate) struct RelocationPolicy {
 }
 
 impl RelocationPolicy {
-    /// The policy for a profile. Only ARM32 has a NOW engine so far; every
-    /// other machine is fail-closed.
+    /// The policy for a profile. Unsupported machines remain fail-closed.
     pub(crate) const fn for_profile(profile: &LoadProfile) -> Self {
         match profile.machine() {
-            ElfMachine::Arm => Self::arm_now(),
+            ElfMachine::Arm => Self::eager(RelocationTypeSet::arm_now()),
+            ElfMachine::Riscv => Self::eager(RelocationTypeSet::riscv_now()),
             _ => Self::fail_closed(),
         }
     }
@@ -109,9 +113,9 @@ impl RelocationPolicy {
         }
     }
 
-    const fn arm_now() -> Self {
+    const fn eager(allowed_types: RelocationTypeSet) -> Self {
         Self {
-            allowed_types: RelocationTypeSet::arm_now(),
+            allowed_types,
             // Undefined weak data binds to 0; undefined weak control flow does
             // not; unsupported binding combinations are rejected.
             allow_undefined_weak_data: true,

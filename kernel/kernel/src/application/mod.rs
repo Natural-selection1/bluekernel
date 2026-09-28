@@ -36,6 +36,11 @@ pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
     blueos_loader::LoadProfile::arm_thumb_hard_float(blueos_loader::ElfType::Dyn)
 }
 
+#[cfg(target_arch = "riscv32")]
+pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
+    blueos_loader::LoadProfile::riscv32(blueos_loader::ElfType::Dyn)
+}
+
 pub mod adapters;
 pub mod group;
 pub mod loader;
