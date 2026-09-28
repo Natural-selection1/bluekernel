@@ -698,3 +698,72 @@ mod arm_admission {
             .expect("valid Thumb entry must be planned");
     }
 }
+
+mod aarch64_profile {
+    use goblin::elf::header::{EM_AARCH64, EM_RISCV, ET_DYN};
+
+    use crate::{
+        error::{ErrorContext, HeaderField, LoadErrorKind},
+        identity::{ElfType, LoadLimits, LoadProfile, LoadRequest},
+        image::ImageLoader,
+        reader::SliceElfReader,
+        tests::fixture::ElfFixtureBuilder,
+    };
+
+    fn request() -> LoadRequest {
+        LoadRequest::new(LoadProfile::aarch64(ElfType::Dyn), LoadLimits::DEFAULT)
+    }
+
+    #[test]
+    fn rejects_foreign_machine_and_reserved_flags() {
+        for (machine, flags, field) in [
+            (EM_RISCV, 0, HeaderField::Machine),
+            (EM_AARCH64, 1, HeaderField::Flags),
+        ] {
+            let bytes = ElfFixtureBuilder::elf64(machine, ET_DYN)
+                .with_flags(flags)
+                .build();
+            let result = ImageLoader::new(SliceElfReader::new(&bytes), request()).admit();
+            let error = result.err().expect("incompatible ELF must be rejected");
+            assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
+            assert!(matches!(
+                (field, error.context()),
+                (
+                    HeaderField::Machine,
+                    ErrorContext::HeaderField {
+                        field: HeaderField::Machine,
+                        ..
+                    }
+                ) | (
+                    HeaderField::Flags,
+                    ErrorContext::HeaderField {
+                        field: HeaderField::Flags,
+                        ..
+                    }
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn entry_requires_an_aligned_complete_instruction() {
+        for (entry, segment_len, accepted) in [
+            (0x1000, 4, true),
+            (0x1002, 8, false),
+            (0x1000, 3, false),
+            (0x1004, 4, false),
+        ] {
+            let bytes = ElfFixtureBuilder::elf64(EM_AARCH64, ET_DYN)
+                .with_load_segment(0x1000, segment_len, segment_len, 4)
+                .with_entry(entry)
+                .build();
+            let result = ImageLoader::new(SliceElfReader::new(&bytes), request())
+                .admit()
+                .expect("admit")
+                .inspect()
+                .expect("inspect")
+                .plan();
+            assert_eq!(result.is_ok(), accepted);
+        }
+    }
+}

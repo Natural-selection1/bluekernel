@@ -39,6 +39,8 @@ use blueos_loader::{
     SessionLimits,
 };
 
+#[cfg(target_arch = "aarch64")]
+use blueos_loader::AArch64Relocator as PlatformRelocator;
 #[cfg(target_arch = "arm")]
 use blueos_loader::ArmRelocator as PlatformRelocator;
 #[cfg(target_arch = "riscv32")]

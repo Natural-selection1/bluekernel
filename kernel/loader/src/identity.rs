@@ -289,6 +289,19 @@ impl LoadProfile {
         )
     }
 
+    /// AArch64 little-endian ELF profile with a native aligned entry.
+    #[inline]
+    pub const fn aarch64(r#type: ElfType) -> Self {
+        Self::new(
+            ElfClass::Elf64,
+            ElfData::Little,
+            ElfMachine::Aarch64,
+            r#type,
+            HeaderFlagsPolicy::new(u32::MAX, 0, 0),
+            EntryMode::direct(4, 4),
+        )
+    }
+
     /// RISC-V RV32 soft-float profile (RVC permitted, RVE rejected).
     #[inline]
     pub const fn riscv32(r#type: ElfType) -> Self {

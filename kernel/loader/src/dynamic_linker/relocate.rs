@@ -65,7 +65,7 @@ impl RelocationTypeSet {
         Self(0)
     }
 
-    const fn arm_now() -> Self {
+    const fn word_now() -> Self {
         Self(Self::RELATIVE | Self::ABSOLUTE | Self::GLOBAL_DATA | Self::JUMP_SLOT)
     }
 
@@ -97,7 +97,7 @@ impl RelocationPolicy {
     /// The policy for a profile. Unsupported machines remain fail-closed.
     pub(crate) const fn for_profile(profile: &LoadProfile) -> Self {
         match profile.machine() {
-            ElfMachine::Arm => Self::eager(RelocationTypeSet::arm_now()),
+            ElfMachine::Arm | ElfMachine::Aarch64 => Self::eager(RelocationTypeSet::word_now()),
             ElfMachine::Riscv => Self::eager(RelocationTypeSet::riscv_now()),
             _ => Self::fail_closed(),
         }
