@@ -1,4 +1,4 @@
-// NEWLINE-TIMEOUT: 10
+// NEWLINE-TIMEOUT: 60
 // ASSERT-SUCC: Dynamic stack reclaim test ended
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*

@@ -255,13 +255,13 @@ impl File {
     }
 
     /// Length of the underlying file, in bytes.
-    #[cfg(armv7m)]
+    #[cfg(any(armv7m, armv8m))]
     pub fn file_len(&self) -> Result<u64, Error> {
         Ok(self.dcache.size() as u64)
     }
 
     /// Positional read that leaves the shared file offset unchanged.
-    #[cfg(armv7m)]
+    #[cfg(any(armv7m, armv8m))]
     pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<usize, Error> {
         if !self.access_mode().is_readable() {
             return Err(code::EACCES);
@@ -271,7 +271,7 @@ impl File {
     }
 
     /// Fill `dst` with positional reads, without changing the shared offset.
-    #[cfg(armv7m)]
+    #[cfg(any(armv7m, armv8m))]
     pub fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), Error> {
         if !self.access_mode().is_readable() {
             return Err(code::EACCES);

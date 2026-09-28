@@ -522,6 +522,81 @@ mod arm_admission {
             .map(|_| ())
     }
 
+    fn hard_float_request() -> LoadRequest {
+        LoadRequest::new(
+            LoadProfile::arm_thumb_hard_float(ElfType::Dyn),
+            LoadLimits::DEFAULT,
+        )
+    }
+
+    fn admit_hard_float(bytes: &[u8]) -> crate::error::LoadResult<()> {
+        ImageLoader::new(SliceElfReader::new(bytes), hard_float_request())
+            .admit()
+            .map(|_| ())
+    }
+
+    #[test]
+    fn hard_float_eabi5_flags_are_accepted() {
+        let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+            .with_flags(HARD_EABI5)
+            .build();
+        assert!(admit_hard_float(&bytes).is_ok());
+    }
+
+    #[test]
+    fn soft_float_flags_are_rejected_by_hard_float_profile() {
+        let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+            .with_flags(SOFT_EABI5)
+            .build();
+        let error = admit_hard_float(&bytes).expect_err("soft-float ABI must be rejected");
+        assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
+        assert!(matches!(
+            error.context(),
+            ErrorContext::HeaderField {
+                field: HeaderField::Flags,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn hard_float_profile_rejects_incompatible_header_flags() {
+        for flags in [
+            0x0400_0400,              // EABI4.
+            0x0500_0000,              // Unspecified float ABI.
+            0x0500_0600,              // Both float ABI bits set.
+            HARD_EABI5 | 0x0080_0000, // BE8.
+        ] {
+            let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+                .with_flags(flags)
+                .build();
+            let error = admit_hard_float(&bytes).expect_err("incompatible flags");
+            assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
+        }
+    }
+
+    #[test]
+    fn hard_float_thumb_entry_requires_valid_instruction_span() {
+        for (entry, segment_len, accepted) in [
+            (0x1001, 0x10, true),
+            (0x1000, 0x10, false),
+            (0x1001, 1, false),
+        ] {
+            let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)
+                .with_flags(HARD_EABI5)
+                .with_load_segment(0x1000, segment_len, segment_len, 0x4)
+                .with_entry(entry)
+                .build();
+            let result = ImageLoader::new(SliceElfReader::new(&bytes), hard_float_request())
+                .admit()
+                .expect("admit")
+                .inspect()
+                .expect("inspect")
+                .plan();
+            assert_eq!(result.is_ok(), accepted);
+        }
+    }
+
     #[test]
     fn soft_float_eabi5_flags_are_accepted() {
         let bytes = ElfFixtureBuilder::elf32(EM_ARM, ET_DYN)

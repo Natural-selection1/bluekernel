@@ -26,9 +26,14 @@
 
 /// The board policy's dynamic-application profile: the single place
 /// where the board ABI decides which loader profile an application links with.
-#[cfg(target_board = "qemu_mps2_an385")]
+#[cfg(armv7m)]
 pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
     blueos_loader::LoadProfile::arm_thumb_soft_float(blueos_loader::ElfType::Dyn)
+}
+
+#[cfg(armv8m)]
+pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
+    blueos_loader::LoadProfile::arm_thumb_hard_float(blueos_loader::ElfType::Dyn)
 }
 
 pub mod adapters;

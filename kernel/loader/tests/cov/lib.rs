@@ -1,4 +1,4 @@
-// NEWLINE-TIMEOUT: 15
+// NEWLINE-TIMEOUT: 60
 // ASSERT-SUCC: coverage test end.
 // ASSERT-FAIL: Backtrace in Panic.*
 

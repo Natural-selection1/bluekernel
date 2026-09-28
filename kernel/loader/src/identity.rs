@@ -107,6 +107,7 @@ const EF_ARM_EABI_MASK: u32 = 0xFF00_0000;
 const EF_ARM_EABI_VER5: u32 = 0x0500_0000;
 const EF_ARM_ABI_FLOAT_MASK: u32 = 0x0000_0600;
 const EF_ARM_ABI_FLOAT_SOFT: u32 = 0x0000_0200;
+const EF_ARM_ABI_FLOAT_HARD: u32 = 0x0000_0400;
 const EF_ARM_BE8: u32 = 0x0080_0000;
 
 /// RISC-V `e_flags` bits the loader interprets. The float ABI must be soft for
@@ -264,6 +265,24 @@ impl LoadProfile {
             HeaderFlagsPolicy::new(
                 EF_ARM_EABI_MASK | EF_ARM_ABI_FLOAT_MASK,
                 EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_SOFT,
+                EF_ARM_BE8,
+            ),
+            EntryMode::thumb(2, 2),
+        )
+    }
+
+    /// Cortex-M hard-float Thumb profile (`thumbv8m.main-none-eabihf`): EABI5,
+    /// hard float ABI, little-endian Thumb entry with bit 0 set.
+    #[inline]
+    pub const fn arm_thumb_hard_float(r#type: ElfType) -> Self {
+        Self::new(
+            ElfClass::Elf32,
+            ElfData::Little,
+            ElfMachine::Arm,
+            r#type,
+            HeaderFlagsPolicy::new(
+                EF_ARM_EABI_MASK | EF_ARM_ABI_FLOAT_MASK,
+                EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_HARD,
                 EF_ARM_BE8,
             ),
             EntryMode::thumb(2, 2),

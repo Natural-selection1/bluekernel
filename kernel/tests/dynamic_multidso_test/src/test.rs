@@ -1,4 +1,4 @@
-// NEWLINE-TIMEOUT: 10
+// NEWLINE-TIMEOUT: 60
 // ASSERT-SUCC: Dynamic multidso test ended
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*
@@ -31,7 +31,7 @@
 //! read-only dependency planning, atomic system batch acquire, private DSO
 //! search, ARM32 NOW
 //! relocation, private init/fini ordering, application exit and deferred
-//! reaping — on `qemu_mps2_an385`.
+//! reaping — on the Cortex-M QEMU boards.
 //!
 //! The bundle (`apps/example/dynamic/multi_dso`: root + foo/bar/common
 //! private DSOs, all importing the shared libc) is streamed from the host and

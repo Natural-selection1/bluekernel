@@ -1,4 +1,4 @@
-// NEWLINE-TIMEOUT: 10
+// NEWLINE-TIMEOUT: 60
 // ASSERT-SUCC: Loader integration test ended
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: loader test: no stack

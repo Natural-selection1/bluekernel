@@ -14,7 +14,7 @@
 
 #![no_std]
 
-#[cfg(armv7m)]
+#[cfg(any(armv7m, armv8m))]
 pub mod application;
 
 pub mod syscalls {
@@ -95,13 +95,13 @@ pub mod syscalls {
         TimerSetTime,
         TimerGetOverrun,
         Rename,
-        #[cfg(armv7m)]
+        #[cfg(any(armv7m, armv8m))]
         ApplicationLaunch,
-        #[cfg(armv7m)]
+        #[cfg(any(armv7m, armv8m))]
         ApplicationInitComplete,
-        #[cfg(armv7m)]
+        #[cfg(any(armv7m, armv8m))]
         ApplicationBeginExit,
-        #[cfg(armv7m)]
+        #[cfg(any(armv7m, armv8m))]
         ApplicationFinishExit,
         LastNR,
     }

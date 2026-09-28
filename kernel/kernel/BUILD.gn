@@ -208,7 +208,7 @@ run_clippy("blueos_clippy") {
 # each artifact lives on the host, and boot streams the bytes into the root
 # tmpfs over semihosting. The kernel image therefore carries no application
 # bytes at all.
-# Gated per board via `boot_dynamic_seed` (currently qemu_mps2_an385).
+# Gated per board via `boot_dynamic_seed`.
 if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
   build_rust("kernel_image") {
     crate_type = "bin"

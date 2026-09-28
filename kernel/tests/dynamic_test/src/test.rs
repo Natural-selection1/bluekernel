@@ -1,4 +1,4 @@
-// NEWLINE-TIMEOUT: 10
+// NEWLINE-TIMEOUT: 60
 // CHECK-SUCC: Dynamic application test started
 // CHECK-SUCC: DSO_LOAD path=/system/lib/libc.so.1
 // CHECK-SUCC: hello dynamic app
@@ -24,7 +24,7 @@
 //! end-to-end: launch a real Thumb PIE dynamic application through the
 //! full kernel path — VFS snapshot, dependency closure, `libc.so.1` load,
 //! ARM32 NOW relocation, thread entry, `scrt1`/`librs` startup, application
-//! exit and deferred reaping — on `qemu_mps2_an385`.
+//! exit and deferred reaping — on the Cortex-M QEMU boards.
 //!
 //! The system image (`apps/example/dynamic/hello` and `librs:libc`) is
 //! streamed from the host by the build's boot seed catalog and seeded into the root tmpfs

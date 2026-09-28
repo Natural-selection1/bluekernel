@@ -32,7 +32,7 @@ use crate::{
 
 pub use crate::sync::posix_mqueue;
 use alloc::boxed::Box;
-#[cfg(armv7m)]
+#[cfg(any(armv7m, armv8m))]
 use blueos_header::application::{
     BlueOsApplicationLaunchRequest, BlueOsStringView, APPLICATION_LAUNCH_REQUEST_ABI_VERSION,
 };
@@ -909,9 +909,8 @@ define_syscall_handler!(
 // authoritative thread group from the current thread id, never from
 // an application-supplied handle.
 //
-// Gated on the loader capability rather than on `armv7m && enable_vfs`: the
-// handlers need `crate::application`, which only exists where the board links
-// the loader.
+// The handlers need `crate::application`, which only exists where VFS and the
+// loader are enabled.
 #[cfg(all(enable_vfs, dynamic_loader))]
 mod application_syscalls {
     use super::*;
@@ -1122,7 +1121,7 @@ mod application_syscalls {
     }
 }
 
-#[cfg(all(armv7m, not(all(enable_vfs, dynamic_loader))))]
+#[cfg(all(any(armv7m, armv8m), not(all(enable_vfs, dynamic_loader))))]
 mod application_syscalls {
     use super::*;
 
@@ -1143,22 +1142,22 @@ mod application_syscalls {
     }
 }
 
-#[cfg(armv7m)]
+#[cfg(any(armv7m, armv8m))]
 define_syscall_handler!(application_launch(request: *const BlueOsApplicationLaunchRequest) -> c_long {
     application_syscalls::launch(request)
 });
 
-#[cfg(armv7m)]
+#[cfg(any(armv7m, armv8m))]
 define_syscall_handler!(application_init_complete() -> c_long {
     application_syscalls::init_complete()
 });
 
-#[cfg(armv7m)]
+#[cfg(any(armv7m, armv8m))]
 define_syscall_handler!(application_begin_exit(status: c_int) -> c_long {
     application_syscalls::begin_exit(status)
 });
 
-#[cfg(armv7m)]
+#[cfg(any(armv7m, armv8m))]
 define_syscall_handler!(application_finish_exit() -> c_long {
     application_syscalls::finish_exit()
 });
@@ -1238,13 +1237,13 @@ syscall_table! {
     (MqTimedReceive, mq_timedreceive),
     (MqGetSetAttr, mq_getsetattr),
     (Ioctl, ioctl),
-    #[cfg(armv7m)]
+    #[cfg(any(armv7m, armv8m))]
     (ApplicationLaunch, application_launch),
-    #[cfg(armv7m)]
+    #[cfg(any(armv7m, armv8m))]
     (ApplicationInitComplete, application_init_complete),
-    #[cfg(armv7m)]
+    #[cfg(any(armv7m, armv8m))]
     (ApplicationBeginExit, application_begin_exit),
-    #[cfg(armv7m)]
+    #[cfg(any(armv7m, armv8m))]
     (ApplicationFinishExit, application_finish_exit),
 }
 

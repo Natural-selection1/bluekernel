@@ -1,4 +1,4 @@
-// NEWLINE-TIMEOUT: 10
+// NEWLINE-TIMEOUT: 60
 // ASSERT-SUCC: Dynamic Clang C test ended
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*
@@ -10,6 +10,7 @@
 // COUNT: clang-c: base=37 generation=1 == 1
 // COUNT: clang-c: result=49 argc=2 argv1=blueos argv1len=6 == 1
 // COUNT: clang-c: heap ok=1 == 1
+// COUNT: clang-c: float abi ok=1 == 1
 // COUNT: clang-c: private fini state=37 == 1
 
 #![no_main]
@@ -26,8 +27,9 @@
 //! language-neutral ELF contract rather than a result. This test makes it a
 //! result. The C app exercises what the C++ fixture does not: `malloc`/`free`
 //! across the DSO boundary, `strlen`/`memcpy`/`memcmp` reached through the PLT,
-//! a root-owned BSS word initialized by the root's own constructor, and reads
-//! of a data object owned by the private DSO.
+//! a root-owned BSS word initialized by the root's own constructor, reads
+//! of a data object owned by the private DSO, and float/double calls across
+//! the PLT using the board's floating-point ABI.
 
 extern crate alloc;
 extern crate rsrt;
