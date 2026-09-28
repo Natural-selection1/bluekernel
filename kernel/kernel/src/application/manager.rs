@@ -92,7 +92,8 @@ struct Slot {
     identity: Vec<u8>,
     generation: u32,
     state: SlotState,
-    group: ThreadGroup,
+    /// Only occupied slots own a group; vacant slots cache identity/generation.
+    group: Option<ThreadGroup>,
 }
 
 impl Slot {
@@ -300,10 +301,10 @@ impl ApplicationManager {
         inner
             .slots
             .iter()
-            .find(|slot| {
-                matches!(slot.state, SlotState::Occupied(_)) && slot.group.contains_member(id)
-            })
-            .map(|slot| slot.group.clone())
+            .filter(|slot| matches!(slot.state, SlotState::Occupied(_)))
+            .filter_map(|slot| slot.group.as_ref())
+            .find(|group| group.contains_member(id))
+            .cloned()
     }
 
     /// Find the handle reserved for an identity. This is used internally when
@@ -340,6 +341,8 @@ impl ApplicationManager {
     /// deferred reaper may call this, and only after [`ApplicationManager::finish`]
     /// moved the slot into a terminal state — the two-phase exit
     /// (`Running → Stopping → Terminated`) or a recorded `Failed`.
+    /// Drops the slot's group before publishing `Vacant`, so per-launch
+    /// resources do not remain cached until another application reuses it.
     pub fn release(&self, handle: ApplicationHandle) -> Result<(), ApplicationLaunchError> {
         let mut inner = self.inner.lock();
         let slot = inner
@@ -353,6 +356,7 @@ impl ApplicationManager {
             SlotState::Vacant => Err(ApplicationLaunchError::AlreadyReleased),
             SlotState::Occupied(ApplicationState::Terminated)
             | SlotState::Occupied(ApplicationState::Failed) => {
+                drop(slot.group.take());
                 slot.state = SlotState::Vacant;
                 Ok(())
             }
@@ -396,7 +400,7 @@ fn reserve_slot(slots: &mut Vec<Slot>, identity: Vec<u8>, group: ThreadGroup) ->
         .position(|s| matches!(s.state, SlotState::Vacant) && s.identity == identity)
     {
         let slot = &mut slots[index];
-        slot.group = group;
+        slot.group = Some(group);
         slot.generation = slot.generation.wrapping_add(1);
         slot.state = SlotState::Occupied(ApplicationState::Loading);
         return (index, slot.generation);
@@ -407,7 +411,7 @@ fn reserve_slot(slots: &mut Vec<Slot>, identity: Vec<u8>, group: ThreadGroup) ->
     {
         let slot = &mut slots[index];
         slot.identity = identity;
-        slot.group = group;
+        slot.group = Some(group);
         slot.generation = slot.generation.wrapping_add(1);
         slot.state = SlotState::Occupied(ApplicationState::Loading);
         return (index, slot.generation);
@@ -416,7 +420,7 @@ fn reserve_slot(slots: &mut Vec<Slot>, identity: Vec<u8>, group: ThreadGroup) ->
         identity,
         generation: 1,
         state: SlotState::Occupied(ApplicationState::Loading),
-        group,
+        group: Some(group),
     });
     (slots.len() - 1, 1)
 }

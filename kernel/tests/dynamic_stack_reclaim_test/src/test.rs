@@ -5,6 +5,7 @@
 // CHECK-SUCC: STACK_RECLAIM round=1
 // CHECK-SUCC: STACK_RECLAIM round=2
 // CHECK-SUCC: STACK_RECLAIM round=3
+// CHECK-SUCC: \[       OK \] released_slots_do_not_retain_membership_storage
 
 #![no_main]
 #![no_std]
@@ -30,7 +31,12 @@ extern crate alloc;
 extern crate rsrt;
 
 use alloc::vec::Vec;
-use blueos::application::{runtime, service::ApplicationService};
+use blueos::application::{
+    manager::{ApplicationLaunchError, ApplicationManager, OwnedLaunchRequest},
+    registry::SystemDsoRegistry,
+    runtime,
+    service::ApplicationService,
+};
 use blueos_test_macro::test;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use librs::pthread;
@@ -45,7 +51,7 @@ const ROUNDS: usize = 3;
 
 /// Steady-state launches must be allocation-neutral after the reaper removed
 /// the manager slot. The warm-up below absorbs cached system DSOs and one-time
-/// allocator/runtime setup, so even a single retained slab block is a failure.
+/// allocator/runtime setup, so even a single retained allocation is a failure.
 const DRIFT_TOLERANCE: usize = 0;
 
 fn heap_used() -> usize {
@@ -79,10 +85,8 @@ fn launch_fixture(service: &ApplicationService) {
 fn application_launch_resources_are_reclaimed() {
     let service = runtime::init();
 
-    // Warm-up: the first launch is the loading generation for `libc.so.1` and
-    // the fixture's private DSOs, which stay resident for the later launches.
-    // Measuring it would compare an image-loading footprint against a
-    // steady-state one.
+    // Warm-up: the first launch loads cached `libc.so.1` and reserves the
+    // manager/reaper tables. Private DSOs are reloaded and freed each round.
     launch_fixture(service);
     let mut previous = heap_used();
 
@@ -98,6 +102,37 @@ fn application_launch_resources_are_reclaimed() {
         );
         previous = used;
     }
+}
+
+#[test]
+fn released_slots_do_not_retain_membership_storage() {
+    let manager = ApplicationManager::new(SystemDsoRegistry::new());
+    let reserve_and_release = |with_member| {
+        let mut handle = None;
+        let result = manager.launch(OwnedLaunchRequest::new(b"reclaim".to_vec()), |group| {
+            handle = group.handle();
+            if with_member {
+                // Borrow an existing thread without scheduling another one.
+                // Removing it leaves an empty vector with allocated capacity.
+                let thread = blueos::scheduler::current_thread();
+                let id = blueos::thread::Thread::id(&thread);
+                group.add_member(thread).unwrap();
+                group.remove_member(id).unwrap();
+            }
+            Err(ApplicationLaunchError::PrepareFailed)
+        });
+        assert_eq!(result, Err(ApplicationLaunchError::PrepareFailed));
+        let handle = handle.unwrap();
+        manager.release(handle).unwrap();
+        assert!(!manager.contains(handle));
+    };
+
+    // Warm the identity and slot cache, then exercise a failed launch that
+    // allocated member storage. A vacant slot must retain no launch resources.
+    reserve_and_release(false);
+    let previous = heap_used();
+    reserve_and_release(true);
+    assert_eq!(heap_used(), previous, "vacant slot retained member storage");
 }
 
 #[no_mangle]

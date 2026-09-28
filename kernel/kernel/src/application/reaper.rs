@@ -141,11 +141,27 @@ impl ApplicationReaper {
             memory.release_committed(allocation);
         }
         let mut pending = self.pending.lock();
-        pending.retain(|group| !self.try_reap(group, manager));
+        let mut index = 0;
+        while index < pending.len() {
+            if !self.try_reap(&pending[index]) {
+                index += 1;
+                continue;
+            }
+            let group = pending.swap_remove(index);
+            let handle = group.handle();
+            // Drop the reaper's reference before the manager publishes Vacant,
+            // so the pending set cannot keep member storage alive after
+            // contains(handle) becomes false.
+            drop(group);
+            if let Some(handle) = handle {
+                let _ = manager.finish(handle);
+                let _ = manager.release(handle);
+            }
+        }
     }
 
     /// Advance one group towards reaping and return `true` once it is fully
-    /// reaped (and may leave the pending set). Covers the three terminal
+    /// reaped (and may leave the pending set). Covers the terminal
     /// shapes:
     ///
     /// - `New`: the launch failed before installing a product; nothing to
@@ -155,15 +171,15 @@ impl ApplicationReaper {
     /// - `Draining` with no members and a pending fini: the coordinator died
     ///   mid-atexit; skip the fini and fall through.
     /// - `Draining` with no members and a resolved fini: take the resources,
-    ///   release the private images, drop the imported leases, close the
-    ///   manager lifecycle and recycle the slot.
-    fn try_reap(&self, group: &ThreadGroup, manager: &ApplicationManager) -> bool {
+    ///   release the private images and drop the imported leases. The scan
+    ///   then drops the group reference and recycles the manager slot.
+    fn try_reap(&self, group: &ThreadGroup) -> bool {
         match group.state() {
             GroupState::Reaped => return true,
             GroupState::New => {
-                // No product was installed; only the manager slot (Failed)
-                // needs recycling.
-                return self.finish_slot(group, manager);
+                // No product was installed; scan only needs to drop the group
+                // and recycle the manager's Failed slot.
+                return true;
             }
             GroupState::Linked => {
                 if !group.is_empty() {
@@ -205,19 +221,6 @@ impl ApplicationReaper {
                 return false;
             }
         }
-        self.finish_slot(group, manager)
-    }
-
-    /// Close the manager lifecycle for a fully reaped group and recycle the
-    /// slot.
-    fn finish_slot(&self, group: &ThreadGroup, manager: &ApplicationManager) -> bool {
-        let Some(handle) = group.handle() else {
-            // A group without a handle never entered the manager slot table;
-            // nothing to recycle.
-            return true;
-        };
-        let _ = manager.finish(handle);
-        let _ = manager.release(handle);
         true
     }
 
