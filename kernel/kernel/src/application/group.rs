@@ -242,7 +242,11 @@ impl ThreadGroup {
             .position(|member| Thread::id(member) == id)
             .ok_or(ThreadGroupError::NotMember)?;
         inner.members.swap_remove(index);
-        bump_members_epoch(&inner.members_epoch);
+        let epoch = Arc::clone(&inner.members_epoch);
+        // Waking the exit coordinator can yield immediately on RISC-V.
+        // Release the group lock and restore interrupts before waking it.
+        drop(inner);
+        bump_members_epoch(&epoch);
         Ok(())
     }
 
@@ -444,9 +448,8 @@ impl ThreadGroup {
     }
 }
 
-/// Wake every membership waiter after an allocation-free removal. This can run
-/// from the scheduler's interrupt-disabled cleanup path because the group uses
-/// the kernel's interrupt-saving [`SpinLock`].
+/// Wake every membership waiter after an allocation-free removal. Call outside
+/// the group lock so an immediate reschedule never runs with interrupts masked.
 fn bump_members_epoch(epoch: &Arc<AtomicUsize>) {
     epoch.fetch_add(1, Ordering::Release);
     let _ = crate::sync::atomic_wake(epoch, usize::MAX);

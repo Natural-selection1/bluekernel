@@ -43,6 +43,8 @@ use blueos_loader::{
 use blueos_loader::ArmRelocator as PlatformRelocator;
 #[cfg(target_arch = "riscv32")]
 use blueos_loader::Riscv32Relocator as PlatformRelocator;
+#[cfg(target_arch = "riscv64")]
+use blueos_loader::Riscv64Relocator as PlatformRelocator;
 
 use crate::application::{
     adapters::{

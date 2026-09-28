@@ -32,7 +32,7 @@ use crate::{
 
 pub use crate::sync::posix_mqueue;
 use alloc::boxed::Box;
-#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"))]
 use blueos_header::application::{
     BlueOsApplicationLaunchRequest, BlueOsStringView, APPLICATION_LAUNCH_REQUEST_ABI_VERSION,
 };
@@ -915,6 +915,8 @@ define_syscall_handler!(
 mod application_syscalls {
     use super::*;
     use alloc::vec::Vec;
+    // Match the return ABI used by define_syscall_handler on 64-bit targets.
+    use core::ffi::c_long;
 
     /// Kernel-side bounds for the launch copy-in. These mirror (and
     /// tighten) librs's own scan limits and are the authoritative gate on the
@@ -1122,11 +1124,12 @@ mod application_syscalls {
 }
 
 #[cfg(all(
-    any(armv7m, armv8m, target_arch = "riscv32"),
+    any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"),
     not(all(enable_vfs, dynamic_loader))
 ))]
 mod application_syscalls {
     use super::*;
+    use core::ffi::c_long;
 
     pub fn launch(_request: *const BlueOsApplicationLaunchRequest) -> c_long {
         -(libc::ENOSYS as c_long)
@@ -1145,22 +1148,22 @@ mod application_syscalls {
     }
 }
 
-#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"))]
 define_syscall_handler!(application_launch(request: *const BlueOsApplicationLaunchRequest) -> c_long {
     application_syscalls::launch(request)
 });
 
-#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"))]
 define_syscall_handler!(application_init_complete() -> c_long {
     application_syscalls::init_complete()
 });
 
-#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"))]
 define_syscall_handler!(application_begin_exit(status: c_int) -> c_long {
     application_syscalls::begin_exit(status)
 });
 
-#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"))]
 define_syscall_handler!(application_finish_exit() -> c_long {
     application_syscalls::finish_exit()
 });
@@ -1240,13 +1243,13 @@ syscall_table! {
     (MqTimedReceive, mq_timedreceive),
     (MqGetSetAttr, mq_getsetattr),
     (Ioctl, ioctl),
-    #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
+    #[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"))]
     (ApplicationLaunch, application_launch),
-    #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
+    #[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"))]
     (ApplicationInitComplete, application_init_complete),
-    #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
+    #[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"))]
     (ApplicationBeginExit, application_begin_exit),
-    #[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
+    #[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"))]
     (ApplicationFinishExit, application_finish_exit),
 }
 

@@ -41,6 +41,11 @@ pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
     blueos_loader::LoadProfile::riscv32(blueos_loader::ElfType::Dyn)
 }
 
+#[cfg(target_arch = "riscv64")]
+pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
+    blueos_loader::LoadProfile::riscv64(blueos_loader::ElfType::Dyn)
+}
+
 pub mod adapters;
 pub mod group;
 pub mod loader;

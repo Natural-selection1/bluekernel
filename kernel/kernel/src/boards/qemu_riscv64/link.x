@@ -70,7 +70,7 @@ SECTIONS
   .heap : {
     . = ALIGN(4096);
     __heap_start = .;
-    . += 0x800000;
+    . += __blueos_heap_size;
     __heap_end = .;
   }
 

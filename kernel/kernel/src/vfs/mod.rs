@@ -49,9 +49,9 @@ mod tmpfs;
 mod utils;
 use alloc::string::String;
 pub use file::AccessMode;
-#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"))]
 pub use file::File;
-#[cfg(any(armv7m, armv8m, target_arch = "riscv32"))]
+#[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64"))]
 pub use path::{get_working_dir, join_path, normalize_path, open_path};
 #[cfg(enable_net)]
 pub use sockfs::{alloc_sock_fd, free_sock_fd, get_sock_by_fd, sock_attach_to_fd};

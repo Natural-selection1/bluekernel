@@ -238,9 +238,8 @@ impl ApplicationService {
             // exactly once and never resets it.
             let _ = crate::sync::atomic_wait(&handoff.epoch, 0, Tick::MAX);
         }
-        handoff
-            .outcome
-            .irqsave_lock()
+        let mut outcome = handoff.outcome.irqsave_lock();
+        outcome
             .take()
             .expect("the worker stores its outcome before bumping the epoch")
     }
