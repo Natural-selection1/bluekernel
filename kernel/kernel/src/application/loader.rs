@@ -68,6 +68,51 @@ pub struct ApplicationLoader {
 }
 
 impl ApplicationLoader {
+    /// Link a runtime DSO against the application's pinned global namespace.
+    /// The caller executes startup entries and completes the returned system
+    /// initialization token before exposing the handle to another thread.
+    pub(crate) fn link_shared(
+        &self,
+        plan: NamespaceLoadPlan,
+        profile: LoadProfile,
+        group: &ThreadGroup,
+        existing: Vec<(
+            alloc::sync::Arc<blueos_loader::PublishedImageDescriptor>,
+            bool,
+        )>,
+        global: Vec<blueos_loader::ImportedImageDescriptor>,
+    ) -> LoadResult<(LinkProduct<KernelLinkReceipt>, SystemInitBatch)> {
+        let mut resolver =
+            NamespaceArtifactResolver::with_namespace(plan, self.registry.clone(), existing)?;
+        let dependency_imports = resolver.dependency_imports();
+        let root = resolver.shared_root()?;
+        let mut memory = self.memory.clone();
+        let mut cache = ArchitectureCodeCache::new(CacheRequirements::CURRENT_EXECUTION_CONTEXT);
+        let mut publisher = KernelLinkPublisher::runtime(group.clone());
+        let mut building = DynamicLinker::new(PlatformRelocator).begin_shared(
+            root,
+            profile,
+            SessionLimits::DEFAULT,
+            &mut memory,
+        )?;
+        building.import_scope(global)?;
+        building.import_dependencies(dependency_imports)?;
+        building.close_dependencies(&mut resolver)?;
+        let ResolverAuthorities {
+            permits,
+            leases,
+            system_images,
+        } = resolver.finish_resolution();
+        publisher.import_leases(leases);
+        let mut product = building
+            .freeze_scopes()?
+            .relocate()?
+            .seal(&mut cache)?
+            .publish(&mut publisher)?;
+        let batch = self.hand_off(permits, &system_images, &mut product)?;
+        Ok((product, batch))
+    }
+
     /// Build a loader over a fixed catalog, shared registry and shared-flat
     /// memory service.
     pub fn new(

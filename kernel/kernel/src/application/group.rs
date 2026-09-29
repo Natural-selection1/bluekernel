@@ -119,6 +119,7 @@ struct GroupInner {
     /// [`blueos_header::application::BlueOsApplicationStartInfo`] stays valid
     /// until the last thread exits.
     start_storage: Option<ApplicationStartStorage>,
+    runtime: Option<Arc<super::dynamic::RuntimeNamespace>>,
     /// The pending system initialization batch: installed with
     /// the linked resources, taken by the `ApplicationInitComplete` path to
     /// advance the system candidates to Ready, or failed on early exit.
@@ -166,6 +167,7 @@ impl ThreadGroup {
                 handle: None,
                 receipt: None,
                 start_storage: None,
+                runtime: None,
                 pending_system_batch: None,
                 fini: ExitFini::Pending,
             })),
@@ -193,6 +195,18 @@ impl ThreadGroup {
     /// the manager reserved the slot.
     pub fn handle(&self) -> Option<ApplicationHandle> {
         self.inner.irqsave_lock().handle
+    }
+
+    pub(crate) fn install_runtime(&self, runtime: Arc<super::dynamic::RuntimeNamespace>) {
+        self.inner.irqsave_lock().runtime = Some(runtime);
+    }
+
+    pub(crate) fn runtime(&self) -> Option<Arc<super::dynamic::RuntimeNamespace>> {
+        self.inner.irqsave_lock().runtime.clone()
+    }
+
+    pub(crate) fn take_runtime(&self) -> Option<Arc<super::dynamic::RuntimeNamespace>> {
+        self.inner.irqsave_lock().runtime.take()
     }
 
     /// Install a publication receipt and its pinned start storage, moving

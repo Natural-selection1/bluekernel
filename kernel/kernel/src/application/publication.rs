@@ -127,6 +127,7 @@ pub struct KernelLinkPublisher {
     /// the resolver and moved in by [`KernelLinkPublisher::import_leases`]
     /// before `publish` is driven. `commit_batch` moves them into the receipt.
     system_leases: Vec<SystemDsoLease>,
+    runtime: bool,
 }
 
 impl KernelLinkPublisher {
@@ -135,6 +136,15 @@ impl KernelLinkPublisher {
         Self {
             group,
             system_leases: Vec::new(),
+            runtime: false,
+        }
+    }
+
+    pub fn runtime(group: ThreadGroup) -> Self {
+        Self {
+            group,
+            system_leases: Vec::new(),
+            runtime: true,
         }
     }
 
@@ -157,7 +167,7 @@ impl LinkPublisher for KernelLinkPublisher {
     ) -> LoadResult<Self::PreparedBatch> {
         // The group must not already carry linked resources: a second install
         // would expose a half-written link map to a reader.
-        if self.group.state() != GroupState::New {
+        if !self.runtime && self.group.state() != GroupState::New {
             return Err(publish_error());
         }
 
@@ -175,8 +185,13 @@ impl LinkPublisher for KernelLinkPublisher {
         let mut system_cap = 0usize;
         for entry in manifest.link_map() {
             let ownership = entry.ownership();
-            if ownership == ImageOwnership::ExternalReady {
-                imported_nodes += 1;
+            if matches!(
+                ownership,
+                ImageOwnership::ExternalReady | ImageOwnership::NamespaceReady
+            ) {
+                if ownership == ImageOwnership::ExternalReady {
+                    imported_nodes += 1;
+                }
                 continue;
             }
             owners.try_reserve(1).map_err(|_| publish_oom())?;
@@ -187,7 +202,7 @@ impl LinkPublisher for KernelLinkPublisher {
                 system_cap += 1;
             }
         }
-        if imported_nodes != self.system_leases.len() {
+        if !self.runtime && imported_nodes != self.system_leases.len() {
             return Err(publish_error());
         }
 
@@ -229,7 +244,7 @@ impl LinkPublisher for KernelLinkPublisher {
                 ImageOwnership::SystemCandidate => system.push(lease),
                 // `prepare_batch` skipped imported Ready images; a lease should
                 // never carry that residency here.
-                ImageOwnership::ExternalReady => {
+                ImageOwnership::ExternalReady | ImageOwnership::NamespaceReady => {
                     unreachable!("imported images carry no lease")
                 }
             }

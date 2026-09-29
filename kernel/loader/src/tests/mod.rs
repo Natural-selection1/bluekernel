@@ -20,6 +20,7 @@ use goblin::elf::{
 use crate::tests::fixture::ElfFixtureBuilder;
 
 mod fixture;
+mod runtime;
 
 #[test]
 fn fixture_builder_emits_a_parseable_elf64_header() {

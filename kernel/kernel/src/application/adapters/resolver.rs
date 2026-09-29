@@ -81,14 +81,39 @@ pub struct NamespaceArtifactResolver {
     leases: Vec<SystemDsoLease>,
     imports: Vec<SystemImportClaim>,
     opened_private: Vec<ArtifactIdentity>,
+    namespace_imports: Vec<(Arc<blueos_loader::PublishedImageDescriptor>, bool)>,
 }
 
 impl NamespaceArtifactResolver {
     /// Atomically acquire the plan's whole system closure. Waiting and retrying
     /// happens here, before the dynamic linker allocates an image.
     pub fn new(plan: NamespaceLoadPlan, registry: SystemDsoRegistry) -> LoadResult<Self> {
+        Self::with_namespace(plan, registry, Vec::new())
+    }
+
+    pub fn with_namespace(
+        plan: NamespaceLoadPlan,
+        registry: SystemDsoRegistry,
+        namespace_imports: Vec<(Arc<blueos_loader::PublishedImageDescriptor>, bool)>,
+    ) -> LoadResult<Self> {
+        // A constructor may dlopen while this application's startup system
+        // batch is still Initializing. Borrow its pinned providers instead of
+        // waiting for our own init completion.
+        let keys: Vec<_> = plan
+            .system_keys()
+            .iter()
+            .filter(|key| {
+                !plan.images().iter().any(|image| {
+                    image.system_key() == Some(*key)
+                        && namespace_imports
+                            .iter()
+                            .any(|(provider, _)| provider.identity() == image.identity())
+                })
+            })
+            .cloned()
+            .collect();
         let PreparedSystemBatch { loads, imports } = loop {
-            match registry.acquire_batch(plan.system_keys()) {
+            match registry.acquire_batch(&keys) {
                 AcquireBatchOutcome::Acquired(batch) => break batch,
                 AcquireBatchOutcome::Pending(wait) => wait.wait(),
             }
@@ -101,12 +126,67 @@ impl NamespaceArtifactResolver {
             leases: Vec::new(),
             imports: Vec::new(),
             opened_private: Vec::new(),
+            namespace_imports,
         })
     }
 
     /// Open the planned root artifact.
     pub fn root_artifact(&self) -> LoadResult<ResolvedArtifact<VfsElfReader>> {
         self.open_planned(&self.plan.images()[0], ImageOwnership::SessionPrivate)
+    }
+
+    pub fn dependency_imports(&self) -> Vec<ImportedImageDescriptor> {
+        let mut imports: Vec<_> = self
+            .namespace_imports
+            .iter()
+            .filter(|(descriptor, _)| {
+                self.plan
+                    .images()
+                    .iter()
+                    .any(|image| image.identity() == descriptor.identity())
+            })
+            .map(|(descriptor, system)| {
+                if *system {
+                    ImportedImageDescriptor::new(descriptor.clone())
+                } else {
+                    ImportedImageDescriptor::namespace(descriptor.clone())
+                }
+            })
+            .collect();
+        imports.extend(
+            self.batch_imports
+                .iter()
+                .map(|(_, _, descriptor)| ImportedImageDescriptor::new(descriptor.clone())),
+        );
+        imports
+    }
+
+    pub fn shared_root(&mut self) -> LoadResult<DependencyResolution<VfsElfReader>> {
+        self.resolve_provider(0)
+    }
+
+    fn resolve_provider(&mut self, index: usize) -> LoadResult<DependencyResolution<VfsElfReader>> {
+        if let Some((descriptor, system)) = self
+            .namespace_imports
+            .iter()
+            .find(|(image, _)| image.identity() == self.plan.images()[index].identity())
+        {
+            return Ok(DependencyResolution::Import(if *system {
+                ImportedImageDescriptor::new(descriptor.clone())
+            } else {
+                ImportedImageDescriptor::namespace(descriptor.clone())
+            }));
+        }
+        if self.plan.images()[index].system() {
+            return self.resolve_system(index);
+        }
+        let provider = &self.plan.images()[index];
+        if !self.opened_private.contains(provider.identity()) {
+            log::info!("NS_LOAD path={}", provider.path());
+            self.opened_private.push(provider.identity().clone());
+        }
+        self.open_planned(provider, ImageOwnership::SessionPrivate)
+            .map(DependencyResolution::Load)
     }
 
     /// Hand all registry authority to the publisher after dependency closure.
@@ -229,17 +309,7 @@ impl ArtifactResolver for NamespaceArtifactResolver {
         request: &DependencyRequest<'_>,
     ) -> LoadResult<DependencyResolution<Self::Reader>> {
         let provider_index = self.planned_provider_index(request)?;
-        if self.plan.images()[provider_index].system() {
-            self.resolve_system(provider_index)
-        } else {
-            let provider = &self.plan.images()[provider_index];
-            if !self.opened_private.contains(provider.identity()) {
-                log::info!("NS_LOAD path={}", provider.path());
-                self.opened_private.push(provider.identity().clone());
-            }
-            self.open_planned(provider, ImageOwnership::SessionPrivate)
-                .map(DependencyResolution::Load)
-        }
+        self.resolve_provider(provider_index)
     }
 }
 

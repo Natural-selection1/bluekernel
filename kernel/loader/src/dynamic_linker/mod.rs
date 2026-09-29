@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Multi-image dynamic linking for Thumbv7 applications.
+//! Multi-image dynamic linking for applications and runtime shared objects.
 //!
 //! The module owns artifact resolution, dependency discovery, symbol scope,
 //! relocation, lifecycle planning and publication.
@@ -27,6 +27,11 @@ mod relocate;
 mod scope;
 mod session;
 mod symbol;
+
+#[cfg(test)]
+pub(crate) use graph::DependencyGraph;
+#[cfg(test)]
+pub(crate) use session::SessionUsage;
 
 pub use artifact::{
     ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,

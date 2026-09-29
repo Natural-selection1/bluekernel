@@ -230,9 +230,19 @@ impl ApplicationReaper {
     /// reap (still draining, members remain, fini pending, or already reaped).
     pub fn reap(&self, group: &ThreadGroup) -> Result<ReapReport, ThreadGroupError> {
         let (receipt, start_storage) = group.take_resources_for_reap()?;
+        if let Some(runtime) = group.take_runtime() {
+            runtime.abandon();
+            drop(runtime);
+        }
         // The start storage holds no leases; dropping it releases the pinned
         // argv/envp/auxv/init/fini backing once no thread can read it.
         drop(start_storage);
+        Ok(self.release_receipt(receipt))
+    }
+
+    /// Release a runtime link after the application's destructor plan finished.
+    /// No group, loader or registry lock may be held while this runs.
+    pub(crate) fn release_receipt(&self, receipt: KernelLinkReceipt) -> ReapReport {
         let (private, failed_system, system_leases) = receipt.into_parts();
 
         // `FlatImageMemory` is a handle onto a shared service; `release_committed`
@@ -316,9 +326,9 @@ impl ApplicationReaper {
             }
         }
 
-        Ok(ReapReport {
+        ReapReport {
             private_images,
             imported_dsos,
-        })
+        }
     }
 }

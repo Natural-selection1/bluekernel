@@ -246,6 +246,8 @@ if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
       "${root_gen_dir}/apps/example/dynamic/scope_bad/scope_bad_layout.json"
   _tls_layout =
       "${root_gen_dir}/apps/example/dynamic/tls_demo/tls_demo_layout.json"
+  _dlopen_layout =
+      "${root_gen_dir}/apps/example/dynamic/dlopen_demo/dlopen_demo_layout.json"
 
   _boot_seed_catalog = "${target_gen_dir}/boot_seed_catalog.rs"
 
@@ -255,6 +257,7 @@ if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
       "//apps/example/dynamic/clang_c:clang_c_layout",
       "//apps/example/dynamic/clang_cxx:clang_cxx_layout",
       "//apps/example/dynamic/cycle_demo:cycle_demo_layout",
+      "//apps/example/dynamic/dlopen_demo:dlopen_demo_layout",
       "//apps/example/dynamic/hello",
       "//apps/example/dynamic/multi_dso:multi_layout",
       "//apps/example/dynamic/rust_std",
@@ -278,6 +281,7 @@ if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
       _scope_layout,
       _scope_bad_layout,
       _tls_layout,
+      _dlopen_layout,
     ]
 
     # Fixed files and application bundle layouts share one source of truth.
@@ -311,6 +315,8 @@ if (defined(boot_dynamic_seed) && boot_dynamic_seed) {
       rebase_path(_scope_bad_layout),
       "--layout",
       rebase_path(_tls_layout),
+      "--layout",
+      rebase_path(_dlopen_layout),
     ]
     outputs = [ _boot_seed_catalog ]
   }

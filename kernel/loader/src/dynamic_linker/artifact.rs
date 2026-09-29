@@ -232,6 +232,10 @@ pub enum ImageOwnership {
     /// A Ready system DSO imported from the registry: already relocated and
     /// sealed, contributed to the graph/scopes without a fresh load.
     ExternalReady,
+    /// An already initialized image owned by the importing application.
+    /// It participates in private scopes but carries no new allocation or
+    /// lifecycle entries. The host must retain its original publication.
+    NamespaceReady,
 }
 
 /// A resolved artifact: its identity and reader.

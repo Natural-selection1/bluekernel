@@ -33,7 +33,8 @@ use crate::{
         artifact::{ArtifactIdentity, DependencyName},
         graph::DependencyNode,
         symbol::SymbolTable,
-        ProgramHeaderRuntimeInfo,
+        ImageOwnership, ProgramHeaderRuntimeInfo, SymbolBinding, SymbolDefinition,
+        SymbolVisibility,
     },
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
@@ -171,6 +172,21 @@ impl PublishedImageDescriptor {
         &self.program_headers
     }
 
+    /// Look up an exported definition, preserving the Thumb function bit and
+    /// distinguishing a defined absolute zero from a missing symbol. Hidden,
+    /// internal, local and undefined entries never escape the image.
+    pub fn lookup_export(&self, name: &[u8]) -> Option<TargetAddress> {
+        let table = self.exports();
+        let entry = table.entry(table.lookup(name)?)?;
+        (entry.definition() == SymbolDefinition::Defined
+            && matches!(entry.binding(), SymbolBinding::Global | SymbolBinding::Weak)
+            && matches!(
+                entry.visibility(),
+                SymbolVisibility::Default | SymbolVisibility::Protected
+            ))
+        .then(|| entry.value())
+    }
+
     #[inline]
     pub(crate) const fn exports(&self) -> &SymbolTable {
         self.exports.table()
@@ -185,6 +201,7 @@ impl PublishedImageDescriptor {
 /// reuse the immutable registry snapshot without cloning its symbol table.
 pub struct ImportedImageDescriptor {
     descriptor: Arc<PublishedImageDescriptor>,
+    ownership: ImageOwnership,
 }
 
 impl ImportedImageDescriptor {
@@ -192,7 +209,18 @@ impl ImportedImageDescriptor {
     /// resolver.
     #[inline]
     pub fn new(descriptor: Arc<PublishedImageDescriptor>) -> Self {
-        Self { descriptor }
+        Self {
+            descriptor,
+            ownership: ImageOwnership::ExternalReady,
+        }
+    }
+
+    /// Borrow an initialized image from this application's existing namespace.
+    pub fn namespace(descriptor: Arc<PublishedImageDescriptor>) -> Self {
+        Self {
+            descriptor,
+            ownership: ImageOwnership::NamespaceReady,
+        }
     }
 
     #[inline]
@@ -201,8 +229,8 @@ impl ImportedImageDescriptor {
     }
 
     #[inline]
-    pub(crate) fn into_descriptor(self) -> Arc<PublishedImageDescriptor> {
-        self.descriptor
+    pub(crate) fn into_parts(self) -> (Arc<PublishedImageDescriptor>, ImageOwnership) {
+        (self.descriptor, self.ownership)
     }
 }
 

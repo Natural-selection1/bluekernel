@@ -489,9 +489,23 @@ impl SystemDsoRegistry {
     /// this path only moves state.
     pub fn finish_initialization_batch(
         &self,
-        batch: SystemInitBatch,
+        mut batch: SystemInitBatch,
     ) -> LoadResult<Vec<SystemDsoLease>> {
-        let (inner, members, _failure_backings) = batch.consume();
+        self.try_finish_initialization_batch(&mut batch)
+    }
+
+    /// Keep failure authority with the caller until all fallible validation
+    /// and reservations finish. Runtime loading can then retain failed
+    /// backings while executing the matching destructor plan.
+    pub(crate) fn try_finish_initialization_batch(
+        &self,
+        batch: &mut SystemInitBatch,
+    ) -> LoadResult<Vec<SystemDsoLease>> {
+        if !batch.armed || !Arc::ptr_eq(&self.inner, &batch.inner) {
+            return Err(stale_error());
+        }
+        let inner = Arc::clone(&batch.inner);
+        let members = &batch.members;
         let mut guard = inner.lock();
         let resolution = Arc::clone(&guard.resolution);
         let mut leases = Vec::new();
@@ -502,7 +516,7 @@ impl SystemDsoRegistry {
         // Validate the complete transition and every outgoing dependency
         // before mutating a slot. A provider may be an already-Ready import or
         // another member of this initialization batch.
-        for member in &members {
+        for member in members {
             let instance = guard.slots.get(member.slot).ok_or_else(stale_error)?;
             if instance.generation != member.generation {
                 return Err(stale_error());
@@ -545,7 +559,10 @@ impl SystemDsoRegistry {
         pending_dependencies
             .try_reserve(members.len())
             .map_err(|_| registry_oom())?;
-        for member in &members {
+        // Validation and storage reservations are complete. No error below
+        // can occur while this lock preserves the validated slot states.
+        batch.armed = false;
+        for member in members {
             let instance = guard.slots.get_mut(member.slot).ok_or_else(stale_error)?;
             match core::mem::replace(&mut instance.state, InstanceState::Vacant) {
                 InstanceState::Initializing {

@@ -149,6 +149,21 @@ impl DependencyGraph {
             .map(DependencyNode::id)
     }
 
+    /// Add a borrowed scope provider with no dependency edge. Its backing and
+    /// dependency closure remain owned by the host's original publication.
+    pub(crate) fn insert_scope_provider(
+        &mut self,
+        artifact: ArtifactIdentity,
+        soname: Option<DependencyName>,
+        ownership: ImageOwnership,
+    ) -> LoadResult<ImageId> {
+        let id = ImageId::new(self.nodes.len() as u32);
+        self.limits.check_image_count(id.get() + 1)?;
+        self.check_soname_len(soname.as_ref())?;
+        self.record_node(id, artifact, soname, ownership, 0)?;
+        Ok(id)
+    }
+
     /// Record an edge from `requester` to an already-admitted `provider`.
     ///
     /// This is the de-duplication fast path: the discovery driver

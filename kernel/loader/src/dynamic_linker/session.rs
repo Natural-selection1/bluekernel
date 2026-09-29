@@ -38,8 +38,8 @@ use crate::{
         scope::RelocationBinding,
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
         DependencyRequester, DependencyResolution, ImageId, ImageOwnership,
-        PublishedImageDescriptor, PublishedRegion, ResolvedArtifact, RuntimeImageMetadata,
-        RuntimeImageState, ScopeSet, SymbolTable,
+        ImportedImageDescriptor, PublishedImageDescriptor, PublishedRegion, ResolvedArtifact,
+        RuntimeImageMetadata, RuntimeImageState, ScopeSet, SymbolTable,
     },
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
@@ -152,6 +152,7 @@ impl ImportedImage {
 pub struct BuildingState {
     images: Vec<SessionImage<RuntimeImageState>>,
     imported: Vec<ImportedImage>,
+    scope_prefix: Vec<ImageId>,
     discovery: DiscoveryQueue,
     closed: bool,
     poisoned: bool,
@@ -351,6 +352,87 @@ impl<A: ArchRelocator> DynamicLinker<A> {
         R: ElfReader,
         Memory: ImageMemory + ?Sized,
     {
+        self.begin_role(root, profile, limits, memory, ArtifactRole::ExecutableRoot)
+    }
+
+    /// Start a runtime shared-object link. A DSO root may have no entry point,
+    /// and may already be initialized in a host-owned namespace or registry.
+    pub fn begin_shared<R, Memory>(
+        self,
+        root: DependencyResolution<R>,
+        profile: LoadProfile,
+        limits: SessionLimits,
+        memory: &mut Memory,
+    ) -> LoadResult<BuildingSession<'_, Memory, A>>
+    where
+        R: ElfReader,
+        Memory: ImageMemory + ?Sized,
+    {
+        match root {
+            DependencyResolution::Load(root) => {
+                self.begin_role(root, profile, limits, memory, ArtifactRole::SharedObject)
+            }
+            DependencyResolution::Import(root) => {
+                if self.arch.machine() != profile.machine()
+                    || self.arch.class() != profile.class()
+                    || profile.r#type() != ElfType::Dyn
+                {
+                    return Err(session_error(
+                        LoadErrorKind::UnsupportedByProfile,
+                        ErrorContext::None,
+                    ));
+                }
+                let (descriptor, ownership) = root.into_parts();
+                let mut graph = DependencyGraph::new(limits);
+                let id = graph.insert_root(
+                    descriptor.identity().try_clone()?,
+                    descriptor
+                        .soname()
+                        .map(DependencyName::try_clone)
+                        .transpose()?,
+                    ownership,
+                )?;
+                let mut usage = SessionUsage::default();
+                usage.record_image(0, imported_metadata_bytes(&descriptor)?, &limits)?;
+                Ok(LinkSession {
+                    rollback: RollbackGuard {
+                        memory,
+                        log: AllocationRollbackLog::new(),
+                    },
+                    graph,
+                    limits,
+                    usage,
+                    profile,
+                    policy: self.policy,
+                    arch: self.arch,
+                    state: BuildingState {
+                        images: Vec::new(),
+                        imported: alloc::vec![ImportedImage {
+                            image_id: id,
+                            descriptor
+                        }],
+                        scope_prefix: Vec::new(),
+                        discovery: DiscoveryQueue::new(limits),
+                        closed: false,
+                        poisoned: false,
+                    },
+                })
+            }
+        }
+    }
+
+    fn begin_role<R, Memory>(
+        self,
+        root: ResolvedArtifact<R>,
+        profile: LoadProfile,
+        limits: SessionLimits,
+        memory: &mut Memory,
+        role: ArtifactRole,
+    ) -> LoadResult<BuildingSession<'_, Memory, A>>
+    where
+        R: ElfReader,
+        Memory: ImageMemory + ?Sized,
+    {
         if self.arch.machine() != profile.machine() || self.arch.class() != profile.class() {
             return Err(
                 LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
@@ -371,7 +453,12 @@ impl<A: ArchRelocator> DynamicLinker<A> {
             )
             .at_stage(LoadStage::Beginning));
         }
-        if root.ownership() != ImageOwnership::SessionPrivate {
+        if !matches!(
+            root.ownership(),
+            ImageOwnership::SessionPrivate | ImageOwnership::SystemCandidate
+        ) || (role == ArtifactRole::ExecutableRoot
+            && root.ownership() != ImageOwnership::SessionPrivate)
+        {
             return Err(
                 LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
                     .at_stage(LoadStage::Beginning),
@@ -389,7 +476,7 @@ impl<A: ArchRelocator> DynamicLinker<A> {
         let (allocation, mut runtime) = load_runtime(
             reader,
             profile,
-            ArtifactRole::ExecutableRoot,
+            role,
             self.policy,
             limits.per_image(),
             &mut guard.log,
@@ -434,6 +521,7 @@ impl<A: ArchRelocator> DynamicLinker<A> {
             state: BuildingState {
                 images,
                 imported: Vec::new(),
+                scope_prefix: Vec::new(),
                 discovery,
                 closed: false,
                 poisoned: false,
@@ -443,6 +531,77 @@ impl<A: ArchRelocator> DynamicLinker<A> {
 }
 
 impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
+    /// Borrow the host's global scope before discovering the new dependency
+    /// closure. No image is relocated or initialized a second time.
+    pub fn import_scope(&mut self, providers: Vec<ImportedImageDescriptor>) -> LoadResult<()> {
+        self.import_providers(providers, true)
+    }
+
+    /// Borrow providers reachable through the new closure without making them
+    /// part of the existing global prefix.
+    pub fn import_dependencies(
+        &mut self,
+        providers: Vec<ImportedImageDescriptor>,
+    ) -> LoadResult<()> {
+        self.import_providers(providers, false)
+    }
+
+    fn import_providers(
+        &mut self,
+        providers: Vec<ImportedImageDescriptor>,
+        global: bool,
+    ) -> LoadResult<()> {
+        if self.state.closed || self.state.poisoned {
+            return Err(session_error(LoadErrorKind::BadElf, ErrorContext::None));
+        }
+        let result = self.add_providers(providers, global);
+        if result.is_err() {
+            self.state.poisoned = true;
+        }
+        result
+    }
+
+    fn add_providers(
+        &mut self,
+        providers: Vec<ImportedImageDescriptor>,
+        global: bool,
+    ) -> LoadResult<()> {
+        for provider in providers {
+            let (descriptor, ownership) = provider.into_parts();
+            let id = if let Some(id) = self.graph.find_identity(descriptor.identity()) {
+                id
+            } else {
+                self.usage
+                    .record_image(0, imported_metadata_bytes(&descriptor)?, &self.limits)?;
+                self.state
+                    .imported
+                    .try_reserve(1)
+                    .map_err(|_| scope_session_oom())?;
+                let id = self.graph.insert_scope_provider(
+                    descriptor.identity().try_clone()?,
+                    descriptor
+                        .soname()
+                        .map(DependencyName::try_clone)
+                        .transpose()?,
+                    ownership,
+                )?;
+                self.state.imported.push(ImportedImage {
+                    image_id: id,
+                    descriptor,
+                });
+                id
+            };
+            if global && !self.state.scope_prefix.contains(&id) {
+                self.state
+                    .scope_prefix
+                    .try_reserve(1)
+                    .map_err(|_| scope_session_oom())?;
+                self.state.scope_prefix.push(id);
+            }
+        }
+        Ok(())
+    }
+
     /// Drive the bounded BFS closure until the discovery queue is empty.
     ///
     /// Each resolved dependency is de-duplicated by identity *before* it is
@@ -567,7 +726,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                 }
 
                 DependencyResolution::Import(imported) => {
-                    let descriptor = imported.into_descriptor();
+                    let (descriptor, ownership) = imported.into_parts();
 
                     // An imported Ready image is joined to the graph and scopes
                     // without a fresh allocation, relocation, seal, or init.
@@ -599,7 +758,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                             item.needed_index(),
                             identity,
                             soname,
-                            ImageOwnership::ExternalReady,
+                            ownership,
                         )
                         .map_err(|error| error.at_stage(LoadStage::Discover))?;
 
@@ -642,6 +801,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
         let BuildingState {
             images,
             imported,
+            scope_prefix,
             discovery: _,
             closed,
             poisoned,
@@ -675,7 +835,12 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                 LoadError::new(LoadErrorKind::BadElf, ErrorContext::None).at_stage(LoadStage::Scope)
             })?);
         }
-        let scopes = ScopeSet::freeze(&graph).map_err(|error| error.at_stage(LoadStage::Scope))?;
+        let scopes = if scope_prefix.is_empty() {
+            ScopeSet::freeze(&graph)
+        } else {
+            ScopeSet::freeze_with_prefix(&graph, &scope_prefix)
+        }
+        .map_err(|error| error.at_stage(LoadStage::Scope))?;
 
         Ok(LinkSession {
             rollback,
@@ -1158,7 +1323,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
             let image_id = imported.image_id;
             slots[image_id.get() as usize] = Some(CommittedImage::new(
                 image_id,
-                ImageOwnership::ExternalReady,
+                graph.node(image_id).ok_or_else(publish_oom)?.ownership(),
                 imported.descriptor,
             ));
         }

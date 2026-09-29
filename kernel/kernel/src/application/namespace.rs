@@ -33,6 +33,7 @@ use blueos_loader::LoadProfile;
 use crate::vfs::{join_path, normalize_path};
 
 /// One launch's frozen path namespace and link policy.
+#[derive(Clone)]
 pub struct ApplicationNamespace {
     /// The root ELF path, resolved against `launch_pwd` and normalized.
     root_path: String,

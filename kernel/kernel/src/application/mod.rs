@@ -52,6 +52,7 @@ pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
 }
 
 pub mod adapters;
+pub mod dynamic;
 pub mod group;
 pub mod loader;
 pub mod manager;

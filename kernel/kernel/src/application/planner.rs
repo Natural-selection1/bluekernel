@@ -170,7 +170,15 @@ impl<'a> NamespaceLoadPlanner<'a> {
     /// Each discovered image is scanned read-only and assigned an identity
     /// derived from its normalized path.
     pub fn plan(&self) -> LoadResult<NamespaceLoadPlan> {
-        let root_path = self.namespace.root_path();
+        self.plan_from(self.namespace.root_path(), ArtifactRole::ExecutableRoot)
+    }
+
+    /// Scan a runtime DSO without changing the application's search directory.
+    pub fn plan_shared(&self, path: &str) -> LoadResult<NamespaceLoadPlan> {
+        self.plan_from(path, ArtifactRole::SharedObject)
+    }
+
+    fn plan_from(&self, root_path: &str, role: ArtifactRole) -> LoadResult<NamespaceLoadPlan> {
         let mut images: Vec<PlannedImage> = Vec::new();
         let mut edges: Vec<PlannedEdge> = Vec::new();
         let mut system_keys: Vec<DependencyName> = Vec::new();
@@ -181,7 +189,10 @@ impl<'a> NamespaceLoadPlanner<'a> {
         // count.
         let mut queue: Vec<(usize, u16)> = Vec::new();
         let mut queue_head = 0;
-        let root = self.open_and_scan(root_path, ArtifactRole::ExecutableRoot)?;
+        let root = self.open_and_scan(root_path, role)?;
+        if let Some(key) = root.system_key() {
+            system_keys.push(key.clone());
+        }
         images.push(root);
         queue.push((0, 1));
 

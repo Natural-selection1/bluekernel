@@ -1204,6 +1204,22 @@ define_syscall_handler!(application_finish_exit() -> c_long {
     application_syscalls::finish_exit()
 });
 
+define_syscall_handler!(dl_open(path: *const u8, len: usize, flags: c_int, plan: *mut blueos_header::dlfcn::BlueOsDlPlan) -> c_long {
+    dlfcn::open(path, len, flags, plan)
+});
+define_syscall_handler!(dl_sym(handle: usize, name: *const u8, len: usize, result: *mut usize) -> c_long {
+    dlfcn::symbol(handle, name, len, result)
+});
+define_syscall_handler!(dl_close(handle: usize, plan: *mut blueos_header::dlfcn::BlueOsDlPlan) -> c_long {
+    dlfcn::close(handle, plan)
+});
+define_syscall_handler!(dl_finish(token: usize, plan: *mut blueos_header::dlfcn::BlueOsDlPlan) -> c_long {
+    dlfcn::finish(token, plan)
+});
+define_syscall_handler!(dl_exit(plan: *mut blueos_header::dlfcn::BlueOsDlPlan) -> c_long {
+    dlfcn::exit(plan)
+});
+
 #[cfg(enable_syscall)]
 syscall_table! {
     (Echo, echo),
@@ -1287,6 +1303,11 @@ syscall_table! {
     (ApplicationBeginExit, application_begin_exit),
     #[cfg(any(armv7m, armv8m, target_arch = "riscv32", target_arch = "riscv64", target_arch = "aarch64"))]
     (ApplicationFinishExit, application_finish_exit),
+    (DlOpen, dl_open),
+    (DlSym, dl_sym),
+    (DlClose, dl_close),
+    (DlFinish, dl_finish),
+    (DlExit, dl_exit),
 }
 
 #[cfg(not(enable_syscall))]
@@ -1295,6 +1316,7 @@ pub fn dispatch_syscall(ctx: &Context) -> usize {
 }
 
 // Begin syscall modules.
+pub mod dlfcn;
 pub mod echo;
 pub mod posix_timers;
 // End syscall modules.

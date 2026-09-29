@@ -185,7 +185,12 @@ pub(crate) fn build_manifest(
                 }
                 *load_bias
             }
-            LinkMapImage::Imported { load_bias, .. } => *load_bias,
+            LinkMapImage::Imported { load_bias, .. } => {
+                if image_id.get() == 0 {
+                    root_entry = Some(TargetAddress::new(0));
+                }
+                *load_bias
+            }
         };
 
         entries.push(LinkMapEntry {

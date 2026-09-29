@@ -154,6 +154,13 @@ impl ScopeSet {
     /// Freeze a closed dependency graph into immutable scopes.
     ///
     pub(crate) fn freeze(graph: &DependencyGraph) -> LoadResult<Self> {
+        Self::freeze_with_prefix(graph, &[])
+    }
+
+    pub(crate) fn freeze_with_prefix(
+        graph: &DependencyGraph,
+        prefix: &[ImageId],
+    ) -> LoadResult<Self> {
         let nodes = graph.nodes();
         let mut session_private = Vec::new();
         let mut system_candidates = Vec::new();
@@ -165,7 +172,9 @@ impl ScopeSet {
             .map_err(|_| scope_oom())?;
         for node in nodes {
             match node.ownership() {
-                ImageOwnership::SessionPrivate => session_private.push(node.id()),
+                ImageOwnership::SessionPrivate | ImageOwnership::NamespaceReady => {
+                    session_private.push(node.id())
+                }
                 ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady => {
                     system_candidates.push(node.id())
                 }
@@ -181,6 +190,19 @@ impl ScopeSet {
             .map_err(|_| scope_oom())?;
         application_order.extend(system_candidates.iter().copied());
 
+        // Runtime relocation searches the existing global namespace before
+        // the new local closure. System requesters still use only system scope.
+        let mut prefixed = Vec::new();
+        prefixed
+            .try_reserve_exact(application_order.len())
+            .map_err(|_| scope_oom())?;
+        prefixed.extend_from_slice(prefix);
+        prefixed.extend(
+            application_order
+                .into_iter()
+                .filter(|id| !prefix.contains(id)),
+        );
+
         let mut ownership = Vec::new();
         ownership
             .try_reserve_exact(nodes.len())
@@ -191,7 +213,7 @@ impl ScopeSet {
 
         Ok(Self {
             application: SymbolScope {
-                ordered_images: application_order,
+                ordered_images: prefixed,
             },
             system: SymbolScope {
                 ordered_images: system_candidates,

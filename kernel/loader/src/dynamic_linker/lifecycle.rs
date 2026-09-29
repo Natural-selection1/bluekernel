@@ -350,7 +350,8 @@ pub(crate) fn build<M: ImageMemory + ?Sized>(
                     None => system_fini.push((entry.owner(), alloc::vec![*entry])),
                 }
             }
-            crate::dynamic_linker::ImageOwnership::ExternalReady => {
+            crate::dynamic_linker::ImageOwnership::ExternalReady
+            | crate::dynamic_linker::ImageOwnership::NamespaceReady => {
                 // Imported images carry no fini entries by construction.
             }
         }

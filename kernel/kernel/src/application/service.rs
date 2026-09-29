@@ -81,6 +81,11 @@ struct LinkHandoff {
     outcome: SpinLock<Option<Result<(), ApplicationLaunchError>>>,
 }
 
+struct RuntimeLinkHandoff {
+    epoch: AtomicUsize,
+    outcome: SpinLock<Option<Result<super::dynamic::PreparedLoad, i32>>>,
+}
+
 impl LinkHandoff {
     fn new() -> Self {
         Self {
@@ -128,6 +133,62 @@ impl ApplicationService {
     /// The application manager.
     pub fn manager(&self) -> &ApplicationManager {
         &self.manager
+    }
+
+    pub(crate) fn runtime_catalog(&self) -> &'static SystemLibraryPaths {
+        self.loader.catalog()
+    }
+    pub(crate) fn runtime_loader(&self) -> &ApplicationLoader {
+        &self.loader
+    }
+    pub(crate) fn release_runtime_receipt(&self, receipt: super::publication::KernelLinkReceipt) {
+        self.reaper.release_receipt(receipt);
+    }
+    pub(crate) fn finish_runtime_init(
+        &self,
+        batch: &mut super::registry::SystemInitBatch,
+    ) -> Result<Vec<super::registry::SystemDsoLease>, i32> {
+        self.loader
+            .registry()
+            .try_finish_initialization_batch(batch)
+            .map_err(|_| libc::ENOEXEC)
+    }
+
+    pub(crate) fn fail_runtime_init(
+        &self,
+        batch: super::registry::SystemInitBatch,
+    ) -> Vec<blueos_loader::AllocationLease> {
+        self.loader.registry().fail_initialization_batch(batch)
+    }
+
+    pub(crate) fn prepare_runtime_load(
+        &'static self,
+        group: ThreadGroup,
+        namespace: ApplicationNamespace,
+        path: alloc::string::String,
+        existing: Vec<super::dynamic::ExistingImage>,
+    ) -> Result<super::dynamic::PreparedLoad, i32> {
+        let handoff = Arc::new(RuntimeLinkHandoff {
+            epoch: AtomicUsize::new(0),
+            outcome: SpinLock::new(None),
+        });
+        let worker = handoff.clone();
+        thread::spawn_with_stack(LINK_STACK_SIZE, move || {
+            let result = super::dynamic::prepare_load(self, &group, &namespace, &path, existing);
+            *worker.outcome.irqsave_lock() = Some(result);
+            worker.epoch.store(1, Ordering::Release);
+            let _ = crate::sync::atomic_wake(&worker.epoch, usize::MAX);
+        })
+        .ok_or(libc::ENOMEM)?;
+        while handoff.epoch.load(Ordering::Acquire) == 0 {
+            let _ = crate::sync::atomic_wait(&handoff.epoch, 0, Tick::MAX);
+        }
+        let result = handoff
+            .outcome
+            .irqsave_lock()
+            .take()
+            .expect("runtime link worker published its result");
+        result
     }
 
     /// Accept the application's init completion: first advance
@@ -296,6 +357,9 @@ impl ApplicationService {
         // after the install moved the storage into the group.
         let start_info = storage.start_info_ptr();
         let entry = product.entry().get() as usize;
+        let runtime = super::dynamic::RuntimeNamespace::new(namespace.clone(), &product)
+            .map_err(|_| ApplicationLaunchError::PrepareFailed)?;
+        group.install_runtime(runtime);
         let receipt = product.into_publication();
         group
             .install_resources(receipt, storage)
