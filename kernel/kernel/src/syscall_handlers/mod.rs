@@ -349,6 +349,9 @@ set_sched_param(tid: usize, prio: c_int) -> c_long {
         return -(EINVAL as c_long);
     }
     let p = prio as crate::types::ThreadPriority;
+    // Keep a local ready thread from running between the state lookup and
+    // its move to the new priority queue.
+    let preempt_guard = thread::Thread::try_preempt_me();
     let mut was_ready = false;
     let target = thread::GlobalQueueVisitor::find_if(|t| {
         if thread::Thread::id(t) == tid {
@@ -368,7 +371,6 @@ set_sched_param(tid: usize, prio: c_int) -> c_long {
         return -(ESRCH as c_long);
     };
 
-    let preempt_guard = thread::Thread::try_preempt_me();
     let ret = if was_ready {
         match scheduler::update_ready_thread_priority(&target, p) {
             Ok(()) => 0,
