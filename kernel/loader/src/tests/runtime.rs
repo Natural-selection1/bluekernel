@@ -21,8 +21,11 @@ use crate::{
     LoadErrorKind, LoadLimits, LoadProfile, LoadResult, ProgramHeaderRuntimeInfo,
     PublishedImageDescriptor, ResolvedArtifact, Riscv64Relocator, SessionLimits, TargetAddress,
 };
+use alloc::{rc::Rc, sync::Arc, vec::Vec};
+use core::cell::RefCell;
 use goblin::elf::header::{EM_RISCV, ET_DYN};
-use std::{cell::RefCell, rc::Rc, sync::Arc, vec::Vec};
+
+use blueos_test_macro::test;
 
 fn identity(name: &[u8]) -> ArtifactIdentity {
     ArtifactIdentity::new(FileIdentity::from_bytes(name))
@@ -31,7 +34,7 @@ fn identity(name: &[u8]) -> ArtifactIdentity {
 // A real decoded hash/symbol table: one named SHN_ABS symbol and the ELF
 // null entry. This also exercises absolute address zero without a fake lookup.
 fn symbols(binding: u8, visibility: u8, defined: bool, value: u64) -> SymbolTable {
-    let mut bytes = std::vec![0u8; 48];
+    let mut bytes = alloc::vec![0u8; 48];
     bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
     bytes[28] = binding << 4;
     bytes[29] = visibility;
@@ -141,7 +144,7 @@ fn runtime_imported_root_and_duplicate_scope_do_not_allocate_backings() {
         )
         .unwrap();
     shared
-        .import_scope(std::vec![
+        .import_scope(alloc::vec![
             ImportedImageDescriptor::namespace(provider.clone()),
             ImportedImageDescriptor::namespace(provider)
         ])
@@ -179,7 +182,7 @@ fn failed_runtime_scope_import_poisoning_prevents_partial_publication() {
         )
         .unwrap();
     let error = shared
-        .import_scope(std::vec![ImportedImageDescriptor::namespace(descriptor(
+        .import_scope(alloc::vec![ImportedImageDescriptor::namespace(descriptor(
             b"excess",
             SymbolTable::empty()
         ))])

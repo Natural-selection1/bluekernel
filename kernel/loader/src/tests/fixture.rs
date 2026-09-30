@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cell::RefCell, rc::Rc, vec::Vec};
+use alloc::{rc::Rc, vec::Vec};
+use core::cell::RefCell;
 
 use goblin::{
     elf::header::{
@@ -34,7 +35,7 @@ pub struct ElfFixtureBuilder {
 
 impl ElfFixtureBuilder {
     pub fn elf64(e_machine: u16, e_type: u16) -> Self {
-        let mut bytes = std::vec![0; elf64::header::SIZEOF_EHDR];
+        let mut bytes = alloc::vec![0; elf64::header::SIZEOF_EHDR];
         bytes[..4].copy_from_slice(ELFMAG);
         bytes[EI_CLASS] = ELFCLASS64;
         bytes[EI_DATA] = ELFDATA2LSB;
@@ -56,7 +57,7 @@ impl ElfFixtureBuilder {
     }
 
     pub fn elf32(e_machine: u16, e_type: u16) -> Self {
-        let mut bytes = std::vec![0; elf32::header::SIZEOF_EHDR];
+        let mut bytes = alloc::vec![0; elf32::header::SIZEOF_EHDR];
         bytes[..4].copy_from_slice(ELFMAG);
         bytes[EI_CLASS] = ELFCLASS32;
         bytes[EI_DATA] = ELFDATA2LSB;

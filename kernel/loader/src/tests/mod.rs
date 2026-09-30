@@ -22,6 +22,8 @@ use crate::tests::fixture::ElfFixtureBuilder;
 mod fixture;
 mod runtime;
 
+use blueos_test_macro::test;
+
 #[test]
 fn fixture_builder_emits_a_parseable_elf64_header() {
     let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN).build();
@@ -37,7 +39,9 @@ fn fixture_builder_emits_a_parseable_elf64_header() {
 /// dependency; a root or static PIE without one always was. The remaining
 /// hard requirement is `PT_DYNAMIC` for a shared object.
 mod soname_relaxation {
-    use std::vec::Vec;
+    use alloc::vec::Vec;
+
+    use blueos_test_macro::test;
 
     use goblin::elf::header::{EM_RISCV, ET_DYN};
 
@@ -128,6 +132,8 @@ mod soname_relaxation {
 /// read-only dependency scan: the scanner must see the same SONAME and
 /// `DT_NEEDED` set the real pipeline would decode, without any allocation.
 mod dependency_scan {
+    use blueos_test_macro::test;
+
     use goblin::elf::{
         dynamic::{DT_NEEDED, DT_SONAME, DT_STRSZ, DT_STRTAB},
         header::{EM_RISCV, ET_DYN},
@@ -149,7 +155,7 @@ mod dependency_scan {
     /// vaddr 0x1000) whose 0x100-byte file range starts right after the ELF
     /// header, so the dynamic table and dynstr — appended after the program
     /// headers — land inside it with `vaddr = 0x1000 + (file - 0x40)`.
-    fn scanned_dso(entries: &[(u64, u64)], dynstr: &[u8]) -> std::vec::Vec<u8> {
+    fn scanned_dso(entries: &[(u64, u64)], dynstr: &[u8]) -> alloc::vec::Vec<u8> {
         // File layout: ehdr (0x40) | PT_LOAD phdr | PT_DYNAMIC phdr | dynamic
         // table | dynstr. The single PT_LOAD maps file offset 0x40 (its own
         // phdr) to vaddr 0x1000 with 0x100 bytes, so vaddr = 0x1000 + (x -
@@ -164,7 +170,7 @@ mod dependency_scan {
         let strtab_file = dyn_file + table_len;
         let to_vaddr = |file: u64| LOAD_BASE + file - EHDR;
 
-        let mut all_entries: std::vec::Vec<(u32, u64)> = std::vec![
+        let mut all_entries: alloc::vec::Vec<(u32, u64)> = alloc::vec![
             (DT_STRTAB as u32, to_vaddr(strtab_file)),
             (DT_STRSZ as u32, dynstr.len() as u64),
         ];
@@ -318,6 +324,8 @@ fn fixture_builder_emits_a_parseable_elf32_header() {
 }
 
 mod placement {
+    use blueos_test_macro::test;
+
     use crate::{
         address::{TargetAddress, TargetRange},
         memory::{AllocationRequest, Placement},
@@ -347,7 +355,10 @@ mod placement {
 }
 
 mod exec_plan {
-    use std::{cell::RefCell, rc::Rc, vec::Vec};
+    use alloc::{rc::Rc, vec::Vec};
+    use core::cell::RefCell;
+
+    use blueos_test_macro::test;
 
     use crate::{
         identity::{ElfType, LoadLimits, LoadProfile, LoadRequest},
@@ -400,6 +411,8 @@ mod exec_plan {
 }
 
 mod fixed_mapper {
+    use blueos_test_macro::test;
+
     use crate::{
         address::{TargetAddress, TargetRange},
         memory::{AllocationRequest, ImageMemory, Placement},
@@ -474,7 +487,9 @@ mod fixed_mapper {
 }
 
 mod entry_dispatch {
-    use std::vec::Vec;
+    use alloc::vec::Vec;
+
+    use blueos_test_macro::test;
 
     use crate::{load_elf, memory_mapper::MemoryMapper, tests::fixture::ElfFixtureBuilder};
 
@@ -494,6 +509,8 @@ mod entry_dispatch {
 }
 
 mod arm_admission {
+    use blueos_test_macro::test;
+
     use goblin::elf::header::{EM_ARM, ET_DYN};
 
     use crate::{
@@ -701,6 +718,8 @@ mod arm_admission {
 }
 
 mod aarch64_profile {
+    use blueos_test_macro::test;
+
     use goblin::elf::header::{EM_AARCH64, EM_RISCV, ET_DYN};
 
     use crate::{
