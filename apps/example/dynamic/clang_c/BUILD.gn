@@ -17,7 +17,6 @@ import("//build/templates/blueos_clang_dynamic.gni")
 # A plain C PIE with this runtime closure:
 #
 # app.elf -> libclang_c_private.so.1 -> libc.so.1
-# `-----------------------^
 #
 # Both artifacts are C. The loader contract is language-neutral, so what this
 # fixture proves is that a C program needs nothing beyond the same libc surface

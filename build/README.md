@@ -34,5 +34,12 @@ application runtime, set `dynamic_loader=false`; `boot_dynamic_seed` then defaul
 to false.
 
 `dynamic_atomic` is an RV32 dependency label for software atomic operations,
-rather than a loader feature. Architecture cfgs such as `armv7m` and `armv8m`
-select the ABI and remain independent of these loading options.
+rather than a loader feature. Application ABI headers, syscall registration,
+libc application contexts and VFS helpers are architecture-independent and do
+not need architecture cfgs. A kernel with `dynamic_loader=false` retains the
+syscall numbers and returns `ENOSYS` for application lifecycle calls.
+
+ARM loader profiles select soft/hard-float calling conventions using the
+built-in `target_abi` cfg (`eabi`/`eabihf`). Custom CPU cfgs such as `armv7m` and
+`armv8m` remain for instructions and hardware behavior that differ between
+CPU generations, including cache maintenance; they are not loader switches.

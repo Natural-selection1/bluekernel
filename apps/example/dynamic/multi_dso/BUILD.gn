@@ -15,12 +15,6 @@
 import("//build/templates/blueos_app_bundle.gni")
 
 # Dynamic application bundle with a private dependency closure:
-#
-# app ──┬── foo ──┬── common ── libc.so.1
-# │         └── libc.so.1
-# ├── bar ─── common
-# └── libc.so.1
-#
 blueos_app_bundle("multi") {
   root_path = "/apps/multi/app.elf"
   root_sources = [ "app/main.rs" ]

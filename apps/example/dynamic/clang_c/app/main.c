@@ -16,12 +16,6 @@
 // `libc.so.1`, plus one private DSO. `blueos_scrt1::_start` is the ELF entry
 // and reaches this image-local `main` through its GOT slot.
 //
-// This exists because every other dynamic fixture in the tree is Rust or
-// freestanding C++, which left "can the loader run a plain C program?" as an
-// inference rather than a result. The answer it is here to pin down is yes:
-// nothing in the loader is language-specific, and C needs no runtime beyond the
-// libc surface the other fixtures already use.
-//
 // It deliberately touches the parts of the C ABI the C++ fixture does not:
 // `malloc`/`free` (heap across the DSO boundary), `strlen`/`memcpy`/`memcmp`
 // (libc string routines reached by `BL` through the PLT), and reads of a data

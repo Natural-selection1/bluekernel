@@ -26,12 +26,14 @@
 
 /// The board policy's dynamic-application profile: the single place
 /// where the board ABI decides which loader profile an application links with.
-#[cfg(armv7m)]
+/// ARM float calling conventions follow the target ABI, independently of the
+/// CPU generation.
+#[cfg(all(target_arch = "arm", target_feature = "mclass", target_abi = "eabi"))]
 pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
     blueos_loader::LoadProfile::arm_thumb_soft_float(blueos_loader::ElfType::Dyn)
 }
 
-#[cfg(armv8m)]
+#[cfg(all(target_arch = "arm", target_feature = "mclass", target_abi = "eabihf"))]
 pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
     blueos_loader::LoadProfile::arm_thumb_hard_float(blueos_loader::ElfType::Dyn)
 }

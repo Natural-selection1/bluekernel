@@ -14,13 +14,6 @@
 
 #![no_std]
 
-#[cfg(any(
-    armv7m,
-    armv8m,
-    target_arch = "riscv32",
-    target_arch = "riscv64",
-    target_arch = "aarch64"
-))]
 pub mod application;
 
 pub mod dlfcn;
@@ -103,37 +96,9 @@ pub mod syscalls {
         TimerSetTime,
         TimerGetOverrun,
         Rename,
-        #[cfg(any(
-            armv7m,
-            armv8m,
-            target_arch = "riscv32",
-            target_arch = "riscv64",
-            target_arch = "aarch64"
-        ))]
         ApplicationLaunch,
-        #[cfg(any(
-            armv7m,
-            armv8m,
-            target_arch = "riscv32",
-            target_arch = "riscv64",
-            target_arch = "aarch64"
-        ))]
         ApplicationInitComplete,
-        #[cfg(any(
-            armv7m,
-            armv8m,
-            target_arch = "riscv32",
-            target_arch = "riscv64",
-            target_arch = "aarch64"
-        ))]
         ApplicationBeginExit,
-        #[cfg(any(
-            armv7m,
-            armv8m,
-            target_arch = "riscv32",
-            target_arch = "riscv64",
-            target_arch = "aarch64"
-        ))]
         ApplicationFinishExit,
         DlOpen,
         DlSym,
