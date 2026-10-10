@@ -81,8 +81,6 @@ pub use relocation::{
     Riscv64Relocator,
 };
 
-pub type Result = core::result::Result<(), &'static str>;
-
 /// A fully mapped, relocated, cache-synchronized and sealed image that has
 /// not yet been published by the kernel.
 ///
@@ -184,30 +182,46 @@ where
 /// pipeline takes over (e_machine ends at offset 20).
 const PROFILE_PEEK_LEN: u64 = 20;
 
-fn peek_profile(
-    reader: &dyn ElfReader,
-    expected_type: ElfType,
-) -> core::result::Result<LoadProfile, &'static str> {
+fn peek_profile(reader: &dyn ElfReader, expected_type: ElfType) -> LoadResult<LoadProfile> {
     let mut peek = [0; PROFILE_PEEK_LEN as usize];
     reader
         .read_exact_at(0, &mut peek)
-        .map_err(|_| "Unable to read the ELF header prefix")?;
+        .map_err(|error| error.at_stage(LoadStage::Admit))?;
     let class = match peek[EI_CLASS] {
         ELFCLASS32 => ElfClass::Elf32,
         ELFCLASS64 => ElfClass::Elf64,
-        _ => return Err("Unsupported ELF class"),
+        value => {
+            return Err(LoadError::new(
+                LoadErrorKind::BadElf,
+                ErrorContext::HeaderField {
+                    field: HeaderField::Class,
+                    value: u64::from(value),
+                },
+            )
+            .at_stage(LoadStage::Admit));
+        }
     };
     let endian = match peek[EI_DATA] {
         ELFDATA2LSB => ElfData::Little,
         ELFDATA2MSB => ElfData::Big,
-        _ => return Err("Unsupported ELF endian"),
+        value => {
+            return Err(LoadError::new(
+                LoadErrorKind::BadElf,
+                ErrorContext::HeaderField {
+                    field: HeaderField::Endian,
+                    value: u64::from(value),
+                },
+            )
+            .at_stage(LoadStage::Admit));
+        }
     };
-    let machine = match read_u16(&peek, 18, endian).map_err(|_| "Unable to read e_machine")? {
-        EM_ARM => ElfMachine::Arm,
-        EM_RISCV => ElfMachine::Riscv,
-        EM_AARCH64 => ElfMachine::Aarch64,
-        value => ElfMachine::Other(value),
-    };
+    let machine =
+        match read_u16(&peek, 18, endian).map_err(|error| error.at_stage(LoadStage::Admit))? {
+            EM_ARM => ElfMachine::Arm,
+            EM_RISCV => ElfMachine::Riscv,
+            EM_AARCH64 => ElfMachine::Aarch64,
+            value => ElfMachine::Other(value),
+        };
     // The compatibility entry point derives its profile from the artifact, so
     // it cannot assert a board ABI: accept any `e_flags` and only enforce the
     // entry-mode geometry for the recognized machines.
@@ -239,31 +253,10 @@ fn peek_profile(
     ))
 }
 
-fn expected_type_for(mapper: &MemoryMapper) -> core::result::Result<ElfType, &'static str> {
+fn expected_type_for(mapper: &MemoryMapper) -> ElfType {
     match mapper.mapping_mode() {
-        MappingMode::Allocated => Ok(ElfType::Dyn),
-        MappingMode::Fixed(_) => Ok(ElfType::Exec),
-    }
-}
-
-fn compatibility_error(error: LoadError) -> &'static str {
-    match error.stage() {
-        Some(error::LoadStage::Beginning) => "Request conflicts with relocator",
-        Some(error::LoadStage::Admit) => "Unable to admit ELF image",
-        Some(error::LoadStage::Inspect) => "Unable to inspect ELF image",
-        Some(error::LoadStage::Plan) => "Unable to plan ELF image",
-        Some(error::LoadStage::Allocate) => "Unable to allocate ELF image",
-        Some(error::LoadStage::Map) => "Unable to map ELF image",
-        Some(error::LoadStage::Decode) => "Unable to decode ELF image",
-        Some(error::LoadStage::Relocate) => "Unable to relocate ELF image",
-        Some(error::LoadStage::Cache) => "Unable to synchronize ELF image",
-        Some(error::LoadStage::Seal) => "Unable to seal ELF image",
-        Some(error::LoadStage::Publish) => "Unable to publish ELF image",
-        Some(error::LoadStage::Discover) => "Unable to discover ELF dependencies",
-        Some(error::LoadStage::Scope) => "Unable to freeze ELF symbol scope",
-        Some(error::LoadStage::LinkRelocate) => "Unable to relocate linked ELF images",
-        Some(error::LoadStage::LinkSeal) => "Unable to seal linked ELF images",
-        None => "Unable to load ELF image",
+        MappingMode::Allocated => ElfType::Dyn,
+        MappingMode::Fixed(_) => ElfType::Exec,
     }
 }
 
@@ -272,8 +265,8 @@ fn compatibility_error(error: LoadError) -> &'static str {
 /// New kernel code should construct a trusted [`LoadRequest`] and call
 /// [`prepare_image`] instead. This wrapper derives a compatibility profile
 /// from the artifact because the legacy API has no profile parameter.
-pub fn load_elf_from_reader<R: ElfReader>(reader: R, mapper: &mut MemoryMapper) -> Result {
-    let expected_type = expected_type_for(mapper)?;
+pub fn load_elf_from_reader<R: ElfReader>(reader: R, mapper: &mut MemoryMapper) -> LoadResult<()> {
+    let expected_type = expected_type_for(mapper);
     let profile = peek_profile(&reader, expected_type)?;
     let (class, machine) = (profile.class(), profile.machine());
     let request = LoadRequest::new(profile, LoadLimits::DEFAULT);
@@ -294,15 +287,15 @@ pub fn load_elf_from_reader<R: ElfReader>(reader: R, mapper: &mut MemoryMapper) 
         }
         _ => Err(LoadError::new(
             LoadErrorKind::UnsupportedByProfile,
-            error::ErrorContext::None,
-        )),
-    }
-    .map_err(compatibility_error)?;
+            ErrorContext::HeaderField {
+                field: HeaderField::Machine,
+                value: u64::from(machine),
+            },
+        )
+        .at_stage(LoadStage::Beginning)),
+    }?;
 
-    let _receipt = prepared
-        .prepare_commit()
-        .map_err(compatibility_error)?
-        .commit();
+    let _receipt = prepared.prepare_commit()?.commit();
     Ok(())
 }
 
@@ -312,7 +305,7 @@ pub fn load_elf_from_reader<R: ElfReader>(reader: R, mapper: &mut MemoryMapper) 
 /// ET_DYN images on the heap, a Fixed mapper accepts ET_EXEC images inside
 /// its static regions. Either way the same parser, copy algorithm and
 /// relocation stages run.
-pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> Result {
+pub fn load_elf(buffer: &[u8], mapper: &mut MemoryMapper) -> LoadResult<()> {
     load_elf_from_reader(SliceElfReader::new(buffer), mapper)
 }
 

@@ -27,8 +27,6 @@ use crate::{
     SealedState,
 };
 
-pub type Result<T> = core::result::Result<T, &'static str>;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryPermissions(u8);
 
@@ -163,9 +161,9 @@ impl MemoryMapper {
     }
 
     #[inline]
-    pub fn real_entry(&self) -> Result<usize> {
+    pub fn real_entry(&self) -> LoadResult<usize> {
         if self.installed.is_none() {
-            return Err("Image has not been committed");
+            return Err(LoadError::new(LoadErrorKind::Backend, ErrorContext::None));
         }
         Ok(self.real_entry)
     }
@@ -175,24 +173,35 @@ impl MemoryMapper {
         start: usize,
         size: usize,
         requested: MemoryPermissions,
-    ) -> Result<()> {
+    ) -> LoadResult<()> {
+        let context = || ErrorContext::TargetRange {
+            start: TargetAddress::new(start as u64),
+            len: size as u64,
+            align: 1,
+        };
         let MappingMode::Fixed(regions) = &self.mode else {
-            return Err("Fixed span requires a fixed mapper");
+            return Err(LoadError::new(LoadErrorKind::Backend, context()));
         };
         let end = start
             .checked_add(size)
-            .ok_or("Address span overflows the target address space")?;
-        let valid = regions.iter().any(|region| {
-            region.start < region.end
-                && start >= region.start
-                && end <= region.end
-                && region.permissions.contains(requested)
-        });
-        if valid {
-            Ok(())
-        } else {
-            Err("Address span is outside authorized regions")
+            .ok_or_else(|| LoadError::new(LoadErrorKind::IntegerOverflow, context()))?;
+        let mut in_bounds = false;
+        for region in *regions {
+            if region.start < region.end && start >= region.start && end <= region.end {
+                in_bounds = true;
+                if region.permissions.contains(requested) {
+                    return Ok(());
+                }
+            }
         }
+        Err(LoadError::new(
+            if in_bounds {
+                LoadErrorKind::PermissionConflict
+            } else {
+                LoadErrorKind::OutOfBounds
+            },
+            context(),
+        ))
     }
 
     fn clear_installed_addresses(&mut self) {
@@ -314,8 +323,7 @@ impl ImageMemory for MemoryMapper {
                 let start =
                     usize::try_from(range.start().get()).map_err(|_| allocation_error(&request))?;
                 let len = usize::try_from(range.len()).map_err(|_| allocation_error(&request))?;
-                self.validate_fixed_span(start, len, MemoryPermissions::NONE)
-                    .map_err(|_| allocation_error(&request))?;
+                self.validate_fixed_span(start, len, MemoryPermissions::NONE)?;
                 let (allocation, lease) = self.create_allocation(
                     &request,
                     range.start(),
@@ -503,8 +511,7 @@ impl ImageCommitMemory for MemoryMapper {
                     .map_err(|_| compatibility_install_error(*allocation))?;
                 let canonical_entry = usize::try_from(sealed.canonical_entry().get())
                     .map_err(|_| compatibility_install_error(*allocation))?;
-                self.validate_fixed_span(canonical_entry, 1, MemoryPermissions::EXECUTE)
-                    .map_err(|_| compatibility_install_error(*allocation))?;
+                self.validate_fixed_span(canonical_entry, 1, MemoryPermissions::EXECUTE)?;
                 entry
             }
         };

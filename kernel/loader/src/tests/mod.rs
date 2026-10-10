@@ -415,6 +415,7 @@ mod fixed_mapper {
 
     use crate::{
         address::{TargetAddress, TargetRange},
+        error::{ErrorContext, LoadErrorKind},
         memory::{AllocationRequest, ImageMemory, Placement},
         memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion},
     };
@@ -457,9 +458,15 @@ mod fixed_mapper {
     fn fixed_mapper_rejects_span_exceeding_regions() {
         let mut mapper = MemoryMapper::new(Some(&REGIONS));
         // The region ends at 0x5000_2000; a span of 0x3000 overruns it.
-        assert!(mapper
+        let error = mapper
             .allocate_image(fixed_request(0x5000_0000, 0x3000))
-            .is_err());
+            .unwrap_err();
+        assert!(matches!(error.kind(), LoadErrorKind::OutOfBounds));
+        assert!(matches!(
+            error.context(),
+            ErrorContext::TargetRange { start, len: 0x3000, .. }
+                if start.get() == 0x5000_0000
+        ));
     }
 
     #[test]
@@ -487,11 +494,14 @@ mod fixed_mapper {
 }
 
 mod entry_dispatch {
-    use alloc::vec::Vec;
-
     use blueos_test_macro::test;
 
-    use crate::{load_elf, memory_mapper::MemoryMapper, tests::fixture::ElfFixtureBuilder};
+    use crate::{
+        error::{ErrorContext, HeaderField, LoadErrorKind, LoadStage},
+        load_elf,
+        memory_mapper::MemoryMapper,
+        tests::fixture::ElfFixtureBuilder,
+    };
 
     #[test]
     fn exec_image_on_allocated_mapper_is_rejected() {
@@ -503,8 +513,30 @@ mod entry_dispatch {
                 .with_entry(0x5000_0000)
                 .build();
         let mut mapper = MemoryMapper::new(None);
-        let result = load_elf(&bytes, &mut mapper);
-        assert!(result.is_err());
+        let error = load_elf(&bytes, &mut mapper).unwrap_err();
+        assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
+        assert!(matches!(error.stage(), Some(LoadStage::Admit)));
+        assert!(matches!(
+            error.context(),
+            ErrorContext::HeaderField { field: HeaderField::Type, value }
+                if *value == u64::from(goblin::elf::header::ET_EXEC)
+        ));
+    }
+
+    #[test]
+    fn truncated_header_preserves_reader_error() {
+        let mut mapper = MemoryMapper::new(None);
+        let error = load_elf(&[], &mut mapper).unwrap_err();
+        assert!(matches!(error.kind(), LoadErrorKind::OutOfBounds));
+        assert!(matches!(error.stage(), Some(LoadStage::Admit)));
+        assert!(matches!(
+            error.context(),
+            ErrorContext::FileRange {
+                offset: 0,
+                len: 20,
+                file_len: 0
+            }
+        ));
     }
 }
 
