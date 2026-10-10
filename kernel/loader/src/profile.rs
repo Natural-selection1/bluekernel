@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Trusted ABI profiles and resource limits supplied by the kernel.
+//!
+//! [`LoadProfile`] describes the accepted ELF architecture and ABI;
+//! [`LoadLimits`] and [`SessionLimits`] bound image and link resource usage.
+//! Per-image requests and supported-feature policies remain crate-private.
+
 use goblin::elf::{
     dynamic::{
         DF_1_NOW, DF_1_PIE, DF_BIND_NOW, DT_BIND_NOW, DT_DEBUG, DT_FINI, DT_FINI_ARRAY,
         DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_GNU_HASH, DT_HASH, DT_INIT, DT_INIT_ARRAY,
         DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_PLTGOT, DT_PLTREL, DT_PLTRELSZ, DT_PREINIT_ARRAY,
         DT_PREINIT_ARRAYSZ, DT_REL, DT_RELA, DT_RELACOUNT, DT_RELAENT, DT_RELASZ, DT_RELCOUNT,
-        DT_RELENT, DT_RELSZ, DT_RPATH, DT_RUNPATH, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMBOLIC,
-        DT_SYMENT, DT_SYMTAB, DT_TEXTREL, DT_TLSDESC_GOT, DT_TLSDESC_PLT, DT_VERDEF, DT_VERDEFNUM,
-        DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM,
+        DT_RELENT, DT_RELSZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
     },
     header::{
         ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFDATA2MSB, EM_AARCH64, EM_ARM, EM_RISCV, ET_DYN,
@@ -29,9 +33,9 @@ use goblin::elf::{
 };
 
 use crate::{
-    elf::{DT_RELR, DT_RELRENT, DT_RELRSZ},
-    error::{ErrorContext, LimitKind, LoadError, LoadErrorKind, LoadResult},
+    error::{ErrorContext, LimitKind, LoadErrorKind},
     memory_mapper::MemoryPermissions,
+    LoadError, LoadResult,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,7 +69,7 @@ impl From<ElfData> for u64 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ElfType {
+pub(crate) enum ElfType {
     Dyn,
     Exec,
     Other(u16),
@@ -111,7 +115,7 @@ const EF_ARM_ABI_FLOAT_HARD: u32 = 0x0000_0400;
 const EF_ARM_BE8: u32 = 0x0080_0000;
 
 /// RISC-V `e_flags` bits the loader interprets. The float ABI must be soft for
-/// the single-image profile; the embedded (RVE) register model is unsupported.
+/// the current RISC-V profiles; the embedded (RVE) register model is unsupported.
 const EF_RISCV_FLOAT_ABI_MASK: u32 = 0x0000_0006;
 const EF_RISCV_FLOAT_ABI_SOFT: u32 = 0x0000_0000;
 const EF_RISCV_RVE: u32 = 0x0000_0008;
@@ -140,14 +144,7 @@ impl HeaderFlagsPolicy {
         }
     }
 
-    /// A policy that accepts any `e_flags`. Reserved for the compatibility
-    /// entry point that derives its profile from the artifact rather than a
-    /// board ABI; trusted callers must use a named machine profile.
-    #[inline]
-    pub(crate) const fn permissive() -> Self {
-        Self::new(0, 0, 0)
-    }
-
+    /// Check the machine-specific flags against the profile constraints.
     #[inline]
     pub const fn accepts(self, flags: u32) -> bool {
         (flags & self.mask) == self.required && (flags & self.forbidden) == 0
@@ -228,7 +225,6 @@ pub struct LoadProfile {
     class: ElfClass,
     endian: ElfData,
     machine: ElfMachine,
-    r#type: ElfType,
     header_flags: HeaderFlagsPolicy,
     entry_mode: EntryMode,
 }
@@ -239,7 +235,6 @@ impl LoadProfile {
         class: ElfClass,
         endian: ElfData,
         machine: ElfMachine,
-        r#type: ElfType,
         header_flags: HeaderFlagsPolicy,
         entry_mode: EntryMode,
     ) -> Self {
@@ -247,7 +242,6 @@ impl LoadProfile {
             class,
             endian,
             machine,
-            r#type,
             header_flags,
             entry_mode,
         }
@@ -256,12 +250,11 @@ impl LoadProfile {
     /// Cortex-M soft-float Thumb profile (`thumbv7m-none-eabi`): EABI5, soft
     /// float ABI, little-endian Thumb entry with bit 0 set.
     #[inline]
-    pub const fn arm_thumb_soft_float(r#type: ElfType) -> Self {
+    pub const fn arm_thumb_soft_float() -> Self {
         Self::new(
             ElfClass::Elf32,
             ElfData::Little,
             ElfMachine::Arm,
-            r#type,
             HeaderFlagsPolicy::new(
                 EF_ARM_EABI_MASK | EF_ARM_ABI_FLOAT_MASK,
                 EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_SOFT,
@@ -274,12 +267,11 @@ impl LoadProfile {
     /// Cortex-M hard-float Thumb profile (`thumbv8m.main-none-eabihf`): EABI5,
     /// hard float ABI, little-endian Thumb entry with bit 0 set.
     #[inline]
-    pub const fn arm_thumb_hard_float(r#type: ElfType) -> Self {
+    pub const fn arm_thumb_hard_float() -> Self {
         Self::new(
             ElfClass::Elf32,
             ElfData::Little,
             ElfMachine::Arm,
-            r#type,
             HeaderFlagsPolicy::new(
                 EF_ARM_EABI_MASK | EF_ARM_ABI_FLOAT_MASK,
                 EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_HARD,
@@ -291,12 +283,11 @@ impl LoadProfile {
 
     /// AArch64 little-endian ELF profile with a native aligned entry.
     #[inline]
-    pub const fn aarch64(r#type: ElfType) -> Self {
+    pub const fn aarch64() -> Self {
         Self::new(
             ElfClass::Elf64,
             ElfData::Little,
             ElfMachine::Aarch64,
-            r#type,
             HeaderFlagsPolicy::new(u32::MAX, 0, 0),
             EntryMode::direct(4, 4),
         )
@@ -304,12 +295,11 @@ impl LoadProfile {
 
     /// RISC-V RV32 soft-float profile (RVC permitted, RVE rejected).
     #[inline]
-    pub const fn riscv32(r#type: ElfType) -> Self {
+    pub const fn riscv32() -> Self {
         Self::new(
             ElfClass::Elf32,
             ElfData::Little,
             ElfMachine::Riscv,
-            r#type,
             HeaderFlagsPolicy::new(
                 EF_RISCV_FLOAT_ABI_MASK,
                 EF_RISCV_FLOAT_ABI_SOFT,
@@ -321,12 +311,11 @@ impl LoadProfile {
 
     /// RISC-V RV64 soft-float profile (RVC permitted, RVE rejected).
     #[inline]
-    pub const fn riscv64(r#type: ElfType) -> Self {
+    pub const fn riscv64() -> Self {
         Self::new(
             ElfClass::Elf64,
             ElfData::Little,
             ElfMachine::Riscv,
-            r#type,
             HeaderFlagsPolicy::new(
                 EF_RISCV_FLOAT_ABI_MASK,
                 EF_RISCV_FLOAT_ABI_SOFT,
@@ -349,11 +338,6 @@ impl LoadProfile {
     #[inline]
     pub const fn machine(&self) -> ElfMachine {
         self.machine
-    }
-
-    #[inline]
-    pub const fn r#type(&self) -> ElfType {
-        self.r#type
     }
 
     #[inline]
@@ -541,7 +525,7 @@ fn check_limit(resource: LimitKind, actual: u64, maximum: u64) -> LoadResult<()>
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LoadRequest {
+pub(crate) struct LoadRequest {
     profile: LoadProfile,
     limits: LoadLimits,
 }
@@ -570,7 +554,6 @@ impl LoadRequest {
 /// lookup budget). Every `Vec`/map growth must be charged here before it is
 /// `try_reserve`d. The `DEFAULT` value is a development ceiling, not a board
 /// configuration. The application layer supplies limits from board policy.
-/// profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionLimits {
     per_image: LoadLimits,
@@ -710,176 +693,25 @@ fn check_u32_limit(resource: LimitKind, actual: u32, maximum: u32) -> LoadResult
     ))
 }
 
-/// Optional ELF capabilities enabled by a load policy.
-///
-/// This policy only controls optional ELF semantics. Structural checks and
-/// safety invariants such as bounds, overflow, overlap and W+X are enforced
-/// independently and cannot be disabled here. A capability must not be
-/// enabled until its metadata also has a real consumer in the load pipeline.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LoadPolicy {
-    allow_interpreter: bool,
-    allow_tls: bool,
-    allow_executable_stack: bool,
-    allow_unknown_program_headers: bool,
-
-    allow_execute_only_segments: bool,
-    allow_write_only_segments: bool,
-    allow_no_access_segments: bool,
-
-    allow_needed: bool,
-    allow_plt_relocations: bool,
-    require_now_for_plt: bool,
-    allow_relr: bool,
-    allow_lifecycle: bool,
-    allow_search_paths: bool,
-    allow_dynamic_symbols: bool,
-    allow_symbolic_lookup: bool,
-    allow_symbol_versions: bool,
-    allow_tls_descriptors: bool,
-    allow_unknown_dynamic_tags: bool,
-    allowed_dynamic_flags: u64,
-    allowed_dynamic_flags_1: u64,
+/// Supported PT_LOAD permissions. W+X is also rejected as a structural
+/// invariant during inspection and planning.
+pub(crate) fn supports_segment_permissions(permissions: MemoryPermissions) -> bool {
+    permissions == MemoryPermissions::READ
+        || permissions == MemoryPermissions::READ.bitor(MemoryPermissions::EXECUTE)
+        || permissions == MemoryPermissions::READ.bitor(MemoryPermissions::WRITE)
 }
 
-impl LoadPolicy {
-    #[inline]
-    const fn single_image() -> Self {
-        Self {
-            allow_interpreter: false,
-            allow_tls: false,
-            allow_executable_stack: false,
-            allow_unknown_program_headers: false,
-
-            allow_execute_only_segments: false,
-            allow_write_only_segments: false,
-            allow_no_access_segments: false,
-
-            allow_needed: false,
-            allow_plt_relocations: false,
-            require_now_for_plt: false,
-            allow_relr: false,
-            allow_lifecycle: false,
-            allow_search_paths: false,
-            allow_dynamic_symbols: false,
-            allow_symbolic_lookup: false,
-            allow_symbol_versions: false,
-            allow_tls_descriptors: false,
-            allow_unknown_dynamic_tags: false,
-            allowed_dynamic_flags: DF_BIND_NOW,
-            allowed_dynamic_flags_1: DF_1_NOW | DF_1_PIE,
-        }
-    }
-
-    /// Thumbv7 dynamic-link policy. It differs from [`Self::single_image`] only in
-    /// the three switches that have a real consumer in the `DynamicLinker`
-    /// (`DT_NEEDED`, `DT_JMPREL/DT_PLTREL`, lifecycle arrays); everything else
-    /// stays fail-closed so an unsupported feature is never silently accepted.
-    #[inline]
-    const fn dynamic_link() -> Self {
-        Self {
-            allow_needed: true,
-            allow_plt_relocations: true,
-            require_now_for_plt: true,
-            allow_lifecycle: true,
-            allow_dynamic_symbols: true,
-            ..Self::single_image()
-        }
-    }
-
-    #[inline]
-    pub const fn allows_interpreter(&self) -> bool {
-        self.allow_interpreter
-    }
-
-    #[inline]
-    pub const fn allows_tls(&self) -> bool {
-        self.allow_tls
-    }
-
-    #[inline]
-    pub const fn allows_executable_stack(&self) -> bool {
-        self.allow_executable_stack
-    }
-
-    #[inline]
-    pub const fn allows_unknown_program_headers(&self) -> bool {
-        self.allow_unknown_program_headers
-    }
-
-    #[inline]
-    pub const fn allows_dynamic_symbols(&self) -> bool {
-        self.allow_dynamic_symbols
-    }
-
-    #[inline]
-    pub const fn allows_lifecycle(&self) -> bool {
-        self.allow_lifecycle
-    }
-
-    #[inline]
-    pub const fn requires_now_for_plt(&self) -> bool {
-        self.require_now_for_plt
-    }
-
-    /// Returns whether a non-empty PT_LOAD permission set is supported.
-    /// W+X is deliberately absent because it is an unconditional invariant.
-    pub fn allows_segment_permissions(&self, permissions: MemoryPermissions) -> bool {
-        let read_execute = MemoryPermissions::READ.bitor(MemoryPermissions::EXECUTE);
-        let read_write = MemoryPermissions::READ.bitor(MemoryPermissions::WRITE);
-        if permissions == MemoryPermissions::READ
-            || permissions == read_execute
-            || permissions == read_write
-        {
-            return true;
-        }
-        if permissions == MemoryPermissions::EXECUTE {
-            return self.allow_execute_only_segments;
-        }
-        if permissions == MemoryPermissions::WRITE {
-            return self.allow_write_only_segments;
-        }
-        if permissions == MemoryPermissions::NONE {
-            return self.allow_no_access_segments;
-        }
-        false
-    }
-
-    /// Returns whether the load policy understands and permits a dynamic
-    /// tag. Known metadata that is harmless without a consumer is accepted;
-    /// tags that introduce linking semantics are controlled explicitly.
-    pub const fn allows_dynamic_tag(&self, tag: u64, value: u64) -> bool {
-        match tag {
-            // Relative relocation tables consumed by the single-image loader.
-            DT_REL | DT_RELSZ | DT_RELENT | DT_RELA | DT_RELASZ | DT_RELAENT => true,
-
-            // Text relocations violate the loader's W^X contract in every
-            // policy, so they are not represented by an enable switch.
-            DT_TEXTREL => false,
-
-            DT_RELR | DT_RELRSZ | DT_RELRENT => self.allow_relr,
-            DT_NEEDED => self.allow_needed,
-            DT_PLTRELSZ | DT_PLTREL | DT_JMPREL => self.allow_plt_relocations,
-            DT_INIT | DT_FINI | DT_INIT_ARRAY | DT_FINI_ARRAY | DT_INIT_ARRAYSZ
-            | DT_FINI_ARRAYSZ | DT_PREINIT_ARRAY | DT_PREINIT_ARRAYSZ => self.allow_lifecycle,
-            DT_RPATH | DT_RUNPATH => self.allow_search_paths,
-            DT_SYMBOLIC => self.allow_symbolic_lookup,
-            DT_VERSYM | DT_VERDEF | DT_VERDEFNUM | DT_VERNEED | DT_VERNEEDNUM => {
-                self.allow_symbol_versions
-            }
-            DT_TLSDESC_PLT | DT_TLSDESC_GOT => self.allow_tls_descriptors,
-
-            DT_FLAGS => value & !self.allowed_dynamic_flags == 0,
-            DT_FLAGS_1 => value & !self.allowed_dynamic_flags_1 == 0,
-
-            // Recognized metadata that does not by itself request an
-            // unsupported runtime operation.
-            DT_SONAME | DT_PLTGOT | DT_HASH | DT_STRTAB | DT_SYMTAB | DT_STRSZ | DT_SYMENT
-            | DT_DEBUG | DT_BIND_NOW | DT_GNU_HASH | DT_RELACOUNT | DT_RELCOUNT => true,
-            _ => self.allow_unknown_dynamic_tags,
-        }
+/// ELF dynamic semantics implemented by the unified loader.
+pub(crate) const fn supports_dynamic_tag(tag: u64, value: u64) -> bool {
+    match tag {
+        DT_REL | DT_RELSZ | DT_RELENT | DT_RELA | DT_RELASZ | DT_RELAENT | DT_NEEDED
+        | DT_PLTRELSZ | DT_PLTREL | DT_JMPREL | DT_INIT | DT_FINI | DT_INIT_ARRAY
+        | DT_FINI_ARRAY | DT_INIT_ARRAYSZ | DT_FINI_ARRAYSZ | DT_PREINIT_ARRAY
+        | DT_PREINIT_ARRAYSZ | DT_SONAME | DT_PLTGOT | DT_HASH | DT_STRTAB | DT_SYMTAB
+        | DT_STRSZ | DT_SYMENT | DT_DEBUG | DT_BIND_NOW | DT_GNU_HASH | DT_RELACOUNT
+        | DT_RELCOUNT => true,
+        DT_FLAGS => value & !DF_BIND_NOW == 0,
+        DT_FLAGS_1 => value & !(DF_1_NOW | DF_1_PIE) == 0,
+        _ => false,
     }
 }
-
-pub(crate) const SINGLE_IMAGE_LOAD_POLICY: LoadPolicy = LoadPolicy::single_image();
-pub(crate) const DYNAMIC_LINK_LOAD_POLICY: LoadPolicy = LoadPolicy::dynamic_link();

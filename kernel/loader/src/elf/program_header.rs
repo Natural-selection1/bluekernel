@@ -14,9 +14,9 @@
 
 use crate::{
     address::TargetAddress,
-    error::{LoadResult, LoadStage},
-    identity::{ElfClass, ElfData},
     image::{read_u32, read_u64},
+    profile::{ElfClass, ElfData},
+    LoadResult,
 };
 
 pub(crate) struct ProgramHeaderInfo {

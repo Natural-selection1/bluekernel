@@ -22,10 +22,11 @@ use crate::{
         ElfHeaderInfo, ELF32_HEADER_SIZE, ELF32_PROGRAM_HEADER_SIZE, ELF64_HEADER_SIZE,
         ELF64_PROGRAM_HEADER_SIZE, ELF_IDENT_SIZE,
     },
-    error::{ErrorContext, HeaderField, LoadError, LoadErrorKind, LoadResult, LoadStage},
-    identity::{ElfClass, ElfData, ElfMachine, ElfType, LoadRequest},
+    error::{ErrorContext, HeaderField, LoadErrorKind, LoadStage},
     image::admit::AdmittedImage,
+    profile::{ElfClass, ElfData, ElfMachine, ElfType, LoadRequest},
     reader::ElfReader,
+    LoadError, LoadResult,
 };
 
 pub(crate) struct ImageLoader<R: ElfReader> {
@@ -168,7 +169,7 @@ fn decode_header(bytes: &[u8], class: ElfClass, endian: ElfData) -> LoadResult<E
 }
 
 fn validate_header(header: &ElfHeaderInfo, request: &LoadRequest, file_len: u64) -> LoadResult<()> {
-    if header.r#type() != request.profile().r#type() {
+    if !matches!(header.r#type(), ElfType::Dyn | ElfType::Exec) {
         return Err(unsupported_header(
             HeaderField::Type,
             u64::from(header.r#type()),

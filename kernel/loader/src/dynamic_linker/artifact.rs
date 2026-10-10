@@ -21,38 +21,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{
-    error::{LoadError, LoadErrorKind, LoadResult},
-    reader::ElfReader,
-};
-
-/// Opaque, comparable file identity supplied by the artifact backend.
-///
-/// Two [`FileIdentity`] values compare equal only when they refer to the same
-/// backend artifact. The loader does not interpret the identity bytes.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct FileIdentity {
-    bytes: Vec<u8>,
-}
-
-impl FileIdentity {
-    #[inline]
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        Self {
-            bytes: bytes.into(),
-        }
-    }
-
-    fn try_clone(&self) -> LoadResult<Self> {
-        Ok(Self {
-            bytes: try_copy_bytes(&self.bytes)?,
-        })
-    }
-
-    fn metadata_bytes(&self) -> u64 {
-        self.bytes.len() as u64
-    }
-}
+use crate::{error::LoadErrorKind, reader::ElfReader, LoadError, LoadResult};
 
 /// How one artifact participates in a link session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,31 +35,30 @@ pub enum ArtifactRole {
     SharedObject,
 }
 
-/// Stable identity of one loaded artifact.
+/// Opaque backend identity of one loaded artifact. Equal bytes must refer
+/// to the same backing and generation; the loader does not interpret them.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ArtifactIdentity {
-    file: FileIdentity,
+    bytes: Vec<u8>,
 }
 
 impl ArtifactIdentity {
-    #[inline]
-    pub const fn new(file: FileIdentity) -> Self {
-        Self { file }
-    }
-
-    #[inline]
-    pub const fn file(&self) -> &FileIdentity {
-        &self.file
-    }
-
-    pub fn try_clone(&self) -> LoadResult<Self> {
+    pub fn from_bytes(bytes: &[u8]) -> LoadResult<Self> {
         Ok(Self {
-            file: self.file.try_clone()?,
+            bytes: try_copy_bytes(bytes)?,
         })
     }
 
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn try_clone(&self) -> LoadResult<Self> {
+        Self::from_bytes(&self.bytes)
+    }
+
     pub(crate) fn metadata_bytes(&self) -> u64 {
-        self.file.metadata_bytes()
+        self.bytes.len() as u64
     }
 }
 
@@ -130,20 +98,6 @@ impl DependencyName {
         })
     }
 
-    /// Copy an owned name without requiring a trailing NUL (manifest
-    /// catalogs store plain names); rejects empty or NUL-containing bytes.
-    pub fn from_bytes(bytes: &[u8]) -> LoadResult<Self> {
-        if bytes.is_empty() || bytes.iter().any(|byte| *byte == 0) {
-            return Err(LoadError::new(
-                LoadErrorKind::BadElf,
-                crate::error::ErrorContext::None,
-            ));
-        }
-        Ok(Self {
-            name: try_copy_bytes(bytes)?,
-        })
-    }
-
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.name
@@ -156,62 +110,21 @@ impl DependencyName {
     }
 }
 
-/// The requester of one dependency edge: the graph node asking for a
-/// `DT_NEEDED` and the ownership that decides how the resolver may satisfy it.
-/// This carries no VFS, path, or registry types into the loader
-/// crate — just the session-local image id, its identity and its ownership.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DependencyRequester<'a> {
-    image: ImageId,
-    identity: &'a ArtifactIdentity,
-    ownership: ImageOwnership,
-}
-
-impl<'a> DependencyRequester<'a> {
-    #[inline]
-    pub const fn new(
-        image: ImageId,
-        identity: &'a ArtifactIdentity,
-        ownership: ImageOwnership,
-    ) -> Self {
-        Self {
-            image,
-            identity,
-            ownership,
-        }
-    }
-
-    #[inline]
-    pub const fn image(&self) -> ImageId {
-        self.image
-    }
-
-    #[inline]
-    pub const fn identity(&self) -> &ArtifactIdentity {
-        self.identity
-    }
-
-    #[inline]
-    pub const fn ownership(&self) -> ImageOwnership {
-        self.ownership
-    }
-}
-
 /// A request for one `DT_NEEDED` dependency, rooted at its requester.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyRequest<'a> {
-    requester: DependencyRequester<'a>,
+    requester: &'a ArtifactIdentity,
     needed: &'a DependencyName,
 }
 
 impl<'a> DependencyRequest<'a> {
     #[inline]
-    pub const fn new(requester: DependencyRequester<'a>, needed: &'a DependencyName) -> Self {
+    pub const fn new(requester: &'a ArtifactIdentity, needed: &'a DependencyName) -> Self {
         Self { requester, needed }
     }
 
     #[inline]
-    pub const fn requester(&self) -> DependencyRequester<'a> {
+    pub const fn requester(&self) -> &'a ArtifactIdentity {
         self.requester
     }
 
@@ -256,23 +169,8 @@ impl<R> ResolvedArtifact<R> {
     }
 
     #[inline]
-    pub const fn identity(&self) -> &ArtifactIdentity {
-        &self.identity
-    }
-
-    #[inline]
     pub const fn ownership(&self) -> ImageOwnership {
         self.ownership
-    }
-
-    #[inline]
-    pub const fn reader(&self) -> &R {
-        &self.reader
-    }
-
-    #[inline]
-    pub fn into_reader(self) -> R {
-        self.reader
     }
 
     #[inline]

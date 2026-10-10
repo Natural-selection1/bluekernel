@@ -17,14 +17,13 @@ use core::alloc::Layout;
 
 use crate::{
     address::TargetAddress,
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
+    error::{ErrorContext, LoadErrorKind},
     image::{PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel},
     memory::{
         AllocationId, AllocationLease, AllocationOffset, AllocationOwnership, AllocationRequest,
-        ImageAllocation, ImageCommitMemory, ImageMemory, ImageProtectionMemory, MutationProgress,
-        Placement,
+        ImageAllocation, ImageMemory, ImageProtectionMemory, MutationProgress, Placement,
     },
-    SealedState,
+    LoadError, LoadResult,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,64 +78,26 @@ impl MemoryRegion {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum MappingMode {
-    Allocated,
-    Fixed(&'static [MemoryRegion]),
-}
-
+/// A memory backend for one image, with optional authorized fixed regions.
 #[derive(Debug)]
 pub struct MemoryMapper {
-    virtual_entry: usize,
-    real_entry: usize,
     mem: Storage,
-    mode: MappingMode,
+    regions: &'static [MemoryRegion],
     allocation: Option<ImageAllocation>,
-    installed: Option<MemoryMapperInstalledImage>,
     poisoned: Option<ImageAllocation>,
     next_allocation_id: u64,
-}
-
-#[derive(Debug)]
-pub struct MemoryMapperPreparedInstall {
-    allocation: ImageAllocation,
-    virtual_entry: usize,
-    real_entry: usize,
-}
-
-#[derive(Debug)]
-struct MemoryMapperInstalledImage {
-    lease: AllocationLease,
-}
-
-/// Compatibility receipt. The mapper's installed state, rather than this
-/// value, owns the allocation lease.
-#[derive(Debug)]
-pub struct MemoryMapperCommitReceipt {
-    _private: (),
 }
 
 impl MemoryMapper {
     #[inline]
     pub fn new(regions: Option<&'static [MemoryRegion]>) -> Self {
         Self {
-            virtual_entry: 0,
-            real_entry: 0,
             mem: Storage::default(),
-            mode: match regions {
-                Some(regions) => MappingMode::Fixed(regions),
-                None => MappingMode::Allocated,
-            },
+            regions: regions.unwrap_or(&[]),
             allocation: None,
-            installed: None,
             poisoned: None,
             next_allocation_id: 1,
         }
-    }
-
-    #[inline]
-    pub(crate) fn mapping_mode(&self) -> &MappingMode {
-        &self.mode
     }
 
     #[inline]
@@ -155,19 +116,6 @@ impl MemoryMapper {
         self.poisoned = None;
     }
 
-    #[inline]
-    pub fn entry(&self) -> usize {
-        self.virtual_entry
-    }
-
-    #[inline]
-    pub fn real_entry(&self) -> LoadResult<usize> {
-        if self.installed.is_none() {
-            return Err(LoadError::new(LoadErrorKind::Backend, ErrorContext::None));
-        }
-        Ok(self.real_entry)
-    }
-
     pub(crate) fn validate_fixed_span(
         &self,
         start: usize,
@@ -179,14 +127,11 @@ impl MemoryMapper {
             len: size as u64,
             align: 1,
         };
-        let MappingMode::Fixed(regions) = &self.mode else {
-            return Err(LoadError::new(LoadErrorKind::Backend, context()));
-        };
         let end = start
             .checked_add(size)
             .ok_or_else(|| LoadError::new(LoadErrorKind::IntegerOverflow, context()))?;
         let mut in_bounds = false;
-        for region in *regions {
+        for region in self.regions {
             if region.start < region.end && start >= region.start && end <= region.end {
                 in_bounds = true;
                 if region.permissions.contains(requested) {
@@ -202,11 +147,6 @@ impl MemoryMapper {
             },
             context(),
         ))
-    }
-
-    fn clear_installed_addresses(&mut self) {
-        self.virtual_entry = 0;
-        self.real_entry = 0;
     }
 
     fn next_allocation_id(&mut self, request: &AllocationRequest) -> LoadResult<AllocationId> {
@@ -244,7 +184,6 @@ impl MemoryMapper {
             return;
         }
 
-        self.clear_installed_addresses();
         self.allocation = None;
         match allocation.ownership() {
             AllocationOwnership::Owned => self.mem = Storage::default(),
@@ -277,11 +216,11 @@ impl MemoryMapper {
 
 impl ImageMemory for MemoryMapper {
     fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
-        if self.poisoned.is_some() || self.installed.is_some() || self.allocation.is_some() {
+        if self.poisoned.is_some() || self.allocation.is_some() {
             return Err(allocation_error(&request));
         }
-        match (&self.mode, request.placement()) {
-            (MappingMode::Allocated, Placement::Anywhere) => {
+        match request.placement() {
+            Placement::Anywhere => {
                 if !self.mem.base().is_null() {
                     return Err(allocation_error(&request));
                 }
@@ -319,11 +258,18 @@ impl ImageMemory for MemoryMapper {
             // A fixed image borrows its span from the mapper's static
             // regions: validate the whole span before recording anything, and
             // never touch the heap storage.
-            (MappingMode::Fixed(_), Placement::Fixed(range)) => {
+            Placement::Fixed(range) => {
                 let start =
                     usize::try_from(range.start().get()).map_err(|_| allocation_error(&request))?;
                 let len = usize::try_from(range.len()).map_err(|_| allocation_error(&request))?;
-                self.validate_fixed_span(start, len, MemoryPermissions::NONE)?;
+                // Loading copies and decodes bytes before final protection.
+                // Require access now, before any write can fault or mutate
+                // a region that the platform did not authorize for loading.
+                self.validate_fixed_span(
+                    start,
+                    len,
+                    MemoryPermissions::READ.bitor(MemoryPermissions::WRITE),
+                )?;
                 let (allocation, lease) = self.create_allocation(
                     &request,
                     range.start(),
@@ -332,7 +278,6 @@ impl ImageMemory for MemoryMapper {
                 self.allocation = Some(allocation);
                 Ok(lease)
             }
-            _ => Err(allocation_error(&request)),
         }
     }
 
@@ -362,8 +307,8 @@ impl ImageMemory for MemoryMapper {
             .map_err(|_| memory_access_error(*allocation, offset, len))?;
         let end =
             usize::try_from(end).map_err(|_| memory_access_error(*allocation, offset, len))?;
-        match &self.mode {
-            MappingMode::Allocated => {
+        match allocation.ownership() {
+            AllocationOwnership::Owned => {
                 let base = self.mem.base();
                 if base.is_null() || self.mem.size() < end {
                     return Err(memory_access_error(*allocation, offset, len));
@@ -373,7 +318,7 @@ impl ImageMemory for MemoryMapper {
             // Fixed images already validated their span against the static
             // regions at allocation time; the offset bounds check above keeps
             // accesses inside the recorded allocation.
-            MappingMode::Fixed(_) => {
+            AllocationOwnership::BorrowedFixed => {
                 let base = usize::try_from(allocation.base().get())
                     .map_err(|_| memory_access_error(*allocation, offset, len))?;
                 let address = base
@@ -442,9 +387,17 @@ impl ImageProtectionMemory for MemoryMapper {
         allocation: &ImageAllocation,
         offset: AllocationOffset,
         len: u64,
-        _permissions: MemoryPermissions,
+        permissions: MemoryPermissions,
     ) -> LoadResult<ProtectionLevel> {
         self.image_span(allocation, offset, len)?;
+        if allocation.ownership() == AllocationOwnership::BorrowedFixed {
+            let start = allocation.base().checked_add(offset.value())?;
+            self.validate_fixed_span(
+                usize::try_from(start.get()).map_err(|_| protection_backend_error(allocation))?,
+                usize::try_from(len).map_err(|_| protection_backend_error(allocation))?,
+                permissions,
+            )?;
+        }
         Ok(ProtectionLevel::LogicalOnly)
     }
 
@@ -455,93 +408,23 @@ impl ImageProtectionMemory for MemoryMapper {
     fn validate_protection_aliases(
         &self,
         allocation: &ImageAllocation,
-        _prepared: &PreparedProtectionPlan,
+        prepared: &PreparedProtectionPlan,
     ) -> LoadResult<()> {
-        match &self.allocation {
-            Some(actual) if actual == allocation => Ok(()),
-            _ => Err(protection_backend_error(allocation)),
+        if self.allocation.as_ref() != Some(allocation) {
+            return Err(protection_backend_error(allocation));
         }
-    }
-}
-
-impl ImageCommitMemory for MemoryMapper {
-    type PreparedInstall = MemoryMapperPreparedInstall;
-    type CommitReceipt = MemoryMapperCommitReceipt;
-
-    fn prepare_install(
-        &mut self,
-        allocation: &ImageAllocation,
-        sealed: &SealedState,
-    ) -> LoadResult<Self::PreparedInstall> {
-        let mismatch = match &self.allocation {
-            Some(actual) => actual != allocation,
-            None => true,
-        };
-        if mismatch || self.installed.is_some() || self.poisoned.is_some() {
-            return Err(compatibility_install_error(*allocation));
-        }
-
-        let virtual_start = allocation.base().checked_sub(sealed.load_bias())?;
-        let virtual_end = TargetAddress::new(virtual_start).checked_add(allocation.len())?;
-        let virtual_entry = sealed.entry().checked_sub(sealed.load_bias())?;
-        usize::try_from(virtual_start).map_err(|_| compatibility_install_error(*allocation))?;
-        usize::try_from(virtual_end.get()).map_err(|_| compatibility_install_error(*allocation))?;
-        let virtual_entry =
-            usize::try_from(virtual_entry).map_err(|_| compatibility_install_error(*allocation))?;
-
-        let canonical_offset = sealed.canonical_entry().checked_sub(allocation.base())?;
-        canonical_offset
-            .checked_add(1)
-            .filter(|end| *end <= allocation.len())
-            .ok_or_else(|| compatibility_install_error(*allocation))?;
-
-        let real_entry = match &self.mode {
-            MappingMode::Allocated => {
-                let entry_offset = sealed.entry().checked_sub(allocation.base())?;
-                let entry_offset = usize::try_from(entry_offset)
-                    .map_err(|_| compatibility_install_error(*allocation))?;
-                let base = self.mem.base();
-                if base.is_null() || entry_offset >= self.mem.size() {
-                    return Err(compatibility_install_error(*allocation));
-                }
-                unsafe { base.add(entry_offset) as usize }
+        if allocation.ownership() == AllocationOwnership::BorrowedFixed {
+            for record in prepared.ranges() {
+                self.validate_fixed_span(
+                    usize::try_from(record.applied_range().start().get())
+                        .map_err(|_| protection_backend_error(allocation))?,
+                    usize::try_from(record.applied_range().len())
+                        .map_err(|_| protection_backend_error(allocation))?,
+                    record.permissions(),
+                )?;
             }
-            MappingMode::Fixed(_) => {
-                let entry = usize::try_from(sealed.entry().get())
-                    .map_err(|_| compatibility_install_error(*allocation))?;
-                let canonical_entry = usize::try_from(sealed.canonical_entry().get())
-                    .map_err(|_| compatibility_install_error(*allocation))?;
-                self.validate_fixed_span(canonical_entry, 1, MemoryPermissions::EXECUTE)?;
-                entry
-            }
-        };
-
-        Ok(MemoryMapperPreparedInstall {
-            allocation: *allocation,
-            virtual_entry,
-            real_entry,
-        })
-    }
-
-    unsafe fn commit_install(
-        &mut self,
-        prepared: Self::PreparedInstall,
-        _sealed: SealedState,
-        lease: AllocationLease,
-    ) -> Self::CommitReceipt {
-        self.virtual_entry = prepared.virtual_entry;
-        self.real_entry = prepared.real_entry;
-        self.allocation = Some(prepared.allocation);
-        self.installed = Some(MemoryMapperInstalledImage { lease });
-        MemoryMapperCommitReceipt { _private: () }
-    }
-}
-
-impl Drop for MemoryMapper {
-    fn drop(&mut self) {
-        if let Some(installed) = self.installed.take() {
-            self.release_committed(installed.lease);
         }
+        Ok(())
     }
 }
 
@@ -585,17 +468,6 @@ fn not_allocated_error(allocation: ImageAllocation) -> LoadError {
 }
 
 fn protection_backend_error(allocation: &ImageAllocation) -> LoadError {
-    LoadError::new(
-        LoadErrorKind::Backend,
-        ErrorContext::Allocation {
-            base: allocation.base(),
-            len: allocation.len(),
-            align: allocation.align(),
-        },
-    )
-}
-
-fn compatibility_install_error(allocation: ImageAllocation) -> LoadError {
     LoadError::new(
         LoadErrorKind::Backend,
         ErrorContext::Allocation {

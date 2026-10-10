@@ -12,331 +12,235 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Runtime namespace resolver.
-//!
-//! The launch planner has already resolved every `DT_NEEDED` string to an
-//! exact VFS path and acquired the complete system closure atomically. This
-//! adapter therefore performs no search and takes no new system permit while
-//! the linker owns mapped memory: it only replays planned requester/edge
-//! bindings, opens the planned files, and consumes the prepared permits or
-//! leases.
+//! File lookup policy for the loader. ELF parsing and dependency traversal
+//! belong to the loader; this adapter selects exact normalized VFS paths.
 
-use alloc::{sync::Arc, vec::Vec};
-
-use blueos_loader::{
-    ArtifactIdentity, ArtifactResolver, DependencyName, DependencyRequest, DependencyResolution,
-    ErrorContext, FileIdentity, ImageOwnership, ImportedImageDescriptor, LoadError, LoadErrorKind,
-    LoadResult, ResolvedArtifact,
-};
-
+use super::{system_paths::SystemLibraryPaths, vfs_reader::VfsElfReader};
 use crate::{
-    application::{
-        planner::{NamespaceLoadPlan, PlannedImage},
-        registry::{
-            AcquireBatchOutcome, LoadPermit, PreparedSystemBatch, SystemDsoLease, SystemDsoRegistry,
-        },
+    application::namespace::{
+        resolve_dependency_paths, ApplicationNamespace, DependencyKind, ResolveBase,
     },
+    error::code,
     vfs::open_path,
 };
+use alloc::sync::Arc;
+use blueos_loader::{
+    error::{ErrorContext, LoadErrorKind},
+    LoadError, LoadResult,
+};
 
-use super::vfs_reader::VfsElfReader;
-
-struct SystemCandidateClaim {
-    key: DependencyName,
-    identity: ArtifactIdentity,
-    permit: LoadPermit,
+#[derive(Clone)]
+pub(crate) struct KernelSource {
+    path: Arc<str>,
+    shared: bool,
 }
 
-struct SystemImportClaim {
-    key: DependencyName,
-    descriptor: Arc<blueos_loader::PublishedImageDescriptor>,
+impl KernelSource {
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+    pub(crate) fn shared(&self) -> bool {
+        self.shared
+    }
 }
 
-/// One first-load system image and its unique registry publication authority.
-pub struct SystemCandidatePermit {
-    pub key: DependencyName,
-    pub identity: ArtifactIdentity,
-    pub permit: LoadPermit,
+pub(crate) struct NamespaceSourceResolver<'a> {
+    namespace: &'a ApplicationNamespace,
+    catalog: &'static SystemLibraryPaths,
 }
 
-/// Registry authority accumulated while replaying a namespace plan.
-pub struct ResolverAuthorities {
-    pub permits: Vec<SystemCandidatePermit>,
-    pub leases: Vec<SystemDsoLease>,
-    /// Identity-to-canonical-key mapping for every system image in the plan.
-    /// Publication uses this instead of optional ELF SONAME metadata.
-    pub system_images: Vec<(ArtifactIdentity, DependencyName)>,
-}
-
-/// Resolve a fully planned application namespace into linker artifacts.
-pub struct NamespaceArtifactResolver {
-    plan: NamespaceLoadPlan,
-    batch_loads: Vec<(DependencyName, LoadPermit)>,
-    batch_imports: Vec<(
-        DependencyName,
-        SystemDsoLease,
-        Arc<blueos_loader::PublishedImageDescriptor>,
-    )>,
-    candidates: Vec<SystemCandidateClaim>,
-    leases: Vec<SystemDsoLease>,
-    imports: Vec<SystemImportClaim>,
-    opened_private: Vec<ArtifactIdentity>,
-    namespace_imports: Vec<(Arc<blueos_loader::PublishedImageDescriptor>, bool)>,
-}
-
-impl NamespaceArtifactResolver {
-    /// Atomically acquire the plan's whole system closure. Waiting and retrying
-    /// happens here, before the dynamic linker allocates an image.
-    pub fn new(plan: NamespaceLoadPlan, registry: SystemDsoRegistry) -> LoadResult<Self> {
-        Self::with_namespace(plan, registry, Vec::new())
+impl<'a> NamespaceSourceResolver<'a> {
+    pub(crate) fn new(
+        namespace: &'a ApplicationNamespace,
+        catalog: &'static SystemLibraryPaths,
+    ) -> Self {
+        Self { namespace, catalog }
     }
-
-    pub fn with_namespace(
-        plan: NamespaceLoadPlan,
-        registry: SystemDsoRegistry,
-        namespace_imports: Vec<(Arc<blueos_loader::PublishedImageDescriptor>, bool)>,
-    ) -> LoadResult<Self> {
-        // A constructor may dlopen while this application's startup system
-        // batch is still Initializing. Borrow its pinned providers instead of
-        // waiting for our own init completion.
-        let keys: Vec<_> = plan
-            .system_keys()
-            .iter()
-            .filter(|key| {
-                !plan.images().iter().any(|image| {
-                    image.system_key() == Some(*key)
-                        && namespace_imports
-                            .iter()
-                            .any(|(provider, _)| provider.identity() == image.identity())
-                })
-            })
-            .cloned()
-            .collect();
-        let PreparedSystemBatch { loads, imports } = loop {
-            match registry.acquire_batch(&keys) {
-                AcquireBatchOutcome::Acquired(batch) => break batch,
-                AcquireBatchOutcome::Pending(wait) => wait.wait(),
-            }
-        };
-        Ok(Self {
-            plan,
-            batch_loads: loads,
-            batch_imports: imports,
-            candidates: Vec::new(),
-            leases: Vec::new(),
-            imports: Vec::new(),
-            opened_private: Vec::new(),
-            namespace_imports,
-        })
-    }
-
-    /// Open the planned root artifact.
-    pub fn root_artifact(&self) -> LoadResult<ResolvedArtifact<VfsElfReader>> {
-        self.open_planned(&self.plan.images()[0], ImageOwnership::SessionPrivate)
-    }
-
-    pub fn dependency_imports(&self) -> Vec<ImportedImageDescriptor> {
-        let mut imports: Vec<_> = self
-            .namespace_imports
-            .iter()
-            .filter(|(descriptor, _)| {
-                self.plan
-                    .images()
-                    .iter()
-                    .any(|image| image.identity() == descriptor.identity())
-            })
-            .map(|(descriptor, system)| {
-                if *system {
-                    ImportedImageDescriptor::new(descriptor.clone())
-                } else {
-                    ImportedImageDescriptor::namespace(descriptor.clone())
-                }
-            })
-            .collect();
-        imports.extend(
-            self.batch_imports
-                .iter()
-                .map(|(_, _, descriptor)| ImportedImageDescriptor::new(descriptor.clone())),
-        );
-        imports
-    }
-
-    pub fn shared_root(&mut self) -> LoadResult<DependencyResolution<VfsElfReader>> {
-        self.resolve_provider(0)
-    }
-
-    fn resolve_provider(&mut self, index: usize) -> LoadResult<DependencyResolution<VfsElfReader>> {
-        if let Some((descriptor, system)) = self
-            .namespace_imports
-            .iter()
-            .find(|(image, _)| image.identity() == self.plan.images()[index].identity())
-        {
-            return Ok(DependencyResolution::Import(if *system {
-                ImportedImageDescriptor::new(descriptor.clone())
-            } else {
-                ImportedImageDescriptor::namespace(descriptor.clone())
-            }));
-        }
-        if self.plan.images()[index].system() {
-            return self.resolve_system(index);
-        }
-        let provider = &self.plan.images()[index];
-        if !self.opened_private.contains(provider.identity()) {
-            log::info!("NS_LOAD path={}", provider.path());
-            self.opened_private.push(provider.identity().clone());
-        }
-        self.open_planned(provider, ImageOwnership::SessionPrivate)
-            .map(DependencyResolution::Load)
-    }
-
-    /// Hand all registry authority to the publisher after dependency closure.
-    pub fn finish_resolution(&mut self) -> ResolverAuthorities {
-        let permits = core::mem::take(&mut self.candidates)
-            .into_iter()
-            .map(|claim| SystemCandidatePermit {
-                key: claim.key,
-                identity: claim.identity,
-                permit: claim.permit,
-            })
-            .collect();
-        let mut leases = core::mem::take(&mut self.leases);
-        leases.extend(
-            core::mem::take(&mut self.batch_imports)
-                .into_iter()
-                .map(|(_, lease, _)| lease),
-        );
-        let system_images = self
-            .plan
-            .images()
-            .iter()
-            .filter_map(|image| {
-                image
-                    .system_key()
-                    .map(|key| (image.identity().clone(), key.clone()))
-            })
-            .collect();
-        ResolverAuthorities {
-            permits,
-            leases,
-            system_images,
+    /// Select resource ownership; the loader determines the ELF object type.
+    pub(crate) fn root(&self, path: &str, private: bool) -> KernelSource {
+        KernelSource {
+            path: Arc::from(path),
+            shared: !private && self.catalog.resolve_path(path).is_some(),
         }
     }
-
-    fn open_planned(
+    pub(crate) fn open(&self, source: &KernelSource) -> LoadResult<VfsElfReader> {
+        open_path(source.path(), libc::O_RDONLY, 0)
+            .map(VfsElfReader::new)
+            .map_err(|_| backend_error())
+    }
+    pub(crate) fn resolve(
         &self,
-        image: &PlannedImage,
-        ownership: ImageOwnership,
-    ) -> LoadResult<ResolvedArtifact<VfsElfReader>> {
-        let file = open_path(image.path(), libc::O_RDONLY, 0).map_err(|_| backend_error())?;
-        let reader = VfsElfReader::new(file);
-        let identity = image.identity().clone();
-        Ok(ResolvedArtifact::new(identity, ownership, reader))
-    }
-
-    fn planned_provider_index(&self, request: &DependencyRequest<'_>) -> LoadResult<usize> {
-        let requester = self
-            .plan
-            .images()
-            .iter()
-            .position(|image| image.identity() == request.requester().identity())
-            .ok_or_else(backend_error)?;
-        self.plan
-            .edges()
-            .iter()
-            .find(|edge| edge.requester() == requester && edge.request() == request.needed())
-            .map(|edge| edge.provider())
-            .ok_or_else(|| unresolved(request.needed()))
-    }
-
-    fn resolve_system(
-        &mut self,
-        provider_index: usize,
-    ) -> LoadResult<DependencyResolution<VfsElfReader>> {
-        let provider = &self.plan.images()[provider_index];
-        let key = provider.system_key().ok_or_else(backend_error)?.clone();
-
-        if let Some(claim) = self.candidates.iter().find(|claim| claim.key == key) {
-            if claim.identity != *provider.identity() {
-                return Err(backend_error());
+        requester: &KernelSource,
+        name: &[u8],
+    ) -> LoadResult<KernelSource> {
+        let request = core::str::from_utf8(name).map_err(|_| unresolved(name))?;
+        let directory = parent_dir(requester.path());
+        let kind = DependencyKind::classify(request);
+        if matches!(kind, DependencyKind::PlainName) {
+            if requester.shared() {
+                let entry = self
+                    .catalog
+                    .resolve_name(name)
+                    .ok_or_else(|| unresolved(name))?;
+                return Ok(self.root(entry.path, false));
             }
-            return self
-                .open_planned(provider, ImageOwnership::SystemCandidate)
-                .map(DependencyResolution::Load);
-        }
-
-        if let Some((_, permit)) = take_by_key(&mut self.batch_loads, &key, |item| &item.0) {
-            let artifact = self.open_planned(provider, ImageOwnership::SystemCandidate)?;
-            self.candidates.push(SystemCandidateClaim {
-                key: key.clone(),
-                identity: provider.identity().clone(),
-                permit,
-            });
-            log::info!("DSO_LOAD path={}", provider.path());
-            return Ok(DependencyResolution::Load(artifact));
-        }
-
-        if let Some((_, lease, descriptor)) =
-            take_by_key(&mut self.batch_imports, &key, |item| &item.0)
-        {
-            if descriptor.identity() != provider.identity() {
-                return Err(backend_error());
+            let private = resolve_dependency_paths(
+                self.namespace,
+                ResolveBase::RequesterDirectory(directory),
+                request,
+            );
+            let path = private.first().ok_or_else(|| unresolved(name))?;
+            // Only absence allows catalog fallback. A corrupt or inaccessible
+            // private file remains selected and fails in the loader.
+            if matches!(open_path(path, libc::O_RDONLY, 0), Err(error) if error == code::ENOENT || error == code::ENOTDIR)
+            {
+                if let Some(entry) = self.catalog.resolve_name(name) {
+                    return Ok(self.root(entry.path, false));
+                }
             }
-            self.leases.push(lease);
-            self.imports.push(SystemImportClaim {
-                key: key.clone(),
-                descriptor: descriptor.clone(),
-            });
-            log::info!("DSO_REUSE path={}", provider.path());
-            return Ok(DependencyResolution::Import(ImportedImageDescriptor::new(
-                descriptor,
-            )));
+            return Ok(self.root(path, false));
         }
-
-        if let Some(claim) = self.imports.iter().find(|claim| claim.key == key) {
-            return Ok(DependencyResolution::Import(ImportedImageDescriptor::new(
-                claim.descriptor.clone(),
-            )));
+        let paths = resolve_dependency_paths(
+            self.namespace,
+            ResolveBase::RequesterDirectory(directory),
+            request,
+        );
+        let path = paths.first().ok_or_else(|| unresolved(name))?;
+        if requester.shared() && self.catalog.resolve_path(path).is_none() {
+            return Err(unresolved(name));
         }
-        Err(backend_error())
+        Ok(self.root(path, false))
     }
 }
 
-impl ArtifactResolver for NamespaceArtifactResolver {
-    type Reader = VfsElfReader;
-
-    fn resolve(
-        &mut self,
-        request: &DependencyRequest<'_>,
-    ) -> LoadResult<DependencyResolution<Self::Reader>> {
-        let provider_index = self.planned_provider_index(request)?;
-        self.resolve_provider(provider_index)
+fn parent_dir(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) | None => "/",
+        Some(at) => &trimmed[..at],
     }
 }
-
-fn take_by_key<T>(
-    items: &mut Vec<T>,
-    key: &DependencyName,
-    key_of: impl Fn(&T) -> &DependencyName,
-) -> Option<T> {
-    let position = items.iter().position(|item| key_of(item) == key)?;
-    Some(items.swap_remove(position))
-}
-
-/// Use the normalized path as the loader's identity for this launch.
-pub(crate) fn identity_from_path(path: &str) -> ArtifactIdentity {
-    ArtifactIdentity::new(FileIdentity::from_bytes(path.as_bytes()))
-}
-
-fn backend_error() -> LoadError {
-    LoadError::new(LoadErrorKind::Backend, ErrorContext::None)
-}
-
-fn unresolved(needed: &DependencyName) -> LoadError {
+fn unresolved(name: &[u8]) -> LoadError {
     LoadError::new(
         LoadErrorKind::Backend,
         ErrorContext::Dependency {
             requester: 0,
-            needed: needed.as_bytes().into(),
+            needed: name.into(),
         },
     )
+}
+fn backend_error() -> LoadError {
+    LoadError::new(LoadErrorKind::Backend, ErrorContext::None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{super::system_paths::SystemLibraryEntry, *};
+    use blueos_test_macro::test;
+    static CATALOG: SystemLibraryPaths = SystemLibraryPaths::new(&[SystemLibraryEntry {
+        lookup_name: b"libextra.so",
+        path: "/system/lib/libextra.so",
+        keep_cached: false,
+    }]);
+    fn c_path<const N: usize>(path: &str) -> [core::ffi::c_char; N] {
+        assert!(path.len() < N, "test path too long: {path}");
+        let mut buffer = [0 as core::ffi::c_char; N];
+        for (byte, slot) in path.bytes().zip(buffer.iter_mut()) {
+            *slot = byte as core::ffi::c_char;
+        }
+        buffer
+    }
+
+    fn write_file(path: &str, bytes: &[u8]) {
+        let c_path = c_path::<64>(path);
+        let fd = crate::vfs::syscalls::open(
+            c_path.as_ptr(),
+            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+            0o644,
+        );
+        assert!(fd > 0, "open {path} for write: {fd}");
+        let wrote = crate::vfs::syscalls::write(fd, bytes.as_ptr(), bytes.len());
+        assert_eq!(wrote as usize, bytes.len(), "write {path}");
+        crate::vfs::syscalls::close(fd);
+    }
+
+    fn make_dir(path: &str) {
+        let c_path = c_path::<64>(path);
+        let rc = crate::vfs::syscalls::mkdir(c_path.as_ptr(), 0o755);
+        // Tests share the root tmpfs; a directory a previous test seeded is
+        // fine to reuse, exactly as the boot seeder tolerates EEXIST.
+        assert!(rc == 0 || rc == -libc::EEXIST, "mkdir {path}: {rc}");
+    }
+
+    /// Remove a file, tolerating ENOENT (a fresh tmpfs never had it).
+    fn remove_file(path: &str) {
+        let c_path = c_path::<64>(path);
+        let rc = crate::vfs::syscalls::unlink(c_path.as_ptr());
+        assert!(rc == 0 || rc == -libc::ENOENT, "unlink {path}: {rc}");
+    }
+
+    fn with_resolver(run: impl FnOnce(NamespaceSourceResolver<'_>, KernelSource)) {
+        make_dir("/apps");
+        make_dir("/apps/resolve-test");
+        make_dir("/apps/resolve-test/lib");
+        remove_file("/apps/resolve-test/lib/libextra.so");
+        let namespace = ApplicationNamespace::from_launch_path(
+            "app.elf",
+            "/apps/resolve-test",
+            crate::application::board_dynamic_profile(),
+        )
+        .unwrap();
+        let resolver = NamespaceSourceResolver::new(&namespace, &CATALOG);
+        let root = resolver.root(namespace.root_path(), true);
+        run(resolver, root);
+    }
+    #[test]
+    fn resolve_relative_from_requester_directory() {
+        with_resolver(|resolver, root| {
+            let image = resolver
+                .resolve(&root, b"./lib/../lib/libextra.so")
+                .unwrap();
+            assert_eq!(image.path(), "/apps/resolve-test/lib/libextra.so");
+            assert!(!image.shared());
+        });
+    }
+    #[test]
+    fn resolve_catalog_absolute_path_as_shared() {
+        with_resolver(|resolver, root| {
+            let image = resolver.resolve(&root, b"/system/lib/libextra.so").unwrap();
+            assert!(image.shared());
+        });
+    }
+    #[test]
+    fn resolve_missing_private_file_uses_catalog() {
+        with_resolver(|resolver, root| {
+            let image = resolver.resolve(&root, b"libextra.so").unwrap();
+            assert_eq!(image.path(), "/system/lib/libextra.so");
+            assert!(image.shared());
+        });
+    }
+    #[test]
+    fn resolve_present_broken_private_file_keeps_exact_path() {
+        with_resolver(|resolver, root| {
+            write_file("/apps/resolve-test/lib/libextra.so", &[0; 16]);
+            let image = resolver.resolve(&root, b"libextra.so").unwrap();
+            assert_eq!(image.path(), "/apps/resolve-test/lib/libextra.so");
+            assert!(!image.shared());
+        });
+    }
+    #[test]
+    fn resolve_system_requester_never_uses_application_files() {
+        with_resolver(|resolver, _| {
+            write_file("/apps/resolve-test/lib/libextra.so", &[0; 16]);
+            let system = resolver.root("/system/lib/libextra.so", false);
+            assert_eq!(
+                resolver.resolve(&system, b"libextra.so").unwrap().path(),
+                system.path()
+            );
+            assert!(resolver
+                .resolve(&system, b"/apps/resolve-test/lib/libextra.so")
+                .is_err());
+            assert!(resolver.resolve(&system, b"libunknown.so").is_err());
+        });
+    }
 }

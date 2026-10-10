@@ -15,15 +15,15 @@
 use goblin::elf;
 
 use crate::{
-    identity::{ElfClass, ElfMachine},
+    profile::{ElfClass, ElfMachine},
     relocation::{AddendEncoding, ArchRelocator, RelocationKind},
 };
 
 #[derive(Clone, Copy)]
-pub struct Riscv64Relocator;
+pub(crate) struct Riscv64Relocator;
 
 #[derive(Clone, Copy)]
-pub struct Riscv32Relocator;
+pub(crate) struct Riscv32Relocator;
 
 impl ArchRelocator for Riscv64Relocator {
     fn machine(&self) -> super::ElfMachine {
@@ -32,10 +32,6 @@ impl ArchRelocator for Riscv64Relocator {
 
     fn class(&self) -> super::ElfClass {
         ElfClass::Elf64
-    }
-
-    fn relative_type(&self) -> u32 {
-        elf::reloc::R_RISCV_RELATIVE
     }
 
     fn addend_encoding(&self) -> super::AddendEncoding {
@@ -59,10 +55,6 @@ impl ArchRelocator for Riscv32Relocator {
 
     fn class(&self) -> ElfClass {
         ElfClass::Elf32
-    }
-
-    fn relative_type(&self) -> u32 {
-        elf::reloc::R_RISCV_RELATIVE
     }
 
     fn addend_encoding(&self) -> AddendEncoding {

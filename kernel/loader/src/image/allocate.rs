@@ -15,17 +15,18 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::{FileRange, TargetAddress, TargetRange},
+    address::{TargetAddress, TargetRange},
     dynamic_linker::ProgramHeaderGeometry,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
-    identity::LoadRequest,
+    error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{
         inspect::StackKind,
         map::{LoadedRegion, MappedImage},
     },
     memory::{AllocationOffset, ImageLoadTransaction, ImageMemory},
+    profile::LoadRequest,
     reader::ElfReader,
+    LoadError, LoadResult,
 };
 
 const COPY_BUFFER_SIZE: usize = 512;
@@ -39,13 +40,10 @@ pub(crate) struct AllocatedImage<R: ElfReader, M: ImageMemory> {
     load_bias: TargetAddress,
     request: LoadRequest,
     entry_vaddr: TargetAddress,
-    canonical_entry_vaddr: TargetAddress,
     load_segments: Vec<LoadSegmentInfo>,
     dynamic: Option<DynamicSegmentInfo>,
     relro: Option<TargetRange>,
     stack: StackKind,
-    interpreter: Option<FileRange>,
-    tls: Option<TargetRange>,
     phdr_geometry: ProgramHeaderGeometry,
 }
 
@@ -59,13 +57,10 @@ impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
         load_bias: TargetAddress,
         request: LoadRequest,
         entry_vaddr: TargetAddress,
-        canonical_entry_vaddr: TargetAddress,
         load_segments: Vec<LoadSegmentInfo>,
         dynamic: Option<DynamicSegmentInfo>,
         relro: Option<TargetRange>,
         stack: StackKind,
-        interpreter: Option<FileRange>,
-        tls: Option<TargetRange>,
         phdr_geometry: ProgramHeaderGeometry,
     ) -> Self {
         Self {
@@ -76,18 +71,15 @@ impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
             load_bias,
             request,
             entry_vaddr,
-            canonical_entry_vaddr,
             load_segments,
             dynamic,
             relro,
             stack,
-            interpreter,
-            tls,
             phdr_geometry,
         }
     }
 
-    pub fn map(mut self) -> LoadResult<MappedImage<R, M>> {
+    pub fn map(mut self) -> LoadResult<MappedImage<M>> {
         let mut regions = Vec::new();
         regions
             .try_reserve_exact(self.load_segments.len())
@@ -121,11 +113,6 @@ impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
             .load_bias
             .checked_add(self.entry_vaddr.get())
             .map_err(|error| error.at_stage(LoadStage::Map))?;
-        let canonical_entry = self
-            .load_bias
-            .checked_add(self.canonical_entry_vaddr.get())
-            .map_err(|error| error.at_stage(LoadStage::Map))?;
-
         let mut scratch = [0; COPY_BUFFER_SIZE];
         for region in regions.iter() {
             let offset = region.allocation_offset();
@@ -186,19 +173,15 @@ impl<R: ElfReader, M: ImageMemory> AllocatedImage<R, M> {
             }
         }
         Ok(MappedImage::new(
-            self.reader,
             self.transaction,
             self.load_bias,
             self.request,
             entry,
-            canonical_entry,
             self.load_segments,
             regions,
             self.dynamic,
             self.relro,
             self.stack,
-            self.interpreter,
-            self.tls,
             self.phdr_geometry,
         ))
     }

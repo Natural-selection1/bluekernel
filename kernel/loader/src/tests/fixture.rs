@@ -22,6 +22,12 @@ use goblin::{
     elf32, elf64,
 };
 
+use crate::{
+    error::{ErrorContext, LoadErrorKind},
+    reader::ElfReader,
+    LoadError, LoadResult,
+};
+
 use crate::memory::{
     AllocationId, AllocationLease, AllocationOwnership, AllocationRequest, ImageAllocation,
     ImageMemory, MutationProgress, Placement,
@@ -245,12 +251,12 @@ impl ElfFixtureBuilder {
         // trailing DT_NULL stays zero
 
         write_u32(&mut self.bytes, ph_offset, 2); // p_type = PT_DYNAMIC
-        write_u32(&mut self.bytes, ph_offset + 4, 0x4); // p_flags = PF_R
-        write_u32(&mut self.bytes, ph_offset + 8, dyn_offset as u32); // p_offset
-        write_u32(&mut self.bytes, ph_offset + 12, vaddr as u32); // p_vaddr
-        write_u32(&mut self.bytes, ph_offset + 16, vaddr as u32); // p_paddr
-        write_u32(&mut self.bytes, ph_offset + 20, dyn_len as u32); // p_filesz
-        write_u32(&mut self.bytes, ph_offset + 24, dyn_len as u32); // p_memsz
+        write_u32(&mut self.bytes, ph_offset + 4, dyn_offset as u32); // p_offset
+        write_u32(&mut self.bytes, ph_offset + 8, vaddr as u32); // p_vaddr
+        write_u32(&mut self.bytes, ph_offset + 12, vaddr as u32); // p_paddr
+        write_u32(&mut self.bytes, ph_offset + 16, dyn_len as u32); // p_filesz
+        write_u32(&mut self.bytes, ph_offset + 20, dyn_len as u32); // p_memsz
+        write_u32(&mut self.bytes, ph_offset + 24, 0x4); // p_flags = PF_R
         write_u32(&mut self.bytes, ph_offset + 28, 0x4); // p_align
 
         self.ph_count += 1;
@@ -366,11 +372,11 @@ impl RecordingMemory {
         *sink.borrow()
     }
 
-    fn validate_allocation(&self, allocation: &ImageAllocation) -> crate::error::LoadResult<()> {
+    fn validate_allocation(&self, allocation: &ImageAllocation) -> crate::LoadResult<()> {
         if allocation == &self.allocation {
             return Ok(());
         }
-        Err(crate::error::LoadError::new(
+        Err(crate::LoadError::new(
             crate::error::LoadErrorKind::Backend,
             crate::error::ErrorContext::Allocation {
                 base: allocation.base(),
@@ -382,10 +388,7 @@ impl RecordingMemory {
 }
 
 impl ImageMemory for RecordingMemory {
-    fn allocate_image(
-        &mut self,
-        request: AllocationRequest,
-    ) -> crate::error::LoadResult<AllocationLease> {
+    fn allocate_image(&mut self, request: AllocationRequest) -> crate::LoadResult<AllocationLease> {
         let (base, ownership) = match request.placement() {
             Placement::Fixed(range) => (range.start(), AllocationOwnership::BorrowedFixed),
             Placement::Anywhere => (
@@ -415,7 +418,7 @@ impl ImageMemory for RecordingMemory {
         allocation: &ImageAllocation,
         _offset: crate::memory::AllocationOffset,
         _len: u64,
-    ) -> crate::error::LoadResult<*mut u8> {
+    ) -> crate::LoadResult<*mut u8> {
         self.validate_allocation(allocation)?;
         Ok(core::ptr::null_mut())
     }
@@ -425,7 +428,7 @@ impl ImageMemory for RecordingMemory {
         allocation: &ImageAllocation,
         _offset: crate::memory::AllocationOffset,
         _data: &[u8],
-    ) -> crate::error::LoadResult<()> {
+    ) -> crate::LoadResult<()> {
         self.validate_allocation(allocation)?;
         Ok(())
     }
@@ -435,7 +438,7 @@ impl ImageMemory for RecordingMemory {
         allocation: &ImageAllocation,
         _offset: crate::memory::AllocationOffset,
         _len: u64,
-    ) -> crate::error::LoadResult<()> {
+    ) -> crate::LoadResult<()> {
         self.validate_allocation(allocation)?;
         Ok(())
     }
@@ -445,8 +448,83 @@ impl ImageMemory for RecordingMemory {
         allocation: &ImageAllocation,
         _offset: crate::memory::AllocationOffset,
         _dst: &mut [u8],
-    ) -> crate::error::LoadResult<()> {
+    ) -> crate::LoadResult<()> {
         self.validate_allocation(allocation)?;
+        Ok(())
+    }
+}
+
+pub struct SliceElfReader<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> SliceElfReader<'a> {
+    #[inline]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+}
+
+impl ElfReader for SliceElfReader<'_> {
+    fn len(&self) -> LoadResult<u64> {
+        u64::try_from(self.bytes.len())
+            .map_err(|_| LoadError::new(LoadErrorKind::IntegerOverflow, ErrorContext::None))
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> LoadResult<()> {
+        let file_len = self.len()?;
+        let len = u64::try_from(dst.len()).map_err(|_| {
+            LoadError::new(
+                LoadErrorKind::IntegerOverflow,
+                ErrorContext::FileRange {
+                    offset,
+                    len: u64::MAX,
+                    file_len,
+                },
+            )
+        })?;
+        let end = offset.checked_add(len).ok_or_else(|| {
+            LoadError::new(
+                LoadErrorKind::IntegerOverflow,
+                ErrorContext::FileRange {
+                    offset,
+                    len,
+                    file_len,
+                },
+            )
+        })?;
+        if end > file_len {
+            return Err(LoadError::new(
+                LoadErrorKind::OutOfBounds,
+                ErrorContext::FileRange {
+                    offset,
+                    len,
+                    file_len,
+                },
+            ));
+        }
+
+        let start = usize::try_from(offset).map_err(|_| {
+            LoadError::new(
+                LoadErrorKind::OutOfBounds,
+                ErrorContext::FileRange {
+                    offset,
+                    len,
+                    file_len,
+                },
+            )
+        })?;
+        let end = usize::try_from(end).map_err(|_| {
+            LoadError::new(
+                LoadErrorKind::OutOfBounds,
+                ErrorContext::FileRange {
+                    offset,
+                    len,
+                    file_len,
+                },
+            )
+        })?;
+        dst.copy_from_slice(&self.bytes[start..end]);
         Ok(())
     }
 }

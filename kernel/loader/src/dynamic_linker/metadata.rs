@@ -26,8 +26,8 @@ use crate::{
     address::{TargetAddress, TargetRange},
     dynamic_linker::{DependencyName, SymbolTable},
     elf::LoadSegmentInfo,
-    error::LoadResult,
     image::{LoadedRegion, RelocationRecord, StackKind},
+    LoadResult,
 };
 
 /// The `DT_REL`/`DT_RELA`/`DT_JMPREL` table descriptors plus their decoded
@@ -152,17 +152,6 @@ pub struct ProgramHeaderRuntimeInfo {
 }
 
 impl ProgramHeaderRuntimeInfo {
-    /// An empty summary: no table location, zero entries. Used when no dynamic
-    /// segment was decoded (a bare ET_EXEC image has no runtime metadata).
-    #[inline]
-    pub const fn empty() -> Self {
-        Self {
-            runtime_vaddr: None,
-            entry_size: 0,
-            count: 0,
-        }
-    }
-
     /// Build the summary from the raw ELF header geometry and the mapped
     /// program-header virtual address (if any), both captured during
     /// inspection.
@@ -273,25 +262,20 @@ impl RuntimeImageMetadata {
     }
 
     #[inline]
-    pub(crate) fn empty() -> Self {
+    pub(crate) fn empty(program_headers: ProgramHeaderRuntimeInfo) -> Self {
         Self::new(
             Vec::new(),
             None,
             SymbolTable::empty(),
             RelocationTables::empty(),
             ImageLifecycleMetadata::empty(),
-            ProgramHeaderRuntimeInfo::empty(),
+            program_headers,
         )
     }
 
     #[inline]
     pub(crate) fn needed(&self) -> &[DependencyName] {
         &self.needed
-    }
-
-    #[inline]
-    pub(crate) const fn soname(&self) -> Option<&DependencyName> {
-        self.soname.as_ref()
     }
 
     #[inline]
@@ -325,11 +309,6 @@ impl RuntimeImageMetadata {
     #[inline]
     pub(crate) const fn program_headers(&self) -> &ProgramHeaderRuntimeInfo {
         &self.program_headers
-    }
-
-    #[inline]
-    pub(crate) fn relocation_count(&self) -> usize {
-        self.relocations.len()
     }
 
     /// Total owned runtime metadata bytes this image keeps: the symbol table,
@@ -369,7 +348,6 @@ pub(crate) struct RuntimeImageState {
     metadata: RuntimeImageMetadata,
     load_bias: TargetAddress,
     runtime_entry: TargetAddress,
-    canonical_runtime_entry: TargetAddress,
     relro: Option<TargetRange>,
     stack: StackKind,
 }
@@ -383,7 +361,6 @@ impl RuntimeImageState {
         metadata: RuntimeImageMetadata,
         load_bias: TargetAddress,
         runtime_entry: TargetAddress,
-        canonical_runtime_entry: TargetAddress,
         relro: Option<TargetRange>,
         stack: StackKind,
     ) -> Self {
@@ -393,7 +370,6 @@ impl RuntimeImageState {
             metadata,
             load_bias,
             runtime_entry,
-            canonical_runtime_entry,
             relro,
             stack,
         }
@@ -429,11 +405,6 @@ impl RuntimeImageState {
     #[inline]
     pub(crate) const fn runtime_entry(&self) -> TargetAddress {
         self.runtime_entry
-    }
-
-    #[inline]
-    pub(crate) const fn canonical_runtime_entry(&self) -> TargetAddress {
-        self.canonical_runtime_entry
     }
 
     #[inline]

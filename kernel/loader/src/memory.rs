@@ -15,9 +15,17 @@
 use alloc::vec::Vec;
 
 use crate::{
+    error::{ErrorContext, LoadErrorKind},
+    LoadError, LoadResult,
+};
+
+pub use crate::{
     address::{TargetAddress, TargetRange},
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
-    MemoryPermissions,
+    image::{
+        PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities, ProtectionLevel,
+        ProtectionRecord,
+    },
+    memory_mapper::{MemoryMapper, MemoryPermissions, MemoryRegion},
 };
 
 /// Where an image wants its memory to come from.
@@ -238,8 +246,8 @@ pub trait ImageMemory {
     /// Allocate or borrow exactly the logical range requested by the loader.
     /// Returning `Err` must leave no allocation behind. On success the
     /// backend returns the unique allocation lease; the loader transfers it
-    /// back through `abort_image` or into the committed owner through
-    /// `ImageCommitMemory::commit_install`.
+    /// back through `abort_image` on failure, or into the committed owner
+    /// during publication.
     fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease>;
 
     /// Abort an uncommitted image. This operation must not allocate, fail or
@@ -289,20 +297,20 @@ pub trait ImageProtectionMemory: ImageMemory {
         offset: AllocationOffset,
         len: u64,
         permissions: MemoryPermissions,
-    ) -> LoadResult<crate::image::ProtectionLevel>;
+    ) -> LoadResult<ProtectionLevel>;
 
-    fn protection_capabilities(&self) -> crate::image::ProtectionCapabilities;
+    fn protection_capabilities(&self) -> ProtectionCapabilities;
 
     fn validate_protection_aliases(
         &self,
         allocation: &ImageAllocation,
-        prepared: &crate::image::PreparedProtectionPlan,
+        prepared: &PreparedProtectionPlan,
     ) -> LoadResult<()>;
 
     fn apply_protection(
         &mut self,
         allocation: &ImageAllocation,
-        mut batch: crate::image::ProtectionBatch<'_>,
+        mut batch: ProtectionBatch<'_>,
     ) -> LoadResult<()> {
         for index in 0..batch.records().len() {
             let record = batch.records()[index];
@@ -316,34 +324,6 @@ pub trait ImageProtectionMemory: ImageMemory {
         }
         Ok(())
     }
-}
-
-/// Backend side of the local two-phase install protocol.
-///
-/// `prepare_install` performs every fallible validation and constructs all
-/// state needed for publication. `commit_install` may only move that prepared
-/// state and the unique lease into the committed owner.
-pub trait ImageCommitMemory: ImageProtectionMemory {
-    type PreparedInstall;
-    type CommitReceipt;
-
-    fn prepare_install(
-        &mut self,
-        allocation: &ImageAllocation,
-        sealed: &crate::SealedState,
-    ) -> LoadResult<Self::PreparedInstall>;
-
-    /// # Safety
-    ///
-    /// `prepared`, `sealed`, and `lease` must come from the same active load
-    /// transaction on this backend. Implementations must not allocate,
-    /// validate, panic, or otherwise fail.
-    unsafe fn commit_install(
-        &mut self,
-        prepared: Self::PreparedInstall,
-        sealed: crate::SealedState,
-        lease: AllocationLease,
-    ) -> Self::CommitReceipt;
 }
 
 /// Stable reference to one allocation whose unique lease is owned by a
@@ -513,25 +493,8 @@ impl<M: ImageMemory> ImageLoadTransaction<M> {
     }
 
     #[inline]
-    pub(crate) fn memory_mut(&mut self) -> &mut M {
-        &mut self.memory
-    }
-
-    #[inline]
     fn mark_bytes_modified(&mut self) {
         self.progress = core::cmp::max(self.progress, MutationProgress::BytesModified);
-    }
-
-    #[inline]
-    fn mark_protection_modified(&mut self) {
-        self.progress = MutationProgress::ProtectionModified;
-    }
-
-    #[inline]
-    pub(crate) fn take_lease(&mut self) -> AllocationLease {
-        self.pending
-            .take()
-            .expect("ready image transaction must own its lease")
     }
 
     /// Owner-bound wrapper around `ImageMemory::read` that always passes the
@@ -564,34 +527,6 @@ impl<M: ImageMemory> ImageLoadTransaction<M> {
     pub(crate) fn image_span(&self, offset: AllocationOffset, len: u64) -> LoadResult<*mut u8> {
         let allocation = *self.allocation();
         self.memory.image_span(&allocation, offset, len)
-    }
-}
-
-impl<M: ImageProtectionMemory> ImageLoadTransaction<M> {
-    #[inline]
-    pub(crate) fn protection_capabilities(&self) -> crate::image::ProtectionCapabilities {
-        self.memory.protection_capabilities()
-    }
-
-    pub(crate) fn validate_protection_aliases(
-        &self,
-        prepared: &crate::image::PreparedProtectionPlan,
-    ) -> LoadResult<()> {
-        let allocation = *self.allocation();
-        self.memory
-            .validate_protection_aliases(&allocation, prepared)
-    }
-
-    /// Apply the complete protection batch to this transaction's allocation.
-    /// Progress is advanced first so partial backend mutation is always
-    /// conservatively rolled back.
-    pub(crate) fn apply_protection(
-        &mut self,
-        batch: crate::image::ProtectionBatch<'_>,
-    ) -> LoadResult<()> {
-        let allocation = *self.allocation();
-        self.mark_protection_modified();
-        self.memory.apply_protection(&allocation, batch)
     }
 }
 

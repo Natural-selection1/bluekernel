@@ -15,30 +15,29 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::{FileRange, TargetAddress, TargetRange},
+    address::{TargetAddress, TargetRange},
     dynamic_linker::ProgramHeaderGeometry,
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
-    identity::{ElfClass, ElfType, LoadRequest},
+    error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{allocate::AllocatedImage, inspect::StackKind},
     memory::{AllocationRequest, ImageAllocation, ImageLoadTransaction, ImageMemory, Placement},
+    profile::{ElfClass, ElfType, LoadRequest},
     reader::ElfReader,
+    LoadError, LoadResult,
 };
 
 pub(crate) struct PlannedImage<R: ElfReader> {
     reader: R,
     request: LoadRequest,
+    elf_type: ElfType,
     aligned_min_vaddr: TargetAddress,
     image_span: u64,
     max_align: u64,
     entry_vaddr: TargetAddress,
-    canonical_entry_vaddr: TargetAddress,
     load_segments: Vec<LoadSegmentInfo>,
     dynamic: Option<DynamicSegmentInfo>,
     relro: Option<TargetRange>,
     stack: StackKind,
-    interpreter: Option<FileRange>,
-    tls: Option<TargetRange>,
     phdr_geometry: ProgramHeaderGeometry,
 }
 
@@ -47,33 +46,29 @@ impl<R: ElfReader> PlannedImage<R> {
     pub const fn new(
         reader: R,
         request: LoadRequest,
+        elf_type: ElfType,
         aligned_min_vaddr: TargetAddress,
         image_span: u64,
         max_align: u64,
         entry_vaddr: TargetAddress,
-        canonical_entry_vaddr: TargetAddress,
         load_segments: Vec<LoadSegmentInfo>,
         dynamic: Option<DynamicSegmentInfo>,
         relro: Option<TargetRange>,
         stack: StackKind,
-        interpreter: Option<FileRange>,
-        tls: Option<TargetRange>,
         phdr_geometry: ProgramHeaderGeometry,
     ) -> Self {
         Self {
             reader,
             request,
+            elf_type,
             aligned_min_vaddr,
             image_span,
             max_align,
             entry_vaddr,
-            canonical_entry_vaddr,
             load_segments,
             dynamic,
             relro,
             stack,
-            interpreter,
-            tls,
             phdr_geometry,
         }
     }
@@ -101,7 +96,7 @@ impl<R: ElfReader> PlannedImage<R> {
                 },
             ));
         }
-        let placement = match self.request.profile().r#type() {
+        let placement = match self.elf_type {
             // Movable image: any suitably aligned address works.
             ElfType::Dyn => Placement::Anywhere,
             // Fixed image: the allocation must cover exactly the aligned
@@ -150,13 +145,10 @@ impl<R: ElfReader> PlannedImage<R> {
             load_bias,
             self.request,
             self.entry_vaddr,
-            self.canonical_entry_vaddr,
             self.load_segments,
             self.dynamic,
             self.relro,
             self.stack,
-            self.interpreter,
-            self.tls,
             self.phdr_geometry,
         ))
     }

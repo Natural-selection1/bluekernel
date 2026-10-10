@@ -29,14 +29,15 @@ use crate::{
         SymbolBinding, SymbolDefinition, SymbolRegionKind, SymbolTable, SymbolVisibility,
     },
     elf::LoadSegmentInfo,
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
-    identity::{ElfMachine, LoadProfile, SessionLimits},
+    error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{LoadedRegion, RelocationAddend, RelocationRecord},
     memory::{
         AllocationOffset, AllocationRollbackLog, ImageAllocation, ImageMemory, SessionAllocation,
     },
+    memory_mapper::MemoryPermissions,
+    profile::{ElfMachine, LoadProfile, SessionLimits},
     relocation::{AddendEncoding, ArchRelocator, RelocationKind, TargetWord, WordWidth},
-    MemoryPermissions,
+    LoadError, LoadResult,
 };
 
 /// The set of relocation kinds a profile's engine understands.
@@ -47,6 +48,15 @@ use crate::{
 pub(crate) struct RelocationTypeSet(u8);
 
 impl RelocationTypeSet {
+    /// Select the relocation kinds implemented for this ABI.
+    pub(crate) const fn for_profile(profile: &LoadProfile) -> Self {
+        match profile.machine() {
+            ElfMachine::Arm | ElfMachine::Aarch64 => Self::word_now(),
+            ElfMachine::Riscv => Self::riscv_now(),
+            _ => Self::empty(),
+        }
+    }
+
     const RELATIVE: u8 = 1 << 0;
     const ABSOLUTE: u8 = 1 << 1;
     const GLOBAL_DATA: u8 = 1 << 2;
@@ -79,53 +89,6 @@ impl RelocationTypeSet {
     }
 }
 
-/// Session-wide relocation acceptance rules.
-///
-/// Constructed from the profile and
-/// [`DYNAMIC_LINK_LOAD_POLICY`](crate::identity::DYNAMIC_LINK_LOAD_POLICY);
-/// callers can never supply an arbitrary type set.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RelocationPolicy {
-    allowed_types: RelocationTypeSet,
-    allow_undefined_weak_data: bool,
-    allow_undefined_weak_control_flow: bool,
-    require_control_flow_target_x: bool,
-    require_target_owner_writable: bool,
-}
-
-impl RelocationPolicy {
-    /// The policy for a profile. Unsupported machines remain fail-closed.
-    pub(crate) const fn for_profile(profile: &LoadProfile) -> Self {
-        match profile.machine() {
-            ElfMachine::Arm | ElfMachine::Aarch64 => Self::eager(RelocationTypeSet::word_now()),
-            ElfMachine::Riscv => Self::eager(RelocationTypeSet::riscv_now()),
-            _ => Self::fail_closed(),
-        }
-    }
-
-    const fn fail_closed() -> Self {
-        Self {
-            allowed_types: RelocationTypeSet::empty(),
-            allow_undefined_weak_data: false,
-            allow_undefined_weak_control_flow: false,
-            require_control_flow_target_x: true,
-            require_target_owner_writable: true,
-        }
-    }
-
-    const fn eager(allowed_types: RelocationTypeSet) -> Self {
-        Self {
-            allowed_types,
-            // Undefined weak data binds to 0; undefined weak control flow does
-            // not; unsupported binding combinations are rejected.
-            allow_undefined_weak_data: true,
-            allow_undefined_weak_control_flow: false,
-            require_control_flow_target_x: true,
-            require_target_owner_writable: true,
-        }
-    }
-}
-
 /// Provenance of a resolved relocation value.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RelocationSource {
@@ -152,11 +115,6 @@ impl SessionRelocation {
     #[inline]
     pub(crate) const fn owner(&self) -> ImageId {
         self.owner
-    }
-
-    #[inline]
-    pub(crate) const fn kind(&self) -> RelocationKind {
-        self.kind
     }
 
     #[inline]
@@ -257,7 +215,7 @@ pub(crate) fn run<A, M>(
     provider_regions: &[Vec<ProviderRegion>],
     scopes: &ScopeSet,
     profile: &LoadProfile,
-    policy: &RelocationPolicy,
+    policy: &RelocationTypeSet,
     limits: &SessionLimits,
     usage: &mut SessionUsage,
     memory: &mut M,
@@ -294,7 +252,7 @@ fn preflight<A, M>(
     provider_regions: &[Vec<ProviderRegion>],
     scopes: &ScopeSet,
     profile: &LoadProfile,
-    policy: &RelocationPolicy,
+    policy: &RelocationTypeSet,
     limits: &SessionLimits,
     usage: &mut SessionUsage,
     memory: &M,
@@ -353,7 +311,7 @@ fn preflight_one<A, M>(
     symbols: &[&SymbolTable],
     scopes: &ScopeSet,
     provider_regions: &[Vec<ProviderRegion>],
-    policy: &RelocationPolicy,
+    policy: &RelocationTypeSet,
     limits: &SessionLimits,
     target_word: TargetWord,
     thumb: bool,
@@ -369,7 +327,7 @@ where
     // the raw type must be in the profile whitelist.
     let kind = arch
         .classify_relocation(record.raw_type())
-        .filter(|kind| policy.allowed_types.contains(*kind))
+        .filter(|kind| policy.contains(*kind))
         .ok_or_else(|| relocation_error(record, LoadErrorKind::UnsupportedByProfile))?;
 
     // target alignment.
@@ -382,9 +340,7 @@ where
     let allocation = image.allocation().allocation();
     let offset = locate_region_offset(image.regions, record.offset(), width.bytes())
         .map_err(|_| relocation_error(record, LoadErrorKind::OutOfBounds))?;
-    if policy.require_target_owner_writable
-        && !segment_is_writable(image.load_segments, record.offset(), width.bytes())
-    {
+    if !segment_is_writable(image.load_segments, record.offset(), width.bytes()) {
         return Err(relocation_error(record, LoadErrorKind::PermissionConflict));
     }
     image
@@ -395,11 +351,9 @@ where
     // Resolve the addend and the symbol value, then fold into the final word.
     let addend = resolve_addend(arch, target_word, record, offset, allocation, memory)?;
     let source = resolve_source(
-        arch,
         symbols,
         scopes,
         provider_regions,
-        policy,
         limits,
         thumb,
         image.image_id,
@@ -465,22 +419,17 @@ fn implicit_addend(word: u64, width: WordWidth) -> i128 {
 /// Resolve the symbol a relocation references into its runtime value and
 /// provenance ( + ).
 #[allow(clippy::too_many_arguments)]
-fn resolve_source<A>(
-    _arch: &A,
+fn resolve_source(
     symbols: &[&SymbolTable],
     scopes: &ScopeSet,
     provider_regions: &[Vec<ProviderRegion>],
-    policy: &RelocationPolicy,
     limits: &SessionLimits,
     thumb: bool,
     owner: ImageId,
     record: RelocationRecord,
     kind: RelocationKind,
     usage: &mut SessionUsage,
-) -> LoadResult<RelocationSource>
-where
-    A: ArchRelocator + ?Sized,
-{
+) -> LoadResult<RelocationSource> {
     // RELATIVE has no symbol; its value is B + A.
     if kind == RelocationKind::Relative {
         if record.symbol_index() != 0 {
@@ -531,7 +480,7 @@ where
 
     match resolved {
         Some(symbol) => {
-            validate_symbol_kind(kind, thumb, &symbol, provider_regions, policy, record)?;
+            validate_symbol_kind(kind, thumb, &symbol, provider_regions, record)?;
             Ok(RelocationSource::Symbol(symbol))
         }
         None => {
@@ -540,13 +489,7 @@ where
             if entry.binding() != SymbolBinding::Weak {
                 return Err(relocation_error(record, LoadErrorKind::BadElf));
             }
-            let is_control_flow = kind == RelocationKind::JumpSlot;
-            let allowed = if is_control_flow {
-                policy.allow_undefined_weak_control_flow
-            } else {
-                policy.allow_undefined_weak_data
-            };
-            if !allowed {
+            if kind == RelocationKind::JumpSlot {
                 return Err(relocation_error(record, LoadErrorKind::BadElf));
             }
             Ok(RelocationSource::UndefinedWeak)
@@ -561,7 +504,6 @@ fn validate_symbol_kind(
     thumb: bool,
     symbol: &ResolvedSymbol,
     provider_regions: &[Vec<ProviderRegion>],
-    policy: &RelocationPolicy,
     record: RelocationRecord,
 ) -> LoadResult<()> {
     if kind == RelocationKind::JumpSlot && symbol.region() != SymbolRegionKind::Executable {
@@ -577,20 +519,18 @@ fn validate_symbol_kind(
                 LoadErrorKind::UnsupportedByProfile,
             ));
         }
-        if policy.require_control_flow_target_x {
-            let provider = provider_regions
-                .get(symbol.owner().get() as usize)
-                .ok_or_else(|| relocation_error(record, LoadErrorKind::BadElf))?;
-            let span = core::cmp::max(symbol.size(), 1);
-            let executable = provider.iter().any(|region| {
-                region.permissions().contains(MemoryPermissions::EXECUTE)
-                    && region
-                        .runtime_range()
-                        .contains_span(symbol.canonical(), span)
-            });
-            if !executable {
-                return Err(relocation_error(record, LoadErrorKind::PermissionConflict));
-            }
+        let provider = provider_regions
+            .get(symbol.owner().get() as usize)
+            .ok_or_else(|| relocation_error(record, LoadErrorKind::BadElf))?;
+        let span = core::cmp::max(symbol.size(), 1);
+        let executable = provider.iter().any(|region| {
+            region.permissions().contains(MemoryPermissions::EXECUTE)
+                && region
+                    .runtime_range()
+                    .contains_span(symbol.canonical(), span)
+        });
+        if !executable {
+            return Err(relocation_error(record, LoadErrorKind::PermissionConflict));
         }
     }
     Ok(())

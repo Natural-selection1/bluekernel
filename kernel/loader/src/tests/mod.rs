@@ -20,6 +20,8 @@ use goblin::elf::{
 use crate::tests::fixture::ElfFixtureBuilder;
 
 mod fixture;
+mod linker;
+mod load;
 mod runtime;
 
 use blueos_test_macro::test;
@@ -48,14 +50,13 @@ mod soname_relaxation {
     use crate::{
         dynamic_linker::ArtifactRole,
         error::{LoadErrorKind, ProgramHeaderField},
-        identity::{ElfType, LoadLimits, LoadProfile, LoadRequest},
         image::ImageLoader,
-        reader::SliceElfReader,
-        tests::fixture::ElfFixtureBuilder,
+        profile::{LoadLimits, LoadProfile, LoadRequest},
+        tests::fixture::{ElfFixtureBuilder, SliceElfReader},
     };
 
     fn dyn_request() -> LoadRequest {
-        LoadRequest::new(LoadProfile::riscv64(ElfType::Dyn), LoadLimits::DEFAULT)
+        LoadRequest::new(LoadProfile::riscv64(), LoadLimits::DEFAULT)
     }
 
     /// One PT_LOAD (r-x, entry inside) plus a PT_DYNAMIC with a single
@@ -141,14 +142,13 @@ mod dependency_scan {
 
     use crate::{
         dynamic_linker::ArtifactRole,
-        identity::{ElfType, LoadLimits, LoadProfile},
-        image::scan::scan_artifact,
-        reader::SliceElfReader,
-        tests::fixture::ElfFixtureBuilder,
+        image::scan::scan_root_or_dependency,
+        profile::{LoadLimits, LoadProfile},
+        tests::fixture::{ElfFixtureBuilder, SliceElfReader},
     };
 
     fn profile() -> LoadProfile {
-        LoadProfile::riscv64(ElfType::Dyn)
+        LoadProfile::riscv64()
     }
 
     /// A dynamic-area convention shared by these fixtures: one PT_LOAD (r-x,
@@ -189,10 +189,10 @@ mod dependency_scan {
         // dynstr: "libc.so.1\0libfoo.so.1\0self.so\0" — offsets 0, 10, 22
         let dynstr: &[u8] = b"libc.so.1\0libfoo.so.1\0self.so\0";
         let bytes = scanned_dso(&[(DT_NEEDED, 0), (DT_NEEDED, 10), (DT_SONAME, 22)], dynstr);
-        let scanned = scan_artifact(
+        let scanned = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            ArtifactRole::SharedObject,
+            Some(ArtifactRole::SharedObject),
             LoadLimits::DEFAULT,
         )
         .expect("scan");
@@ -209,10 +209,10 @@ mod dependency_scan {
     fn scan_accepts_dso_without_soname() {
         let dynstr: &[u8] = b"libc.so.1\0";
         let bytes = scanned_dso(&[(DT_NEEDED, 0)], dynstr);
-        let scanned = scan_artifact(
+        let scanned = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            ArtifactRole::SharedObject,
+            Some(ArtifactRole::SharedObject),
             LoadLimits::DEFAULT,
         )
         .expect("scan");
@@ -228,10 +228,10 @@ mod dependency_scan {
             .with_load_segment(0x1000, 0x100, 0x100, 0x4)
             .with_entry(0x1000)
             .build();
-        let scanned = scan_artifact(
+        let scanned = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            ArtifactRole::ExecutableRoot,
+            Some(ArtifactRole::ExecutableRoot),
             LoadLimits::DEFAULT,
         )
         .expect("scan");
@@ -244,10 +244,10 @@ mod dependency_scan {
         let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
             .with_load_segment(0x1000, 0x100, 0x100, 0x4)
             .build();
-        let result = scan_artifact(
+        let result = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            ArtifactRole::SharedObject,
+            Some(ArtifactRole::SharedObject),
             LoadLimits::DEFAULT,
         );
         assert!(
@@ -262,10 +262,10 @@ mod dependency_scan {
         // reject it (BadElf,  length rules).
         let dynstr: &[u8] = b"libc.so.1"; // no terminator
         let bytes = scanned_dso(&[(DT_NEEDED, 0)], dynstr);
-        let result = scan_artifact(
+        let result = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            ArtifactRole::SharedObject,
+            Some(ArtifactRole::SharedObject),
             LoadLimits::DEFAULT,
         );
         assert!(
@@ -279,10 +279,10 @@ mod dependency_scan {
         // DT_NEEDED offset 0xff points past the end of the 10-byte dynstr.
         let dynstr: &[u8] = b"libc.so.1\0";
         let bytes = scanned_dso(&[(DT_NEEDED, 0xff)], dynstr);
-        let result = scan_artifact(
+        let result = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            ArtifactRole::SharedObject,
+            Some(ArtifactRole::SharedObject),
             LoadLimits::DEFAULT,
         );
         assert!(
@@ -302,10 +302,10 @@ mod dependency_scan {
             .with_load_segment(0x1000, 0x100, 0x100, 0x4)
             .with_dynamic_entries(dyn_vaddr, &[(DT_NEEDED as u32, 0)])
             .build();
-        let result = scan_artifact(
+        let result = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            ArtifactRole::SharedObject,
+            Some(ArtifactRole::SharedObject),
             LoadLimits::DEFAULT,
         );
         assert!(result.is_err(), "DT_NEEDED without DT_STRTAB must fail");
@@ -361,15 +361,14 @@ mod exec_plan {
     use blueos_test_macro::test;
 
     use crate::{
-        identity::{ElfType, LoadLimits, LoadProfile, LoadRequest},
         image::ImageLoader,
         memory::Placement,
-        reader::SliceElfReader,
-        tests::fixture::{ElfFixtureBuilder, RecordingMemory},
+        profile::{LoadLimits, LoadProfile, LoadRequest},
+        tests::fixture::{ElfFixtureBuilder, RecordingMemory, SliceElfReader},
     };
 
     fn build_exec_request() -> LoadRequest {
-        let profile = LoadProfile::riscv64(ElfType::Exec);
+        let profile = LoadProfile::riscv64();
         LoadRequest::new(profile, LoadLimits::DEFAULT)
     }
 
@@ -455,6 +454,24 @@ mod fixed_mapper {
     }
 
     #[test]
+    fn fixed_mapper_rejects_readonly_loading_span() {
+        static READONLY: [MemoryRegion; 1] = [unsafe {
+            // Only reservation is attempted; this range is never accessed.
+            MemoryRegion::new(0x5000_0000, 0x5000_2000, MemoryPermissions::READ)
+        }];
+        let mut mapper = MemoryMapper::new(Some(&READONLY));
+        let error = mapper
+            .allocate_image(fixed_request(0x5000_0000, 0x1000))
+            .unwrap_err();
+        assert!(matches!(error.kind(), LoadErrorKind::PermissionConflict));
+        assert!(!mapper.is_poisoned(), "reject before target mutation");
+        let lease = mapper
+            .allocate_image(AllocationRequest::new(Placement::Anywhere, 16, 4))
+            .expect("failed reservation leaves mapper reusable");
+        mapper.abort_image(lease, crate::memory::MutationProgress::Reserved);
+    }
+
+    #[test]
     fn fixed_mapper_rejects_span_exceeding_regions() {
         let mut mapper = MemoryMapper::new(Some(&REGIONS));
         // The region ends at 0x5000_2000; a span of 0x3000 overruns it.
@@ -486,57 +503,15 @@ mod fixed_mapper {
     }
 
     #[test]
-    fn fixed_mapper_rejects_anywhere_request() {
+    fn fixed_regions_also_allow_movable_images() {
         let mut mapper = MemoryMapper::new(Some(&REGIONS));
         let request = AllocationRequest::new(Placement::Anywhere, 0x1000, 4);
-        assert!(mapper.allocate_image(request).is_err());
-    }
-}
-
-mod entry_dispatch {
-    use blueos_test_macro::test;
-
-    use crate::{
-        error::{ErrorContext, HeaderField, LoadErrorKind, LoadStage},
-        load_elf,
-        memory_mapper::MemoryMapper,
-        tests::fixture::ElfFixtureBuilder,
-    };
-
-    #[test]
-    fn exec_image_on_allocated_mapper_is_rejected() {
-        // An ET_EXEC image must only be given to a Fixed mapper; the entry
-        // dispatch notices the mismatch before any segment is copied.
-        let bytes =
-            ElfFixtureBuilder::elf64(goblin::elf::header::EM_RISCV, goblin::elf::header::ET_EXEC)
-                .with_load_segment(0x5000_0000, 0x100, 0x100, 0x4)
-                .with_entry(0x5000_0000)
-                .build();
-        let mut mapper = MemoryMapper::new(None);
-        let error = load_elf(&bytes, &mut mapper).unwrap_err();
-        assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
-        assert!(matches!(error.stage(), Some(LoadStage::Admit)));
-        assert!(matches!(
-            error.context(),
-            ErrorContext::HeaderField { field: HeaderField::Type, value }
-                if *value == u64::from(goblin::elf::header::ET_EXEC)
-        ));
-    }
-
-    #[test]
-    fn truncated_header_preserves_reader_error() {
-        let mut mapper = MemoryMapper::new(None);
-        let error = load_elf(&[], &mut mapper).unwrap_err();
-        assert!(matches!(error.kind(), LoadErrorKind::OutOfBounds));
-        assert!(matches!(error.stage(), Some(LoadStage::Admit)));
-        assert!(matches!(
-            error.context(),
-            ErrorContext::FileRange {
-                offset: 0,
-                len: 20,
-                file_len: 0
-            }
-        ));
+        let lease = mapper.allocate_image(request).expect("movable allocation");
+        assert_eq!(
+            lease.allocation().ownership(),
+            crate::memory::AllocationOwnership::Owned
+        );
+        mapper.abort_image(lease, crate::memory::MutationProgress::Reserved);
     }
 }
 
@@ -547,10 +522,9 @@ mod arm_admission {
 
     use crate::{
         error::{ErrorContext, HeaderField, LoadErrorKind},
-        identity::{ElfType, LoadLimits, LoadProfile, LoadRequest},
         image::ImageLoader,
-        reader::SliceElfReader,
-        tests::fixture::ElfFixtureBuilder,
+        profile::{LoadLimits, LoadProfile, LoadRequest},
+        tests::fixture::{ElfFixtureBuilder, SliceElfReader},
     };
 
     // EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_SOFT, as produced for
@@ -560,26 +534,20 @@ mod arm_admission {
     const EABI4: u32 = 0x0400_0200;
 
     fn arm_request() -> LoadRequest {
-        LoadRequest::new(
-            LoadProfile::arm_thumb_soft_float(ElfType::Dyn),
-            LoadLimits::DEFAULT,
-        )
+        LoadRequest::new(LoadProfile::arm_thumb_soft_float(), LoadLimits::DEFAULT)
     }
 
-    fn admit(bytes: &[u8]) -> crate::error::LoadResult<()> {
+    fn admit(bytes: &[u8]) -> crate::LoadResult<()> {
         ImageLoader::new(SliceElfReader::new(bytes), arm_request())
             .admit()
             .map(|_| ())
     }
 
     fn hard_float_request() -> LoadRequest {
-        LoadRequest::new(
-            LoadProfile::arm_thumb_hard_float(ElfType::Dyn),
-            LoadLimits::DEFAULT,
-        )
+        LoadRequest::new(LoadProfile::arm_thumb_hard_float(), LoadLimits::DEFAULT)
     }
 
-    fn admit_hard_float(bytes: &[u8]) -> crate::error::LoadResult<()> {
+    fn admit_hard_float(bytes: &[u8]) -> crate::LoadResult<()> {
         ImageLoader::new(SliceElfReader::new(bytes), hard_float_request())
             .admit()
             .map(|_| ())
@@ -756,14 +724,13 @@ mod aarch64_profile {
 
     use crate::{
         error::{ErrorContext, HeaderField, LoadErrorKind},
-        identity::{ElfType, LoadLimits, LoadProfile, LoadRequest},
         image::ImageLoader,
-        reader::SliceElfReader,
-        tests::fixture::ElfFixtureBuilder,
+        profile::{LoadLimits, LoadProfile, LoadRequest},
+        tests::fixture::{ElfFixtureBuilder, SliceElfReader},
     };
 
     fn request() -> LoadRequest {
-        LoadRequest::new(LoadProfile::aarch64(ElfType::Dyn), LoadLimits::DEFAULT)
+        LoadRequest::new(LoadProfile::aarch64(), LoadLimits::DEFAULT)
     }
 
     #[test]

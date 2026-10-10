@@ -41,7 +41,7 @@
 //!   sessions cannot form an ABBA wait cycle.
 //!
 //! A system candidate's unique
-//! [`AllocationLease`](blueos_loader::AllocationLease) moves from the publisher
+//! [`AllocationLease`](blueos_loader::memory::AllocationLease) moves from the publisher
 //! receipt into the registry when the candidate enters `Initializing`. The
 //! registry retains it through `Ready` and hands it to the reaper only when the
 //! instance is safe to unload. The registry itself is a plain `Arc<Mutex<_>>`
@@ -50,9 +50,11 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use super::adapters::system_paths::SystemLibraryKey;
 use blueos_loader::{
-    AllocationLease, DependencyName, ErrorContext, FiniPlan, LoadError, LoadErrorKind, LoadResult,
-    PublishedImageDescriptor,
+    error::{ErrorContext, LoadErrorKind},
+    memory::AllocationLease,
+    ImageHandle, LoadError, LoadResult,
 };
 use spin::Mutex;
 
@@ -72,9 +74,9 @@ pub enum QuiescenceResolution {
 
 /// One member handed to the quiescence worker for destruction.
 pub struct SystemUnloadBacking {
-    pub key: DependencyName,
+    pub key: SystemLibraryKey,
     pub allocation: AllocationLease,
-    pub fini_plan: FiniPlan,
+    pub fini_plan: Vec<usize>,
     /// Outgoing SCC dependency leases. They remain live through this member's
     /// fini and drop only after its backing has been released.
     pub dependencies: Vec<SystemDsoLease>,
@@ -110,13 +112,9 @@ pub enum AcquireBatchOutcome {
 /// The atomically acquired system closure a resolver consumes edge-by-edge.
 pub struct PreparedSystemBatch {
     /// First-load candidates: the canonical path key and publication permit.
-    pub loads: Vec<(DependencyName, LoadPermit)>,
+    pub loads: Vec<(SystemLibraryKey, LoadPermit)>,
     /// Ready imports: the canonical path key, lease and shared descriptor.
-    pub imports: Vec<(
-        DependencyName,
-        SystemDsoLease,
-        Arc<PublishedImageDescriptor>,
-    )>,
+    pub imports: Vec<(SystemLibraryKey, SystemDsoLease, ImageHandle)>,
 }
 
 /// The registry-owned backing of one new system candidate.
@@ -125,18 +123,18 @@ pub struct PreparedSystemBatch {
 /// publication: the instance — not the application receipt — owns the unique
 /// allocation, the descriptor and the fini plan from then on.
 pub struct SystemCandidateBacking {
-    pub descriptor: Arc<PublishedImageDescriptor>,
-    pub fini_plan: FiniPlan,
+    pub descriptor: ImageHandle,
+    pub fini_plan: Vec<usize>,
     pub allocation: AllocationLease,
     /// Outgoing dependencies to other system SCCs. They become counted leases
     /// atomically when the whole initialization batch becomes Ready.
-    pub dependency_keys: Vec<DependencyName>,
+    pub dependency_keys: Vec<SystemLibraryKey>,
     /// Empty storage pre-reserved for `dependency_keys`, so the Ready
     /// transition and lease minting do not allocate under the registry lock.
     pub dependencies: Vec<SystemDsoLease>,
     /// Every canonical path key in this candidate's system SCC. Internal edges are
     /// structural and do not mint self-sustaining leases.
-    pub scc_members: Vec<DependencyName>,
+    pub scc_members: Vec<SystemLibraryKey>,
     /// Cached/unloadable policy captured from the immutable system catalog.
     pub keep_cached: bool,
 }
@@ -230,24 +228,24 @@ enum InstanceState {
     /// waiter may observe a descriptor here — they stay `Pending` until the
     /// application reports init completion.
     Initializing {
-        descriptor: Arc<PublishedImageDescriptor>,
-        fini_plan: FiniPlan,
+        descriptor: ImageHandle,
+        fini_plan: Vec<usize>,
         allocation: AllocationLease,
-        dependency_keys: Vec<DependencyName>,
+        dependency_keys: Vec<SystemLibraryKey>,
         dependencies: Vec<SystemDsoLease>,
-        scc_members: Vec<DependencyName>,
+        scc_members: Vec<SystemLibraryKey>,
         keep_cached: bool,
     },
     Ready {
         leases: usize,
-        descriptor: Arc<PublishedImageDescriptor>,
-        fini_plan: FiniPlan,
+        descriptor: ImageHandle,
+        fini_plan: Vec<usize>,
         /// The instance owns its backing: the unique allocation lease
         /// and its system-to-system dependency leases live with the Ready
         /// state, released only by the quiescence worker.
         allocation: AllocationLease,
         dependencies: Vec<SystemDsoLease>,
-        scc_members: Vec<DependencyName>,
+        scc_members: Vec<SystemLibraryKey>,
         keep_cached: bool,
     },
     /// An SCC's backings have moved to a [`SystemUnloadBatch`]. The state is
@@ -270,7 +268,7 @@ struct BatchMember {
 }
 
 struct Slot {
-    key: DependencyName,
+    key: SystemLibraryKey,
     generation: u32,
     state: InstanceState,
 }
@@ -318,10 +316,10 @@ impl SystemDsoRegistry {
     /// an ABBA cycle. Any in-flight slot leaves the entire set untouched and
     /// returns a [`SystemBatchWait`] ticket; the caller waits outside the lock
     /// and retries the whole batch.
-    pub fn acquire_batch(&self, keys: &[DependencyName]) -> AcquireBatchOutcome {
+    pub fn acquire_batch(&self, keys: &[SystemLibraryKey]) -> AcquireBatchOutcome {
         let mut inner = self.inner.lock();
         // Deterministic canonical-path byte order, de-duplicated.
-        let mut ordered: Vec<DependencyName> = keys.to_vec();
+        let mut ordered: Vec<SystemLibraryKey> = keys.to_vec();
         ordered.sort();
         ordered.dedup();
         for key in &ordered {
@@ -382,8 +380,8 @@ impl SystemDsoRegistry {
 
     /// Advance a `Loading` slot to `Relocated` once the candidate image's
     /// relocation and seal stage completed. All capacity/identity/
-    /// generation checks happen in the link publisher's `prepare_batch` before
-    /// this call; this only moves the slot and returns the next token.
+    /// publication storage is reserved before this call; generation checks
+    /// below validate the permit before moving the slot to the next state.
     pub fn publish_relocated(&self, permit: LoadPermit) -> LoadResult<RelocatedPermit> {
         let (inner, slot, generation) = permit.consume();
         {
@@ -417,7 +415,7 @@ impl SystemDsoRegistry {
     pub fn publish_relocated_batch(
         &self,
         permits: Vec<RelocatedPermit>,
-        backings: Vec<SystemCandidateBacking>,
+        backings: &mut Vec<SystemCandidateBacking>,
     ) -> LoadResult<SystemInitBatch> {
         if permits.len() != backings.len() {
             return Err(stale_error());
@@ -457,7 +455,7 @@ impl SystemDsoRegistry {
         // Every fallible check completed above. Mutate the whole batch while
         // holding one registry lock, so no observer can see a partial
         // Relocated-to-Initializing transition.
-        for (permit, backing) in permits.into_iter().zip(backings) {
+        for (permit, backing) in permits.into_iter().zip(backings.drain(..)) {
             let (_, slot, _) = permit.consume();
             let instance = &mut guard.slots[slot];
             instance.state = InstanceState::Initializing {
@@ -715,7 +713,7 @@ impl SystemDsoRegistry {
     /// cache-pinned, the whole SCC stays Ready. Otherwise all members move to
     /// `Unloading` in one lock hold and their backings are handed to the
     /// worker; no concurrent acquire can observe a half-destroyed SCC.
-    pub fn resolve_quiescence(&self, key: &DependencyName) -> Option<QuiescenceResolution> {
+    pub fn resolve_quiescence(&self, key: &SystemLibraryKey) -> Option<QuiescenceResolution> {
         let mut inner = self.inner.lock();
         let index = inner.slots.iter().position(|slot| &slot.key == key)?;
         let InstanceState::Ready {
@@ -955,13 +953,13 @@ pub struct SystemDsoLease {
     inner: Arc<Mutex<RegistryInner>>,
     slot: usize,
     generation: u32,
-    key: DependencyName,
+    key: SystemLibraryKey,
 }
 
 impl SystemDsoLease {
     /// The canonical system catalog path key this lease was minted for.
     #[inline]
-    pub fn key(&self) -> &DependencyName {
+    pub fn key(&self) -> &SystemLibraryKey {
         &self.key
     }
 }
@@ -992,7 +990,7 @@ fn wake_waiters(resolution: &AtomicUsize) {
     let _ = atomic_wake(resolution, usize::MAX);
 }
 
-fn ensure_slot(slots: &mut Vec<Slot>, key: DependencyName) -> usize {
+fn ensure_slot(slots: &mut Vec<Slot>, key: SystemLibraryKey) -> usize {
     if let Some(index) = slots.iter().position(|slot| slot.key == key) {
         return index;
     }
@@ -1011,11 +1009,21 @@ fn stale_error() -> LoadError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blueos_loader::{ImageAllocation, TargetAddress};
+    use blueos_loader::memory::{ImageAllocation, TargetAddress};
     use blueos_test_macro::test;
 
-    fn key(path: &[u8]) -> DependencyName {
-        DependencyName::from_bytes(path).expect("valid system path")
+    fn key(path: &[u8]) -> SystemLibraryKey {
+        SystemLibraryKey::from_bytes(path).expect("valid system path")
+    }
+
+    fn generation(registry: &SystemDsoRegistry, key: &SystemLibraryKey) -> Option<u32> {
+        registry
+            .inner
+            .lock()
+            .slots
+            .iter()
+            .find(|slot| &slot.key == key)
+            .map(|slot| slot.generation)
     }
 
     #[test]
@@ -1030,8 +1038,8 @@ mod tests {
         };
         assert_eq!(batch.loads.len(), 2);
         assert!(batch.imports.is_empty());
-        assert_eq!(registry.generation(&libc), Some(1));
-        assert_eq!(registry.generation(&other), Some(1));
+        assert_eq!(generation(&registry, &libc), Some(1));
+        assert_eq!(generation(&registry, &other), Some(1));
     }
 
     #[test]
@@ -1050,7 +1058,7 @@ mod tests {
         else {
             panic!("expected pending batch");
         };
-        assert_eq!(registry.generation(&other), None);
+        assert_eq!(generation(&registry, &other), None);
         drop(permit);
         wait.wait();
         let AcquireBatchOutcome::Acquired(second) =
@@ -1059,8 +1067,8 @@ mod tests {
             panic!("expected retry batch");
         };
         assert_eq!(second.loads.len(), 2);
-        assert_eq!(registry.generation(&libc), Some(2));
-        assert_eq!(registry.generation(&other), Some(1));
+        assert_eq!(generation(&registry, &libc), Some(2));
+        assert_eq!(generation(&registry, &other), Some(1));
     }
 
     #[test]
@@ -1081,7 +1089,7 @@ mod tests {
             panic!("expected retry batch");
         };
         assert_eq!(retry.loads.len(), 1);
-        assert_eq!(registry.generation(&libc), Some(2));
+        assert_eq!(generation(&registry, &libc), Some(2));
     }
 
     #[test]
@@ -1108,6 +1116,6 @@ mod tests {
             panic!("failed slot was not reopened by the drain");
         };
         assert_eq!(retry.loads.len(), 1);
-        assert_eq!(registry.generation(&library), Some(2));
+        assert_eq!(generation(&registry, &library), Some(2));
     }
 }

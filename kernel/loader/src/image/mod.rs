@@ -14,26 +14,22 @@
 
 mod admit;
 mod allocate;
-mod cache;
 mod decode;
 mod features;
 mod image_loader;
 mod inspect;
 mod map;
 mod plan;
-mod relocate;
 pub mod scan;
 mod seal;
 
-pub(crate) use decode::{
-    absorb_into_session, RelocationAddend, RelocationRecord, RelocationTableKind,
-};
+pub(crate) use decode::{absorb_into_session, RelocationAddend, RelocationRecord};
 pub(crate) use features::DynamicFeatureSummary;
 pub(crate) use image_loader::{read_u16, read_u32, read_u64, ImageLoader};
 pub(crate) use inspect::StackKind;
 pub(crate) use map::LoadedRegion;
-pub use scan::{scan_artifact, ScannedArtifact};
+pub(crate) use scan::ScannedArtifact;
 pub use seal::{
-    AppliedProtectionSet, PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities,
-    ProtectionLevel, ProtectionRecord, SealPlan, SealRange, SealedState,
+    PreparedProtectionPlan, ProtectionBatch, ProtectionCapabilities, ProtectionLevel,
+    ProtectionRecord, SealPlan,
 };

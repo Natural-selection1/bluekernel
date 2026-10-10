@@ -14,7 +14,7 @@
 
 use crate::{
     address::{FileRange, TargetAddress},
-    MemoryPermissions,
+    memory_mapper::MemoryPermissions,
 };
 
 pub(crate) struct LoadSegmentInfo {

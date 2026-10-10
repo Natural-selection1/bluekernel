@@ -21,7 +21,11 @@ use crate::{
     error::{code, Error},
     vfs::File,
 };
-use blueos_loader::{ElfReader, ErrorContext, LoadError, LoadErrorKind, LoadResult};
+use blueos_loader::{
+    error::{ErrorContext, LoadErrorKind},
+    reader::ElfReader,
+    LoadError, LoadResult,
+};
 
 /// A read-only ELF reader over an opened VFS file.
 ///

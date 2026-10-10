@@ -16,15 +16,13 @@ use alloc::vec::Vec;
 
 use crate::{
     address::{TargetAddress, TargetRange},
-    cache::CacheSyncOutcome,
     elf::LoadSegmentInfo,
-    error::{ErrorContext, LimitKind, LoadError, LoadErrorKind, LoadResult, ProgramHeaderField},
-    identity::{ElfClass, SINGLE_IMAGE_LOAD_POLICY},
+    error::{ErrorContext, LimitKind, LoadErrorKind, ProgramHeaderField},
     image::{inspect::StackKind, map::LoadedRegion, RelocationRecord},
-    memory::{
-        AllocationOffset, ImageAllocation, ImageLoadTransaction, ImageMemory, ImageProtectionMemory,
-    },
-    MemoryPermissions,
+    memory::{AllocationOffset, ImageAllocation, ImageProtectionMemory},
+    memory_mapper::MemoryPermissions,
+    profile::ElfClass,
+    LoadError, LoadResult,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,7 +101,7 @@ impl SealPlan {
         stack: &StackKind,
         relocations: &[RelocationRecord],
     ) -> LoadResult<Self> {
-        if *stack == StackKind::Executable && !SINGLE_IMAGE_LOAD_POLICY.allows_executable_stack() {
+        if *stack == StackKind::Executable {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::ProgramHeader {
@@ -282,19 +280,6 @@ pub struct PreparedProtectionPlan {
 }
 
 impl PreparedProtectionPlan {
-    pub(crate) fn prepare<M: ImageProtectionMemory>(
-        transaction: &ImageLoadTransaction<M>,
-        logical: &SealPlan,
-    ) -> LoadResult<Self> {
-        let allocation = *transaction.allocation();
-        let prepared = Self::build(&allocation, logical, transaction.protection_capabilities())?;
-        transaction.validate_protection_aliases(&prepared)?;
-        for range in prepared.ranges() {
-            transaction.image_span(range.allocation_offset(), range.applied_range().len())?;
-        }
-        Ok(prepared)
-    }
-
     pub(crate) fn prepare_for_allocation<M: ImageProtectionMemory + ?Sized>(
         memory: &M,
         allocation: &ImageAllocation,
@@ -393,125 +378,6 @@ impl PreparedProtectionPlan {
     #[inline]
     pub(crate) fn into_ranges(self) -> Vec<ProtectionRecord> {
         self.ranges
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct AppliedProtectionSet {
-    ranges: Vec<ProtectionRecord>,
-}
-
-impl AppliedProtectionSet {
-    #[inline]
-    pub(crate) const fn new(ranges: Vec<ProtectionRecord>) -> Self {
-        Self { ranges }
-    }
-
-    #[inline]
-    pub fn ranges(&self) -> &[ProtectionRecord] {
-        &self.ranges
-    }
-
-    pub fn level(&self) -> ProtectionLevel {
-        if !self.ranges.is_empty()
-            && self
-                .ranges
-                .iter()
-                .all(|range| range.level() == ProtectionLevel::HardwareEnforced)
-        {
-            ProtectionLevel::HardwareEnforced
-        } else {
-            ProtectionLevel::LogicalOnly
-        }
-    }
-}
-
-/// The sealed, unpublished payload validated by a commit backend.
-///
-/// This value carries no allocation authority by itself. In the public API it
-/// is always kept private inside `PreparedImage`/`ReadyImageCommit` until the
-/// same transaction transfers its unique lease to the committed owner.
-#[derive(Clone, Debug)]
-pub struct SealedState {
-    load_bias: TargetAddress,
-    runtime_entry: TargetAddress,
-    canonical_entry: TargetAddress,
-    cache_sync: CacheSyncOutcome,
-    seal_plan: SealPlan,
-    protections: AppliedProtectionSet,
-}
-
-impl SealedState {
-    pub(crate) const fn new(
-        load_bias: TargetAddress,
-        runtime_entry: TargetAddress,
-        canonical_entry: TargetAddress,
-        cache_sync: CacheSyncOutcome,
-        seal_plan: SealPlan,
-        protections: AppliedProtectionSet,
-    ) -> Self {
-        Self {
-            load_bias,
-            runtime_entry,
-            canonical_entry,
-            cache_sync,
-            seal_plan,
-            protections,
-        }
-    }
-
-    #[inline]
-    pub const fn load_bias(&self) -> TargetAddress {
-        self.load_bias
-    }
-
-    #[inline]
-    pub const fn entry(&self) -> TargetAddress {
-        self.runtime_entry
-    }
-
-    #[inline]
-    pub const fn canonical_entry(&self) -> TargetAddress {
-        self.canonical_entry
-    }
-
-    #[inline]
-    pub const fn cache_sync(&self) -> &CacheSyncOutcome {
-        &self.cache_sync
-    }
-
-    #[inline]
-    pub const fn seal_plan(&self) -> &SealPlan {
-        &self.seal_plan
-    }
-
-    #[inline]
-    pub const fn protections(&self) -> &AppliedProtectionSet {
-        &self.protections
-    }
-
-    #[inline]
-    pub fn protection(&self) -> ProtectionLevel {
-        self.protections.level()
-    }
-}
-
-#[must_use = "dropping a sealed image aborts its allocation"]
-pub(crate) struct SealedImage<M: ImageMemory> {
-    transaction: ImageLoadTransaction<M>,
-    sealed: SealedState,
-}
-
-impl<M: ImageMemory> SealedImage<M> {
-    pub(crate) fn new(transaction: ImageLoadTransaction<M>, sealed: SealedState) -> Self {
-        Self {
-            transaction,
-            sealed,
-        }
-    }
-
-    pub(crate) fn into_prepared_parts(self) -> (ImageLoadTransaction<M>, SealedState) {
-        (self.transaction, self.sealed)
     }
 }
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::identity::{ElfClass, ElfData, ElfMachine, ElfType};
+use crate::profile::{ElfClass, ElfData, ElfMachine, ElfType};
 
 pub(crate) struct ElfHeaderInfo {
     class: ElfClass,

@@ -33,33 +33,24 @@ pub(crate) use graph::DependencyGraph;
 #[cfg(test)]
 pub(crate) use session::SessionUsage;
 
-pub use artifact::{
+pub(crate) use artifact::{
     ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
-    DependencyRequester, DependencyResolution, FileIdentity, ImageId, ImageOwnership,
-    ResolvedArtifact,
+    DependencyResolution, ImageId, ImageOwnership, ResolvedArtifact,
 };
 
-pub use published::{
-    ImportedImageDescriptor, PublishedImageDescriptor, PublishedRegion, PublishedSymbolTable,
-};
+pub(crate) use published::{ImportedImageDescriptor, PublishedImageDescriptor, PublishedRegion};
 
-pub(crate) use lifecycle::LifecycleImage;
-pub use lifecycle::{FiniPlan, ImageFiniPlan, InitPlan, LifecycleEntry, LifecyclePlans};
-pub use metadata::ProgramHeaderRuntimeInfo;
+pub(crate) use lifecycle::{LifecycleEntry, LifecyclePlans};
 pub(crate) use metadata::{
-    ImageLifecycleMetadata, ProgramHeaderGeometry, RelocationTables, RuntimeImageMetadata,
-    RuntimeImageState,
+    ImageLifecycleMetadata, ProgramHeaderGeometry, ProgramHeaderRuntimeInfo, RelocationTables,
+    RuntimeImageMetadata, RuntimeImageState,
 };
-pub(crate) use publish::{build_manifest, LinkMapImage};
-pub use publish::{
-    CommittedImage, CommittingLinkProduct, LinkContext, LinkMapEntry, LinkProduct, LinkPublisher,
+pub(crate) use publish::{
+    CommittedImage, CommittingLinkProduct, LinkContext, LinkProduct, LinkPublisher,
     PreparedLinkManifest,
 };
-pub use scope::RelocationBinding;
-pub(crate) use scope::{ResolvedSymbol, ScopeSet, SymbolRegionKind, SymbolScope};
-pub use session::{
-    BuildingSession, DynamicLinker, LinkSession, RelocatedSession, ScopedSession, SealedSession,
-};
+pub(crate) use scope::{RelocationBinding, ResolvedSymbol, ScopeSet, SymbolRegionKind};
+pub(crate) use session::{DynamicLinker, SealedSession};
 pub(crate) use symbol::{
     symbol_count_from_hash, SymbolBinding, SymbolDefinition, SymbolEntry, SymbolTable, SymbolType,
     SymbolVisibility,

@@ -24,11 +24,10 @@ use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     dynamic_linker::{
         symbol_count_from_hash, DependencyName, ImageLifecycleMetadata, ProgramHeaderGeometry,
-        RelocationTables, RuntimeImageMetadata, SymbolTable,
+        RelocationTables, RuntimeImageMetadata, RuntimeImageState, SymbolTable,
     },
     elf::{DynamicSegmentInfo, LoadSegmentInfo},
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
-    identity::{ElfClass, ElfData, LoadPolicy, LoadRequest, SINGLE_IMAGE_LOAD_POLICY},
+    error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{
         decode::{
             DecodedImage, DynamicTags, RelocationAddend, RelocationRecord, RelocationTableKind,
@@ -38,7 +37,8 @@ use crate::{
         read_u32, read_u64,
     },
     memory::{AllocationOffset, ImageLoadTransaction, ImageMemory},
-    reader::ElfReader,
+    profile::{supports_dynamic_tag, ElfClass, ElfData, LoadRequest},
+    LoadError, LoadResult,
 };
 
 pub(crate) struct LoadedRegion {
@@ -86,55 +86,43 @@ impl LoadedRegion {
 }
 
 #[must_use = "dropping a mapped image aborts its allocation"]
-pub(crate) struct MappedImage<R: ElfReader, M: ImageMemory> {
-    reader: R,
+pub(crate) struct MappedImage<M: ImageMemory> {
     transaction: ImageLoadTransaction<M>,
     load_bias: TargetAddress,
     request: LoadRequest,
     entry_vaddr: TargetAddress,
-    canonical_entry_vaddr: TargetAddress,
     load_segments: Vec<LoadSegmentInfo>,
     regions: Vec<LoadedRegion>,
     dynamic: Option<DynamicSegmentInfo>,
     relro: Option<TargetRange>,
     stack: StackKind,
-    interpreter: Option<FileRange>,
-    tls: Option<TargetRange>,
     phdr_geometry: ProgramHeaderGeometry,
 }
 
-impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
+impl<M: ImageMemory> MappedImage<M> {
     #[inline]
     pub fn new(
-        reader: R,
         transaction: ImageLoadTransaction<M>,
         load_bias: TargetAddress,
         request: LoadRequest,
         entry_vaddr: TargetAddress,
-        canonical_entry_vaddr: TargetAddress,
         load_segments: Vec<LoadSegmentInfo>,
         regions: Vec<LoadedRegion>,
         dynamic: Option<DynamicSegmentInfo>,
         relro: Option<TargetRange>,
         stack: StackKind,
-        interpreter: Option<FileRange>,
-        tls: Option<TargetRange>,
         phdr_geometry: ProgramHeaderGeometry,
     ) -> Self {
         Self {
-            reader,
             transaction,
             load_bias,
             request,
             entry_vaddr,
-            canonical_entry_vaddr,
             load_segments,
             regions,
             dynamic,
             relro,
             stack,
-            interpreter,
-            tls,
             phdr_geometry,
         }
     }
@@ -197,7 +185,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         ))
     }
 
-    fn decode_dynamic_tags(&self, policy: LoadPolicy) -> LoadResult<DynamicTags> {
+    fn decode_dynamic_tags(&self) -> LoadResult<DynamicTags> {
         let dynamic = self.dynamic.as_ref().unwrap();
         let entry_size = dynamic_entry_size(self.request.profile().class());
 
@@ -239,7 +227,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                 terminated = true;
                 break;
             }
-            accept_dynamic_tag(&policy, &mut tags, tag, value)?;
+            accept_dynamic_tag(&mut tags, tag, value)?;
         }
         if !terminated {
             return Err(dynamic_error(DT_NULL, dynamic.file_range().len()));
@@ -251,7 +239,6 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         &self,
         tags: &RelocationTableTags,
         kind: RelocationTableKind,
-        policy: LoadPolicy,
         records: &mut Vec<RelocationRecord>,
     ) -> LoadResult<()> {
         let absent =
@@ -300,11 +287,6 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                     self.request.profile().endian(),
                     kind,
                 )?;
-                // Only the multi-image profile understands symbol-bound
-                // relocations; the relative engine must fail closed.
-                if record.symbol_index() != 0 && !policy.allows_dynamic_symbols() {
-                    return Err(unsupported_relocation(record));
-                }
                 records.push(record);
             }
         }
@@ -319,7 +301,6 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
     fn decode_plt_relocations(
         &self,
         tags: &DynamicTags,
-        policy: LoadPolicy,
         records: &mut Vec<RelocationRecord>,
     ) -> LoadResult<()> {
         let jmp_absent = tags.jmp_rel().address().is_none()
@@ -338,52 +319,31 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
         };
         let entry_size = relocation_entry_size(self.request.profile().class(), entry_kind);
         let synthesized = RelocationTableTags::with_entry_size(tags.jmp_rel(), entry_size);
-        self.decode_relocation_table(&synthesized, entry_kind, policy, records)
+        self.decode_relocation_table(&synthesized, entry_kind, records)
     }
 
-    pub fn decode(self) -> LoadResult<DecodedImage<R, M>> {
-        self.decode_inner(SINGLE_IMAGE_LOAD_POLICY)
-    }
-
-    /// Decode with an explicit policy. The public image pipeline stays fixed
-    /// to [`SINGLE_IMAGE_LOAD_POLICY`]; the crate-internal `DynamicLinker` passes
-    /// [`crate::identity::DYNAMIC_LINK_LOAD_POLICY`] here.
-    pub(crate) fn decode_with_policy(self, policy: LoadPolicy) -> LoadResult<DecodedImage<R, M>> {
-        self.decode_inner(policy)
-    }
-
-    fn decode_inner(mut self, policy: LoadPolicy) -> LoadResult<DecodedImage<R, M>> {
-        let mut metadata = RuntimeImageMetadata::empty();
+    pub(crate) fn decode(self) -> LoadResult<DecodedImage<M>> {
+        let program_headers = self
+            .phdr_geometry
+            .resolve(self.load_bias)
+            .map_err(|error| error.at_stage(LoadStage::Decode))?;
+        let mut metadata = RuntimeImageMetadata::empty(program_headers);
         if self.dynamic.is_some() {
             let tags = self
-                .decode_dynamic_tags(policy)
+                .decode_dynamic_tags()
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
             let mut records = Vec::new();
-            self.decode_relocation_table(
-                tags.rel(),
-                RelocationTableKind::Rel,
-                policy,
-                &mut records,
-            )
-            .map_err(|error| error.at_stage(LoadStage::Decode))?;
-            self.decode_relocation_table(
-                tags.rela(),
-                RelocationTableKind::Rela,
-                policy,
-                &mut records,
-            )
-            .map_err(|error| error.at_stage(LoadStage::Decode))?;
-            self.decode_plt_relocations(&tags, policy, &mut records)?;
+            self.decode_relocation_table(tags.rel(), RelocationTableKind::Rel, &mut records)
+                .map_err(|error| error.at_stage(LoadStage::Decode))?;
+            self.decode_relocation_table(tags.rela(), RelocationTableKind::Rela, &mut records)
+                .map_err(|error| error.at_stage(LoadStage::Decode))?;
+            self.decode_plt_relocations(&tags, &mut records)?;
             let relocations = RelocationTables::new(records);
             let (symbols, needed, soname) = self
-                .decode_symbols_and_dependencies(&tags, policy)
+                .decode_symbols_and_dependencies(&tags)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
             let lifecycle = self
-                .decode_lifecycle(&tags, policy)
-                .map_err(|error| error.at_stage(LoadStage::Decode))?;
-            let program_headers = self
-                .phdr_geometry
-                .resolve(self.load_bias)
+                .decode_lifecycle(&tags)
                 .map_err(|error| error.at_stage(LoadStage::Decode))?;
             metadata = RuntimeImageMetadata::new(
                 needed,
@@ -393,28 +353,24 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
                 lifecycle,
                 program_headers,
             );
-            self.request
-                .limits()
-                .check_runtime_metadata_bytes(metadata.metadata_bytes())
-                .map_err(|error| error.at_stage(LoadStage::Decode))?;
         }
+        self.request
+            .limits()
+            .check_runtime_metadata_bytes(metadata.metadata_bytes())
+            .map_err(|error| error.at_stage(LoadStage::Decode))?;
 
-        Ok(DecodedImage::new(
-            self.reader,
-            self.transaction,
-            self.load_bias,
-            self.request,
-            self.entry_vaddr,
-            self.canonical_entry_vaddr,
-            self.load_segments,
-            self.regions,
-            self.dynamic,
-            metadata,
-            self.relro,
-            self.stack,
-            self.interpreter,
-            self.tls,
-        ))
+        Ok(DecodedImage {
+            transaction: self.transaction,
+            runtime: RuntimeImageState::new(
+                self.regions,
+                self.load_segments,
+                metadata,
+                self.load_bias,
+                self.entry_vaddr,
+                self.relro,
+                self.stack,
+            ),
+        })
     }
 
     /// Decode `.dynstr`, `.dynsym`, and the hash table(s) into an
@@ -425,11 +381,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
     fn decode_symbols_and_dependencies(
         &self,
         tags: &DynamicTags,
-        policy: LoadPolicy,
     ) -> LoadResult<(SymbolTable, Vec<DependencyName>, Option<DependencyName>)> {
-        if !policy.allows_dynamic_symbols() {
-            return Ok((SymbolTable::empty(), Vec::new(), None));
-        }
         let class = self.request.profile().class();
         let endian = self.request.profile().endian();
         let thumb = self.request.profile().entry_mode().is_thumb();
@@ -580,14 +532,7 @@ impl<R: ElfReader, M: ImageMemory> MappedImage<R, M> {
     /// Save the lifecycle targets and array ranges without fixing
     /// the array contents into function addresses. The array entry
     /// words are re-read after relocation by the lifecycle plan builder.
-    fn decode_lifecycle(
-        &self,
-        tags: &DynamicTags,
-        policy: LoadPolicy,
-    ) -> LoadResult<ImageLifecycleMetadata> {
-        if !policy.allows_lifecycle() {
-            return Ok(ImageLifecycleMetadata::empty());
-        }
+    fn decode_lifecycle(&self, tags: &DynamicTags) -> LoadResult<ImageLifecycleMetadata> {
         let word_size = match self.request.profile().class() {
             ElfClass::Elf32 => 4,
             ElfClass::Elf64 => 8,
@@ -849,13 +794,8 @@ fn decode_relocation_entry(
     ))
 }
 
-fn accept_dynamic_tag(
-    policy: &LoadPolicy,
-    tags: &mut DynamicTags,
-    tag: u64,
-    value: u64,
-) -> LoadResult<()> {
-    if !policy.allows_dynamic_tag(tag, value) {
+fn accept_dynamic_tag(tags: &mut DynamicTags, tag: u64, value: u64) -> LoadResult<()> {
+    if !supports_dynamic_tag(tag, value) {
         return Err(unsupported_dynamic(tag, value));
     }
     match tag {
@@ -927,16 +867,5 @@ pub(crate) fn unsupported_dynamic(tag: u64, value: u64) -> LoadError {
     LoadError::new(
         LoadErrorKind::UnsupportedByProfile,
         ErrorContext::DynamicTag { tag, value },
-    )
-}
-
-fn unsupported_relocation(record: RelocationRecord) -> LoadError {
-    LoadError::new(
-        LoadErrorKind::UnsupportedByProfile,
-        ErrorContext::Relocation {
-            offset: record.offset(),
-            raw_type: record.raw_type(),
-            symbol_index: record.symbol_index(),
-        },
     )
 }

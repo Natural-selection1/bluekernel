@@ -14,15 +14,16 @@
 
 extern crate alloc;
 extern crate rsrt;
-use alloc::sync::Arc;
+use alloc::{rc::Rc, sync::Arc, vec::Vec};
 use blueos::{
     sync::{atomic_wait, atomic_wake},
     thread,
     time::Tick,
 };
 use blueos_loader as loader;
-use blueos_loader::{ElfReader, LoadError, LoadErrorKind, LoadResult};
+use blueos_loader::{error::LoadErrorKind, reader::ElfReader, LoadError, LoadResult};
 use core::{
+    cell::RefCell,
     ffi::c_char,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -64,15 +65,15 @@ mod loader_test_config {
         result
     }
 
-    const fn parse_permissions(value: &str) -> loader::MemoryPermissions {
+    const fn parse_permissions(value: &str) -> loader::memory::MemoryPermissions {
         let bytes = value.as_bytes();
         let mut index = 0;
-        let mut permissions = loader::MemoryPermissions::NONE;
+        let mut permissions = loader::memory::MemoryPermissions::NONE;
         while index < bytes.len() {
             let permission = match bytes[index] {
-                b'r' => loader::MemoryPermissions::READ,
-                b'w' => loader::MemoryPermissions::WRITE,
-                b'x' => loader::MemoryPermissions::EXECUTE,
+                b'r' => loader::memory::MemoryPermissions::READ,
+                b'w' => loader::memory::MemoryPermissions::WRITE,
+                b'x' => loader::memory::MemoryPermissions::EXECUTE,
                 _ => panic!("invalid loader test relocation permission"),
             };
             permissions = permissions.bitor(permission);
@@ -84,11 +85,15 @@ mod loader_test_config {
     pub const TEST_REGION_START: usize = parse_hex(env!("LOADER_TEST_RELOCATION_ORIGIN"));
     pub const TEST_REGION_END: usize =
         TEST_REGION_START + parse_hex(env!("LOADER_TEST_RELOCATION_LENGTH"));
-    pub const TEST_REGION_PERMISSIONS: loader::MemoryPermissions =
+    pub const TEST_REGION_PERMISSIONS: loader::memory::MemoryPermissions =
         parse_permissions(env!("LOADER_TEST_RELOCATION_PERMISSIONS"));
 
-    pub static TEST_REGIONS: [loader::MemoryRegion; 1] = [unsafe {
-        loader::MemoryRegion::new(TEST_REGION_START, TEST_REGION_END, TEST_REGION_PERMISSIONS)
+    pub static TEST_REGIONS: [loader::memory::MemoryRegion; 1] = [unsafe {
+        loader::memory::MemoryRegion::new(
+            TEST_REGION_START,
+            TEST_REGION_END,
+            TEST_REGION_PERMISSIONS,
+        )
     }];
 }
 
@@ -100,6 +105,7 @@ fn open_test_elf(ptr: *const core::ffi::c_char) -> semihosting::fs::File {
 /// A seek-based `ElfReader` over a semihosting file: the image is never
 /// buffered as a whole, so debug ELFs (with full debug info) load without
 /// inflating the kernel heap.
+#[derive(Clone, Copy)]
 struct SemihostingElfReader<'a> {
     file: &'a semihosting::fs::File,
     len: u64,
@@ -115,7 +121,7 @@ impl<'a> SemihostingElfReader<'a> {
 }
 
 fn io_error() -> LoadError {
-    LoadError::new(LoadErrorKind::Io, loader::ErrorContext::None)
+    LoadError::new(LoadErrorKind::Io, loader::error::ErrorContext::None)
 }
 
 impl ElfReader for SemihostingElfReader<'_> {
@@ -134,7 +140,7 @@ impl ElfReader for SemihostingElfReader<'_> {
             if n == 0 {
                 return Err(LoadError::new(
                     LoadErrorKind::OutOfBounds,
-                    loader::ErrorContext::FileRange {
+                    loader::error::ErrorContext::FileRange {
                         offset,
                         len: dst.len() as u64,
                         file_len: self.len,
@@ -203,14 +209,196 @@ mod test_elf_loader {
     };
     use super::*;
     use blueos_test_macro::test;
+    use loader::{
+        memory::{
+            AllocationLease, AllocationOffset, AllocationRequest, ImageAllocation, ImageMemory,
+            ImageProtectionMemory, MemoryMapper, MemoryPermissions, MutationProgress,
+            PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel,
+        },
+        profile::{LoadProfile, SessionLimits},
+        CommittedAllocations, ImageHandle, LoadRequest, LoadedImage, LoaderBackend, Publication,
+    };
+
+    #[derive(Clone)]
+    struct Memory(Rc<RefCell<MemoryMapper>>);
+
+    impl ImageMemory for Memory {
+        fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
+            self.0.borrow_mut().allocate_image(request)
+        }
+        fn abort_image(&mut self, lease: AllocationLease, progress: MutationProgress) {
+            self.0.borrow_mut().abort_image(lease, progress);
+        }
+        fn release_committed(&mut self, lease: AllocationLease) {
+            self.0.borrow_mut().release_committed(lease);
+        }
+        fn image_span(
+            &self,
+            allocation: &ImageAllocation,
+            offset: AllocationOffset,
+            len: u64,
+        ) -> LoadResult<*mut u8> {
+            self.0.borrow().image_span(allocation, offset, len)
+        }
+        fn read(
+            &self,
+            allocation: &ImageAllocation,
+            offset: AllocationOffset,
+            dst: &mut [u8],
+        ) -> LoadResult<()> {
+            self.0.borrow().read(allocation, offset, dst)
+        }
+        fn write(
+            &mut self,
+            allocation: &ImageAllocation,
+            offset: AllocationOffset,
+            bytes: &[u8],
+        ) -> LoadResult<()> {
+            self.0.borrow_mut().write(allocation, offset, bytes)
+        }
+        fn zero(
+            &mut self,
+            allocation: &ImageAllocation,
+            offset: AllocationOffset,
+            len: u64,
+        ) -> LoadResult<()> {
+            self.0.borrow_mut().zero(allocation, offset, len)
+        }
+    }
+    impl ImageProtectionMemory for Memory {
+        fn protect(
+            &mut self,
+            allocation: &ImageAllocation,
+            offset: AllocationOffset,
+            len: u64,
+            permissions: MemoryPermissions,
+        ) -> LoadResult<ProtectionLevel> {
+            self.0
+                .borrow_mut()
+                .protect(allocation, offset, len, permissions)
+        }
+        fn protection_capabilities(&self) -> ProtectionCapabilities {
+            self.0.borrow().protection_capabilities()
+        }
+        fn validate_protection_aliases(
+            &self,
+            allocation: &ImageAllocation,
+            plan: &PreparedProtectionPlan,
+        ) -> LoadResult<()> {
+            self.0
+                .borrow()
+                .validate_protection_aliases(allocation, plan)
+        }
+    }
+    struct Receipt {
+        memory: Memory,
+        leases: Vec<AllocationLease>,
+    }
+    impl Drop for Receipt {
+        fn drop(&mut self) {
+            for lease in self.leases.drain(..) {
+                self.memory.release_committed(lease);
+            }
+        }
+    }
+    struct Backend<'a> {
+        reader: SemihostingElfReader<'a>,
+        memory: Memory,
+    }
+    impl<'a> LoaderBackend for Backend<'a> {
+        type Source = ();
+        type Reader = SemihostingElfReader<'a>;
+        type Memory = Memory;
+        type PreparedPublication = Vec<AllocationLease>;
+        type Receipt = Receipt;
+        fn identity<'b>(&self, _: &'b ()) -> &'b [u8] {
+            b"test-elf"
+        }
+        fn is_shared(&self, _: &()) -> bool {
+            false
+        }
+        fn open(&mut self, _: &()) -> LoadResult<Self::Reader> {
+            Ok(self.reader)
+        }
+        fn resolve(&mut self, _: &(), _: &[u8]) -> LoadResult<()> {
+            Err(io_error())
+        }
+        fn acquire(&mut self, _: &[()], _: &[ImageHandle]) -> LoadResult<Vec<ImageHandle>> {
+            Ok(Vec::new())
+        }
+        fn memory(&mut self) -> Memory {
+            self.memory.clone()
+        }
+        fn prepare_publication(
+            &mut self,
+            publication: &Publication,
+        ) -> LoadResult<Vec<AllocationLease>> {
+            let mut leases = Vec::new();
+            leases
+                .try_reserve_exact(publication.private_images())
+                .map_err(|_| io_error())?;
+            Ok(leases)
+        }
+        unsafe fn commit_publication(
+            &mut self,
+            mut leases: Vec<AllocationLease>,
+            allocations: CommittedAllocations,
+        ) -> Receipt {
+            for (_, lease) in allocations.into_images() {
+                leases.push(lease);
+            }
+            Receipt {
+                memory: self.memory.clone(),
+                leases,
+            }
+        }
+        fn abort_publication(&mut self, receipt: Receipt) {
+            drop(receipt);
+        }
+    }
+    fn profile() -> LoadProfile {
+        #[cfg(all(target_arch = "arm", target_abi = "eabihf"))]
+        {
+            LoadProfile::arm_thumb_hard_float()
+        }
+        #[cfg(all(target_arch = "arm", not(target_abi = "eabihf")))]
+        {
+            LoadProfile::arm_thumb_soft_float()
+        }
+        #[cfg(target_arch = "riscv32")]
+        {
+            LoadProfile::riscv32()
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            LoadProfile::riscv64()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            LoadProfile::aarch64()
+        }
+    }
+    fn load(
+        reader: SemihostingElfReader<'_>,
+        mapper: MemoryMapper,
+    ) -> LoadResult<LoadedImage<Receipt>> {
+        let mut backend = Backend {
+            reader,
+            memory: Memory(Rc::new(RefCell::new(mapper))),
+        };
+        loader::load(
+            LoadRequest::new((), profile(), SessionLimits::DEFAULT),
+            &mut backend,
+        )
+    }
 
     #[cfg(loader_test_exec)]
     const EXPECTED_RESULT: u32 = 0x9afc_e987;
 
     #[cfg(loader_test_exec)]
-    static SHORT_REGIONS: [loader::MemoryRegion; 1] = [unsafe {
+    static SHORT_REGIONS: [loader::memory::MemoryRegion; 1] = [unsafe {
         // SAFETY: This is a valid subset of the configured loader test range.
-        loader::MemoryRegion::new(
+        loader::memory::MemoryRegion::new(
             TEST_REGION_START,
             TEST_REGION_START + 16,
             TEST_REGION_PERMISSIONS,
@@ -218,41 +406,38 @@ mod test_elf_loader {
     }];
 
     #[cfg(loader_test_exec)]
-    static NON_EXEC_REGIONS: [loader::MemoryRegion; 1] = [unsafe {
+    static NON_EXEC_REGIONS: [loader::memory::MemoryRegion; 1] = [unsafe {
         // SAFETY: The configured region supports read and write accesses.
-        loader::MemoryRegion::new(
+        loader::memory::MemoryRegion::new(
             TEST_REGION_START,
             TEST_REGION_END,
-            loader::MemoryPermissions::READ.bitor(loader::MemoryPermissions::WRITE),
+            loader::memory::MemoryPermissions::READ.bitor(loader::memory::MemoryPermissions::WRITE),
         )
     }];
 
-    fn new_mapper() -> loader::MemoryMapper {
+    fn new_mapper() -> loader::memory::MemoryMapper {
         #[cfg(loader_test_exec)]
         {
-            loader::MemoryMapper::new(Some(&TEST_REGIONS))
+            loader::memory::MemoryMapper::new(Some(&TEST_REGIONS))
         }
         #[cfg(not(loader_test_exec))]
         {
-            loader::MemoryMapper::new(None)
+            loader::memory::MemoryMapper::new(None)
         }
     }
 
     fn assert_rejected_elf(path: *const c_char) {
         let file = open_test_elf(path);
         let reader = SemihostingElfReader::new(&file).unwrap();
-        let mut mapper = new_mapper();
-        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_err());
+        assert!(load(reader, new_mapper()).is_err());
     }
 
     #[test]
-    fn test_load_elf_and_run() {
+    fn test_load_and_run() {
         let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
         let reader = SemihostingElfReader::new(&file).unwrap();
-        let mut mapper = new_mapper();
-        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_ok());
-
-        let entry = mapper.real_entry().unwrap();
+        let image = load(reader, new_mapper()).expect("load ELF through the public entry");
+        let entry = image.entry().unwrap().get() as usize;
 
         #[cfg(all(loader_test_exec))]
         {
@@ -286,8 +471,7 @@ mod test_elf_loader {
     fn test_exec_rejects_allocated_mapper() {
         let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
         let reader = SemihostingElfReader::new(&file).unwrap();
-        let mut mapper = loader::MemoryMapper::new(None);
-        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_err());
+        assert!(load(reader, loader::memory::MemoryMapper::new(None)).is_err());
     }
 
     #[cfg(loader_test_exec)]
@@ -296,8 +480,11 @@ mod test_elf_loader {
         let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
         let reader = SemihostingElfReader::new(&file).unwrap();
         let before = unsafe { (TEST_REGION_START as *const u32).read_volatile() };
-        let mut mapper = loader::MemoryMapper::new(Some(&SHORT_REGIONS));
-        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_err());
+        assert!(load(
+            reader,
+            loader::memory::MemoryMapper::new(Some(&SHORT_REGIONS))
+        )
+        .is_err());
         let after = unsafe { (TEST_REGION_START as *const u32).read_volatile() };
         assert_eq!(after, before);
     }
@@ -307,8 +494,11 @@ mod test_elf_loader {
     fn test_exec_rejects_non_executable_region() {
         let file = open_test_elf(unsafe { LOADER_TEST_ELF_PATH });
         let reader = SemihostingElfReader::new(&file).unwrap();
-        let mut mapper = loader::MemoryMapper::new(Some(&NON_EXEC_REGIONS));
-        assert!(loader::load_elf_from_reader(reader, &mut mapper).is_err());
+        assert!(load(
+            reader,
+            loader::memory::MemoryMapper::new(Some(&NON_EXEC_REGIONS))
+        )
+        .is_err());
     }
 }
 

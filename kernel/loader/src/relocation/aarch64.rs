@@ -17,12 +17,12 @@ use goblin::elf::reloc::{
 };
 
 use crate::{
-    identity::{ElfClass, ElfMachine},
+    profile::{ElfClass, ElfMachine},
     relocation::{AddendEncoding, ArchRelocator, RelocationKind},
 };
 
 #[derive(Clone, Copy)]
-pub struct AArch64Relocator;
+pub(crate) struct AArch64Relocator;
 
 impl ArchRelocator for AArch64Relocator {
     fn machine(&self) -> ElfMachine {
@@ -31,10 +31,6 @@ impl ArchRelocator for AArch64Relocator {
 
     fn class(&self) -> ElfClass {
         ElfClass::Elf64
-    }
-
-    fn relative_type(&self) -> u32 {
-        R_AARCH64_RELATIVE
     }
 
     fn addend_encoding(&self) -> AddendEncoding {

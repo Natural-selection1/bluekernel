@@ -27,16 +27,12 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use blueos_header::dlfcn::{BlueOsDlPlan, RTLD_GLOBAL, RTLD_LAZY, RTLD_NOW};
-use blueos_loader::{
-    ArtifactIdentity, ImageOwnership, LinkContext, LinkProduct, PublishedImageDescriptor,
-};
+use blueos_loader::{ImageHandle, LoadedImage};
 
 use crate::{
     application::{
-        adapters::resolver::identity_from_path,
         group::{GroupState, ThreadGroup},
         namespace::{resolve_dependency_paths, ApplicationNamespace, DependencyKind, ResolveBase},
-        planner::{NamespaceLoadPlan, NamespaceLoadPlanner},
         publication::KernelLinkReceipt,
         registry::SystemInitBatch,
         service::ApplicationService,
@@ -58,17 +54,15 @@ fn token() -> Result<usize> {
 
 struct Object {
     handle: usize,
-    descriptor: Arc<PublishedImageDescriptor>,
-    system: bool,
+    descriptor: ImageHandle,
     global: bool,
     opens: usize,
     // Root-first BFS closure for dlsym(handle), independent of global scope.
-    lookup: Vec<Arc<PublishedImageDescriptor>>,
+    lookup: Vec<ImageHandle>,
 }
 
 pub(crate) struct ExistingImage {
-    descriptor: Arc<PublishedImageDescriptor>,
-    system: bool,
+    descriptor: ImageHandle,
     global: bool,
     batch: usize,
 }
@@ -169,18 +163,16 @@ pub(crate) struct PreparedLoad {
 impl RuntimeNamespace {
     pub(crate) fn new(
         namespace: ApplicationNamespace,
-        product: &LinkProduct<KernelLinkReceipt>,
+        product: &LoadedImage<KernelLinkReceipt>,
     ) -> Result<Arc<Self>> {
-        let context = product.context();
         let mut base = Vec::new();
-        for image in context.images() {
+        for image in product.images() {
             base.push(Object {
                 handle: token()?,
-                descriptor: image.descriptor_handle(),
-                system: image.ownership() != ImageOwnership::SessionPrivate,
+                descriptor: image.clone(),
                 global: true,
                 opens: 0,
-                lookup: context_closure(context, image.owner().get() as usize),
+                lookup: product.lookup_scope(image).to_vec(),
             });
         }
         Ok(Arc::new(Self {
@@ -257,12 +249,12 @@ impl RuntimeNamespace {
             Some(path) => Some(self.resolve(path, cwd)?),
             None => None,
         };
-        let identity = path.as_ref().map(|path| identity_from_path(path));
+        let identity = path.as_ref().map(|path| path.as_bytes().to_vec());
         let mut state = self.state.irqsave_lock();
         let existing_handle = if let Some(identity) = &identity {
             state
                 .objects()
-                .find(|object| object.descriptor.identity() == identity)
+                .find(|object| object.descriptor.identity() == identity.as_slice())
                 .map(|object| object.handle)
         } else {
             state.base.first().map(|object| object.handle)
@@ -274,13 +266,16 @@ impl RuntimeNamespace {
                 object
                     .lookup
                     .iter()
-                    .map(|image| image.identity().clone())
+                    .map(|image| image.identity().to_vec())
                     .collect()
             } else {
                 Vec::new()
             };
             for object in state.objects_mut() {
-                if promote.contains(object.descriptor.identity()) {
+                if promote
+                    .iter()
+                    .any(|identity| identity.as_slice() == object.descriptor.identity())
+                {
                     object.global = true;
                 }
             }
@@ -297,7 +292,7 @@ impl RuntimeNamespace {
                 batch
                     .objects
                     .iter()
-                    .any(|object| Some(object.descriptor.identity()) == identity.as_ref())
+                    .any(|object| Some(object.descriptor.identity()) == identity.as_deref())
             }),
             _ => false,
         }) {
@@ -319,7 +314,7 @@ impl RuntimeNamespace {
             batch.objects[0]
                 .lookup
                 .iter()
-                .map(|image| image.identity().clone())
+                .map(|image| image.identity().to_vec())
                 .collect()
         } else {
             Vec::new()
@@ -336,7 +331,10 @@ impl RuntimeNamespace {
         let mut state = self.state.irqsave_lock();
         state.batches.push(batch);
         for object in state.objects_mut() {
-            if promote.contains(object.descriptor.identity()) {
+            if promote
+                .iter()
+                .any(|identity| identity.as_slice() == object.descriptor.identity())
+            {
                 object.global = true;
             }
         }
@@ -363,7 +361,7 @@ impl RuntimeNamespace {
                 .state
                 .irqsave_lock()
                 .objects()
-                .any(|object| object.descriptor.identity() == &identity_from_path(&candidate))
+                .any(|object| object.descriptor.identity() == candidate.as_bytes())
             {
                 return Ok(candidate);
             }
@@ -565,7 +563,6 @@ impl State {
             )
             .map(|(object, batch)| ExistingImage {
                 descriptor: object.descriptor.clone(),
-                system: object.system,
                 global: object.global,
                 batch,
             })
@@ -646,29 +643,6 @@ impl State {
     }
 }
 
-fn context_closure(context: &LinkContext, root: usize) -> Vec<Arc<PublishedImageDescriptor>> {
-    let mut queue = alloc::vec![root];
-    let mut cursor = 0;
-    while cursor < queue.len() {
-        let requester = queue[cursor];
-        for edge in context
-            .graph_edges()
-            .iter()
-            .filter(|edge| edge.requester().get() as usize == requester)
-        {
-            let id = edge.provider().get() as usize;
-            if !queue.contains(&id) {
-                queue.push(id);
-            }
-        }
-        cursor += 1;
-    }
-    queue
-        .into_iter()
-        .map(|id| context.images()[id].descriptor_handle())
-        .collect()
-}
-
 /// Runs entirely on the service's link stack. Preparing descriptors, pinned
 /// plans and dependency retention must finish before the caller installs it.
 pub(crate) fn prepare_load(
@@ -678,159 +652,59 @@ pub(crate) fn prepare_load(
     path: &str,
     existing: Vec<ExistingImage>,
 ) -> Result<PreparedLoad> {
-    let plan = NamespaceLoadPlanner::new(
-        namespace,
-        service.runtime_catalog(),
-        blueos_loader::SessionLimits::DEFAULT,
-    )
-    .plan_shared(path)
-    .map_err(load_errno)?;
-    let identities: Vec<_> = plan
-        .images()
-        .iter()
-        .map(|image| image.identity().clone())
-        .collect();
-    let edges: Vec<_> = plan
-        .edges()
-        .iter()
-        .map(|edge| (edge.requester(), edge.provider()))
-        .collect();
     let globals = existing
         .iter()
         .filter(|image| image.global)
-        .map(|image| {
-            if image.system {
-                blueos_loader::ImportedImageDescriptor::new(image.descriptor.clone())
-            } else {
-                blueos_loader::ImportedImageDescriptor::namespace(image.descriptor.clone())
-            }
-        })
+        .map(|image| image.descriptor.clone())
         .collect();
     let imports = existing
         .iter()
-        .map(|image| (image.descriptor.clone(), image.system))
+        .map(|image| image.descriptor.clone())
         .collect();
     let (product, system) = service
         .runtime_loader()
-        .link_shared(plan, namespace.profile(), group, imports, globals)
+        .link_shared(namespace, path, group, imports, globals)
         .map_err(load_errno)?;
     let mut dependencies = Vec::new();
     for image in &existing {
         if image.batch != 0
-            && (identities.contains(image.descriptor.identity())
-                || product.relocation_bindings().iter().any(|binding| {
-                    binding.provider().is_some_and(|owner| {
-                        product.context().images()[owner.get() as usize]
-                            .descriptor()
-                            .identity()
-                            == image.descriptor.identity()
-                    })
-                }))
+            && product
+                .retained_images()
+                .iter()
+                .any(|provider| provider.identity() == image.descriptor.identity())
             && !dependencies.contains(&image.batch)
         {
             dependencies.push(image.batch);
         }
     }
-    let init = product
-        .lifecycle_plans()
-        .startup()
-        .iter()
-        .map(|entry| entry.function().get() as usize)
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    let fini: Box<[usize]> = product
-        .lifecycle_plans()
-        .group_fini()
-        .iter()
-        .map(|entry| entry.function().get() as usize)
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    let rollback_fini = fini
-        .iter()
-        .copied()
-        .chain(
-            product
-                .lifecycle_plans()
-                .system_fini()
-                .iter()
-                .flat_map(|image| {
-                    image
-                        .plan()
-                        .iter()
-                        .map(|entry| entry.function().get() as usize)
-                }),
-        )
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    let descriptors: Vec<_> = product
-        .context()
-        .images()
-        .iter()
-        .map(|image| (image.descriptor_handle(), image.ownership()))
-        .collect();
-    let receipt = product.into_publication();
-    let mut batch = Batch {
-        id: 0,
-        objects: Vec::new(),
-        dependencies,
-        fini,
-        rollback_fini,
-        receipt: Some(receipt),
-        initializing: true,
-    };
-    batch.id = token()?;
-    // Plan order keeps the runtime root first even though global providers were
-    // inserted before its dependencies in the link session.
-    for (index, identity) in identities.iter().enumerate() {
+    let init = product.startup().to_vec().into_boxed_slice();
+    let fini = product.fini().to_vec().into_boxed_slice();
+    let rollback_fini = product.rollback_fini().to_vec().into_boxed_slice();
+    let mut objects = Vec::new();
+    for image in product.images() {
         if existing
             .iter()
-            .any(|image| image.descriptor.identity() == identity)
+            .any(|existing| existing.descriptor.identity() == image.identity())
         {
             continue;
         }
-        let (descriptor, ownership) = descriptors
-            .iter()
-            .find(|(image, _)| image.identity() == identity)
-            .ok_or(libc::ENOEXEC)?;
-        let mut queue = alloc::vec![index];
-        let mut cursor = 0;
-        while cursor < queue.len() {
-            let current = queue[cursor];
-            for (_, provider) in edges.iter().filter(|(requester, _)| *requester == current) {
-                if !queue.contains(provider) {
-                    queue.push(*provider);
-                }
-            }
-            cursor += 1;
-        }
-        let lookup = queue
-            .into_iter()
-            .map(|id| {
-                descriptors
-                    .iter()
-                    .find(|(image, _)| image.identity() == &identities[id])
-                    .map(|(image, _)| image.clone())
-                    .or_else(|| {
-                        existing
-                            .iter()
-                            .find(|image| image.descriptor.identity() == &identities[id])
-                            .map(|image| image.descriptor.clone())
-                    })
-                    .ok_or(libc::ENOEXEC)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        batch.objects.push(Object {
+        objects.push(Object {
             handle: token()?,
-            descriptor: descriptor.clone(),
-            system: matches!(
-                ownership,
-                ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady
-            ),
+            descriptor: image.clone(),
             global: false,
             opens: 0,
-            lookup,
+            lookup: product.lookup_scope(image).to_vec(),
         });
     }
+    let batch = Batch {
+        id: token()?,
+        objects,
+        dependencies,
+        fini,
+        rollback_fini,
+        receipt: Some(product.into_receipt()),
+        initializing: true,
+    };
     Ok(PreparedLoad {
         batch,
         init,
@@ -840,7 +714,10 @@ pub(crate) fn prepare_load(
 
 fn load_errno(error: blueos_loader::LoadError) -> i32 {
     log::error!("runtime link failed: {:?}", error);
-    if matches!(error.kind(), blueos_loader::LoadErrorKind::OutOfMemory) {
+    if matches!(
+        error.kind(),
+        blueos_loader::error::LoadErrorKind::OutOfMemory
+    ) {
         libc::ENOMEM
     } else {
         libc::ENOEXEC

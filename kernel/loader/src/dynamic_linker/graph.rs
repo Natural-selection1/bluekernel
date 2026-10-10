@@ -17,17 +17,18 @@
 //!
 //! The graph records *structure* only: which artifact depends on which. It
 //! never resolves names, reads ELF bytes, or owns an allocation. The discovery
-//! driver (the session in ) feeds it resolved `ArtifactIdentity`/`SONAME`
+//! driver (the link session) feeds it resolved `ArtifactIdentity`/`SONAME`
 //! facts; this module enforces identity de-duplication and the quotas
-//! of , and derives the dependency-first order required by lifecycle
+//! of `SessionLimits`, and derives the dependency-first order required by lifecycle
 //! planning.
 
 use alloc::vec::Vec;
 
 use crate::{
     dynamic_linker::{ArtifactIdentity, DependencyName, ImageId, ImageOwnership},
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
-    identity::SessionLimits,
+    error::{ErrorContext, LoadErrorKind},
+    profile::SessionLimits,
+    LoadError, LoadResult,
 };
 
 /// One artifact admitted into the link session.
@@ -36,7 +37,6 @@ pub(crate) struct DependencyNode {
     artifact: ArtifactIdentity,
     soname: Option<DependencyName>,
     ownership: ImageOwnership,
-    discovery_index: u32,
     depth: u16,
 }
 
@@ -59,11 +59,6 @@ impl DependencyNode {
     #[inline]
     pub(crate) const fn ownership(&self) -> ImageOwnership {
         self.ownership
-    }
-
-    #[inline]
-    pub(crate) const fn discovery_index(&self) -> u32 {
-        self.discovery_index
     }
 
     #[inline]
@@ -276,7 +271,6 @@ impl DependencyGraph {
             artifact,
             soname,
             ownership,
-            discovery_index: id.get(),
             depth,
         });
         Ok(())
@@ -439,7 +433,7 @@ fn image_groups_with_capacities(counts: &[usize]) -> LoadResult<Vec<Vec<ImageId>
 /// FIFO of pending dependency resolutions, bounded by the session edge budget.
 ///
 /// The discovery driver pushes one item per `DT_NEEDED` in encounter order and
-/// pops in the same order, giving the stable BFS of .
+/// pops in the same order, giving the stable BFS of the dependency closure.
 pub(crate) struct DiscoveryQueue {
     pending: alloc::collections::VecDeque<DiscoveryItem>,
     limits: SessionLimits,

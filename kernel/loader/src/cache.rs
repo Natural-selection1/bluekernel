@@ -16,11 +16,12 @@ use alloc::vec::Vec;
 
 use crate::{
     address::{TargetAddress, TargetRange},
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
+    error::{ErrorContext, LoadErrorKind},
+    LoadError, LoadResult,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExecutionScope {
+pub(crate) enum ExecutionScope {
     CurrentExecutionContext,
     AllExecutionContexts,
 }
@@ -32,7 +33,7 @@ impl ExecutionScope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CacheMaintenance {
+pub(crate) enum CacheMaintenance {
     CoherentInstructionCache,
     InstructionFence,
     BarrierOnly,
@@ -40,34 +41,15 @@ pub enum CacheMaintenance {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CacheRequirements {
+pub(crate) struct CacheRequirements {
     scope: ExecutionScope,
-    maintenance: Option<CacheMaintenance>,
 }
 
 impl CacheRequirements {
     pub const CURRENT_EXECUTION_CONTEXT: Self = Self::new(ExecutionScope::CurrentExecutionContext);
 
     pub const fn new(scope: ExecutionScope) -> Self {
-        Self {
-            scope,
-            maintenance: None,
-        }
-    }
-
-    pub const fn exact(scope: ExecutionScope, maintenance: CacheMaintenance) -> Self {
-        Self {
-            scope,
-            maintenance: Some(maintenance),
-        }
-    }
-
-    pub const fn scope(self) -> ExecutionScope {
-        self.scope
-    }
-
-    pub const fn maintenance(self) -> Option<CacheMaintenance> {
-        self.maintenance
+        Self { scope }
     }
 
     pub fn validate_prepared(
@@ -78,11 +60,7 @@ impl CacheRequirements {
         if prepared.executable_ranges() != executable_ranges {
             return Err(cache_contract_error(executable_ranges));
         }
-        let scope_valid = prepared.scope().covers(self.scope);
-        let maintenance_valid = self
-            .maintenance
-            .is_none_or(|required| prepared.maintenance() == required);
-        if scope_valid && maintenance_valid {
+        if prepared.scope().covers(self.scope) {
             Ok(())
         } else {
             Err(cache_capability_error())
@@ -91,7 +69,7 @@ impl CacheRequirements {
 }
 
 #[derive(Debug)]
-pub struct PreparedCacheSync {
+pub(crate) struct PreparedCacheSync {
     executable_ranges: Vec<TargetRange>,
     scope: ExecutionScope,
     maintenance: CacheMaintenance,
@@ -140,25 +118,13 @@ impl PreparedCacheSync {
 }
 
 #[derive(Clone, Debug)]
-pub struct CacheSyncOutcome {
+pub(crate) struct CacheSyncOutcome {
     executable_ranges: Vec<TargetRange>,
     scope: ExecutionScope,
     maintenance: CacheMaintenance,
 }
 
 impl CacheSyncOutcome {
-    pub(crate) const fn from_synchronized_ranges(
-        executable_ranges: Vec<TargetRange>,
-        scope: ExecutionScope,
-        maintenance: CacheMaintenance,
-    ) -> Self {
-        Self {
-            executable_ranges,
-            scope,
-            maintenance,
-        }
-    }
-
     pub fn executable_ranges(&self) -> &[TargetRange] {
         &self.executable_ranges
     }
@@ -188,7 +154,7 @@ impl CacheSyncOutcome {
     }
 }
 
-pub trait CodeCache {
+pub(crate) trait CodeCache {
     fn requirements(&self) -> CacheRequirements;
 
     fn prepare(&self, executable_ranges: &[TargetRange]) -> LoadResult<PreparedCacheSync>;
@@ -210,7 +176,7 @@ impl<C: CodeCache + ?Sized> CodeCache for &mut C {
     }
 }
 
-pub struct ArchitectureCodeCache {
+pub(crate) struct ArchitectureCodeCache {
     requirements: CacheRequirements,
 }
 

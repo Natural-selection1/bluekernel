@@ -16,16 +16,16 @@ mod aarch64;
 mod arm;
 mod riscv;
 
-pub use aarch64::AArch64Relocator;
-pub use arm::ArmRelocator;
-pub use riscv::{Riscv32Relocator, Riscv64Relocator};
+pub(crate) use aarch64::AArch64Relocator;
+pub(crate) use arm::ArmRelocator;
+pub(crate) use riscv::{Riscv32Relocator, Riscv64Relocator};
 
 use crate::{
     address::TargetAddress,
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
-    identity::{ElfClass, ElfData, ElfMachine},
-    image::RelocationRecord,
-    memory::{AllocationOffset, ImageAllocation, ImageLoadTransaction, ImageMemory},
+    error::{ErrorContext, LoadErrorKind},
+    memory::{AllocationOffset, ImageAllocation, ImageMemory},
+    profile::{ElfClass, ElfData, ElfMachine},
+    LoadError, LoadResult,
 };
 
 #[derive(Clone, Copy)]
@@ -61,7 +61,7 @@ impl WordWidth {
 }
 
 #[derive(Clone, Copy)]
-pub enum AddendEncoding {
+pub(crate) enum AddendEncoding {
     Implicit,
     Explicit,
 }
@@ -71,7 +71,7 @@ pub enum AddendEncoding {
 /// Each arch relocator maps its raw relocation type to one of these; anything
 /// unmapped is fail-closed by the session preflight.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RelocationKind {
+pub(crate) enum RelocationKind {
     /// `B + A`: the load-bias plus addend, `symbol_index == 0`.
     Relative,
     /// `S + A`: a resolved symbol value plus addend (data reference).
@@ -159,71 +159,12 @@ impl TargetWord {
         }
         Ok((bytes, len))
     }
-
-    /// Read through an active image transaction: the transaction supplies
-    /// both the memory backend and the owner-bound allocation descriptor.
-    pub fn read_via<M: ImageMemory>(
-        self,
-        transaction: &ImageLoadTransaction<M>,
-        offset: AllocationOffset,
-    ) -> LoadResult<u64> {
-        let mut bytes = [0; 8];
-        let len = self.width.bytes() as usize;
-        transaction.read(offset, &mut bytes[..len])?;
-        Ok(self.decode(bytes))
-    }
-
-    /// Write through an active image transaction, marking bytes-modified
-    /// before the backend call so a partial write is rolled back correctly.
-    pub fn write_via<M: ImageMemory>(
-        self,
-        transaction: &mut ImageLoadTransaction<M>,
-        offset: AllocationOffset,
-        value: u64,
-    ) -> LoadResult<()> {
-        let (bytes, len) = self.encode(offset, value)?;
-        transaction.write(offset, &bytes[..len])
-    }
 }
 
-pub(crate) struct RelocationOperation {
-    offset: AllocationOffset,
-    value: u64,
-    record: RelocationRecord,
-}
-
-impl RelocationOperation {
-    #[inline]
-    pub const fn new(offset: AllocationOffset, value: u64, record: RelocationRecord) -> Self {
-        Self {
-            offset,
-            value,
-            record,
-        }
-    }
-
-    #[inline]
-    pub const fn offset(&self) -> AllocationOffset {
-        self.offset
-    }
-
-    #[inline]
-    pub const fn value(&self) -> u64 {
-        self.value
-    }
-
-    #[inline]
-    pub const fn record(&self) -> RelocationRecord {
-        self.record
-    }
-}
-
-pub trait ArchRelocator {
+pub(crate) trait ArchRelocator {
     fn machine(&self) -> ElfMachine;
 
     fn class(&self) -> ElfClass;
-
-    fn relative_type(&self) -> u32;
 
     fn addend_encoding(&self) -> AddendEncoding;
 
@@ -243,10 +184,6 @@ impl<A: ArchRelocator + ?Sized> ArchRelocator for &A {
 
     fn class(&self) -> ElfClass {
         (**self).class()
-    }
-
-    fn relative_type(&self) -> u32 {
-        (**self).relative_type()
     }
 
     fn addend_encoding(&self) -> AddendEncoding {

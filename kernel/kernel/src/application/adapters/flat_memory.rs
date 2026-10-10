@@ -28,10 +28,13 @@ use core::alloc::Layout;
 
 use blueos_infra::storage::Storage;
 use blueos_loader::{
-    AllocationId, AllocationLease, AllocationOffset, AllocationOwnership, AllocationRequest,
-    ErrorContext, ImageAllocation, ImageMemory, ImageProtectionMemory, LoadError, LoadErrorKind,
-    LoadResult, MemoryPermissions, MutationProgress, Placement, PreparedProtectionPlan,
-    ProtectionCapabilities, ProtectionLevel, TargetAddress,
+    error::{ErrorContext, LoadErrorKind},
+    memory::{
+        AllocationId, AllocationLease, AllocationOffset, AllocationOwnership, AllocationRequest,
+        ImageAllocation, ImageMemory, ImageProtectionMemory, MemoryPermissions, MutationProgress,
+        Placement, PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel, TargetAddress,
+    },
+    LoadError, LoadResult,
 };
 use spin::Mutex;
 

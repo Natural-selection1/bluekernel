@@ -33,8 +33,9 @@ use crate::{
         scope::RelocationBinding,
         DependencyName, ImageId, ImageOwnership, LifecyclePlans, PublishedImageDescriptor,
     },
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
+    error::{ErrorContext, LoadErrorKind, LoadStage},
     memory::AllocationLease,
+    LoadError, LoadResult,
 };
 
 /// One entry of the published link map, in stable image-id order.
@@ -50,7 +51,6 @@ pub struct LinkMapEntry {
 }
 
 impl LinkMapEntry {
-    #[inline]
     #[inline]
     pub const fn owner(&self) -> ImageId {
         self.owner
@@ -86,12 +86,6 @@ pub struct PreparedLinkManifest {
 }
 
 impl PreparedLinkManifest {
-    /// The root's mapped runtime entry, Thumb bit preserved.
-    #[inline]
-    pub const fn entry(&self) -> TargetAddress {
-        self.entry
-    }
-
     #[inline]
     pub fn link_map(&self) -> &[LinkMapEntry] {
         &self.link_map
@@ -332,6 +326,15 @@ pub trait LinkPublisher {
     type PreparedBatch;
     type Receipt;
 
+    fn prepare_metadata(
+        &mut self,
+        _context: &LinkContext,
+        _plans: &LifecyclePlans,
+        _bindings: &[RelocationBinding],
+    ) -> LoadResult<u64> {
+        Ok(0)
+    }
+
     fn prepare_batch(&mut self, manifest: &PreparedLinkManifest)
         -> LoadResult<Self::PreparedBatch>;
 
@@ -404,14 +407,6 @@ impl<Receipt> LinkProduct<Receipt> {
     #[inline]
     pub fn link_map(&self) -> &[LinkMapEntry] {
         &self.link_map
-    }
-
-    /// Mutable access to the publisher receipt, for the host to move parts
-    /// out before installation. System backings move into the registry at
-    /// batch publication.
-    #[inline]
-    pub fn publication_mut(&mut self) -> &mut Receipt {
-        &mut self.publication
     }
 
     #[inline]

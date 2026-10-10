@@ -35,18 +35,20 @@ use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     dynamic_linker::{ArtifactRole, DependencyName},
     elf::LoadSegmentInfo,
-    error::{LoadError, LoadErrorKind, LoadResult, LoadStage},
-    identity::{LoadLimits, LoadProfile, LoadRequest, DYNAMIC_LINK_LOAD_POLICY},
+    error::{LoadErrorKind, LoadStage},
     image::{image_loader::ImageLoader, map::decode_dependency_name_at},
+    profile::{LoadLimits, LoadProfile, LoadRequest},
     reader::ElfReader,
+    LoadError, LoadResult,
 };
 
 /// What one artifact's dynamic table declares.
 ///
 /// `declared_soname` is `None` for a DSO without `DT_SONAME` — legal since the
 /// SONAME relaxation — and for a root without a dynamic table (a static PIE).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ScannedArtifact {
+    pub(crate) role: ArtifactRole,
     /// The declared `DT_SONAME`, when present.
     pub declared_soname: Option<DependencyName>,
     /// Every `DT_NEEDED`, in encounter order.
@@ -63,28 +65,38 @@ pub struct ScannedArtifact {
 ///
 /// A root without `PT_DYNAMIC` scans to an empty result; a shared object
 /// without `PT_DYNAMIC` fails, exactly as during a real load.
-pub fn scan_artifact<R: ElfReader>(
+pub(crate) fn scan_root_or_dependency<R: ElfReader>(
     reader: &R,
     profile: LoadProfile,
-    role: ArtifactRole,
+    role: Option<ArtifactRole>,
     limits: LoadLimits,
 ) -> LoadResult<ScannedArtifact> {
     let request = LoadRequest::new(profile, limits);
     // Admit and inspect read only through `reader`: the header, the program
     // header table and the file-backed PT_DYNAMIC all go through
     // read_exact_at, never through a memory transaction.
-    let inspected = ImageLoader::new(ReadRef::new(reader), request)
+    let admitted = ImageLoader::new(ReadRef::new(reader), request)
         .admit()
-        .map_err(|error| error.at_stage(LoadStage::Discover))?
-        .inspect_with_policy(DYNAMIC_LINK_LOAD_POLICY)
-        .with_role(role)
+        .map_err(|error| error.at_stage(LoadStage::Discover))?;
+    let admitted = match role {
+        Some(role) => admitted.with_role(role),
+        None => admitted.infer_role(),
+    };
+    let inspected = admitted
         .inspect()
         .map_err(|error| error.at_stage(LoadStage::Discover))?;
+
+    let role = inspected.role();
+    let empty = || ScannedArtifact {
+        role,
+        declared_soname: None,
+        needed: Vec::new(),
+    };
 
     let (dynamic, summary, load_segments) = inspected.scan_parts();
     let Some(dynamic) = dynamic else {
         // A root without a dynamic table: no SONAME, no NEEDED.
-        return Ok(ScannedArtifact::default());
+        return Ok(empty());
     };
 
     // Resolve the raw offsets against the file-backed `.dynstr` using the
@@ -93,7 +105,7 @@ pub fn scan_artifact<R: ElfReader>(
     let needed_offsets = summary.needed();
     let soname_offset = summary.soname();
     if needed_offsets.is_empty() && soname_offset.is_none() {
-        return Ok(ScannedArtifact::default());
+        return Ok(empty());
     }
     let (strtab, strsz) = match (summary.strtab(), summary.strsz()) {
         (Some(strtab), Some(strsz)) => (strtab, strsz),
@@ -134,6 +146,7 @@ pub fn scan_artifact<R: ElfReader>(
         None => None,
     };
     Ok(ScannedArtifact {
+        role,
         declared_soname,
         needed,
     })

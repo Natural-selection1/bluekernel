@@ -14,16 +14,17 @@
 
 use alloc::vec::Vec;
 use goblin::elf::dynamic::{
-    DF_1_NOW, DF_BIND_NOW, DT_BIND_NOW, DT_FLAGS, DT_FLAGS_1, DT_JMPREL, DT_NEEDED, DT_NULL,
-    DT_PLTREL, DT_PLTRELSZ, DT_SONAME, DT_STRSZ, DT_STRTAB,
+    DF_1_NOW, DF_1_PIE, DF_BIND_NOW, DT_BIND_NOW, DT_FLAGS, DT_FLAGS_1, DT_JMPREL, DT_NEEDED,
+    DT_NULL, DT_PLTREL, DT_PLTRELSZ, DT_SONAME, DT_STRSZ, DT_STRTAB,
 };
 
 use crate::{
     elf::DynamicSegmentInfo,
-    error::{LoadError, LoadErrorKind, LoadResult},
-    identity::{ElfClass, ElfData, LoadLimits, LoadPolicy},
+    error::LoadErrorKind,
     image::map::{decode_dynamic_entry, dynamic_error, unsupported_dynamic},
+    profile::{supports_dynamic_tag, ElfClass, ElfData, LoadLimits},
     reader::ElfReader,
+    LoadError, LoadResult,
 };
 
 /// summary of the dynamic features an image requests.
@@ -36,6 +37,7 @@ use crate::{
 /// read-only dependency scanner resolves the offsets from the file with
 /// the same summary instead of re-decoding the whole table.
 pub(crate) struct DynamicFeatureSummary {
+    pie: bool,
     needed: Vec<u64>,
     soname: Option<u64>,
     strtab: Option<u64>,
@@ -45,11 +47,16 @@ pub(crate) struct DynamicFeatureSummary {
 impl DynamicFeatureSummary {
     pub(crate) const fn empty() -> Self {
         Self {
+            pie: false,
             needed: Vec::new(),
             soname: None,
             strtab: None,
             strsz: None,
         }
+    }
+
+    pub(crate) const fn is_pie(&self) -> bool {
+        self.pie
     }
 
     #[inline]
@@ -78,13 +85,12 @@ impl DynamicFeatureSummary {
 /// Scan the file-backed `PT_DYNAMIC` and return a feature summary,
 /// rejecting any tag the policy does not permit.
 ///
-/// This runs before allocation, so a policy violation (`DT_NEEDED` under
-/// the single-image policy, `RPATH/RUNPATH`, symbol versioning, unknown tags, …) fails with
+/// This runs before allocation, so unsupported features (`RPATH/RUNPATH`,
+/// symbol versioning, unknown tags, …) fail with
 /// zero allocations and zero writes.
 pub(crate) fn validate_dynamic_features<R: ElfReader>(
     reader: &R,
     dynamic: &DynamicSegmentInfo,
-    policy: LoadPolicy,
     class: ElfClass,
     endian: ElfData,
     limits: &LoadLimits,
@@ -113,6 +119,7 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
     let mut strsz = None;
     let mut has_plt_relocations = false;
     let mut bind_now = false;
+    let mut pie = false;
 
     let mut raw = [0; 16];
     let mut terminated = false;
@@ -144,7 +151,7 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
             terminated = true;
             break;
         }
-        if !policy.allows_dynamic_tag(tag, value) {
+        if !supports_dynamic_tag(tag, value) {
             return Err(unsupported_dynamic(tag, value));
         }
         match tag {
@@ -167,7 +174,10 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
             DT_PLTRELSZ | DT_PLTREL | DT_JMPREL => has_plt_relocations = true,
             DT_BIND_NOW => bind_now = true,
             DT_FLAGS if value & DF_BIND_NOW != 0 => bind_now = true,
-            DT_FLAGS_1 if value & DF_1_NOW != 0 => bind_now = true,
+            DT_FLAGS_1 => {
+                bind_now |= value & DF_1_NOW != 0;
+                pie |= value & DF_1_PIE != 0;
+            }
             _ => {}
         }
     }
@@ -180,11 +190,12 @@ pub(crate) fn validate_dynamic_features<R: ElfReader>(
     // Distinguishing two
     // SONAME-less files is the resolver's job — by identity and path — not
     // this stage's.
-    if has_plt_relocations && policy.requires_now_for_plt() && !bind_now {
+    if has_plt_relocations && !bind_now {
         return Err(unsupported_dynamic(DT_JMPREL, 0));
     }
 
     Ok(DynamicFeatureSummary {
+        pie,
         needed,
         soname,
         strtab,

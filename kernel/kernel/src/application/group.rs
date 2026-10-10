@@ -213,7 +213,7 @@ impl ThreadGroup {
     /// the group from `New` to `Linked`.
     ///
     /// This is the infallible second half of the two-phase install: the
-    /// `KernelLinkPublisher::prepare_batch` check already proved the group was
+    /// `KernelLinkPublisher::prepare` check already proved the group was
     /// unlinked, and this move only swaps the fully-built product into place.
     /// A reader therefore observes either the old `New` state or a complete
     /// product, never a half-written link map.

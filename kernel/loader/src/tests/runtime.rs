@@ -13,13 +13,18 @@
 // limitations under the License.
 
 use crate::{
-    dynamic_linker::{DependencyGraph, ScopeSet, SessionUsage, SymbolTable},
-    reader::SliceElfReader,
-    tests::fixture::{ElfFixtureBuilder, RecordingMemory},
-    ArtifactIdentity, ArtifactResolver, DependencyRequest, DependencyResolution, DynamicLinker,
-    ElfClass, ElfData, ElfType, FileIdentity, ImageOwnership, ImportedImageDescriptor,
-    LoadErrorKind, LoadLimits, LoadProfile, LoadResult, ProgramHeaderRuntimeInfo,
-    PublishedImageDescriptor, ResolvedArtifact, Riscv64Relocator, SessionLimits, TargetAddress,
+    address::TargetAddress,
+    dynamic_linker::{
+        ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyGraph, DependencyRequest,
+        DependencyResolution, DynamicLinker, ImageOwnership, ImportedImageDescriptor,
+        ProgramHeaderRuntimeInfo, PublishedImageDescriptor, ResolvedArtifact, ScopeSet,
+        SessionUsage, SymbolTable,
+    },
+    error::LoadErrorKind,
+    profile::{ElfClass, ElfData, LoadLimits, LoadProfile, SessionLimits},
+    relocation::Riscv64Relocator,
+    tests::fixture::{ElfFixtureBuilder, RecordingMemory, SliceElfReader},
+    LoadResult,
 };
 use alloc::{rc::Rc, sync::Arc, vec::Vec};
 use core::cell::RefCell;
@@ -28,7 +33,7 @@ use goblin::elf::header::{EM_RISCV, ET_DYN};
 use blueos_test_macro::test;
 
 fn identity(name: &[u8]) -> ArtifactIdentity {
-    ArtifactIdentity::new(FileIdentity::from_bytes(name))
+    ArtifactIdentity::from_bytes(name).unwrap()
 }
 
 // A real decoded hash/symbol table: one named SHN_ABS symbol and the ELF
@@ -70,7 +75,7 @@ fn descriptor(name: &[u8], table: SymbolTable) -> Arc<PublishedImageDescriptor> 
             Vec::new(),
             Vec::new(),
             TargetAddress::new(0),
-            ProgramHeaderRuntimeInfo::empty(),
+            ProgramHeaderRuntimeInfo::from_headers(0, 0, None, TargetAddress::new(0)).unwrap(),
             table,
         )
         .unwrap(),
@@ -99,12 +104,13 @@ fn runtime_shared_root_accepts_zero_entry_without_weakening_executable_admission
     let sink = Rc::new(RefCell::new(None));
     let mut memory = RecordingMemory::new(sink.clone());
     let executable = DynamicLinker::new(Riscv64Relocator).begin(
-        ResolvedArtifact::new(
+        DependencyResolution::Load(ResolvedArtifact::new(
             identity(b"app"),
             ImageOwnership::SessionPrivate,
             SliceElfReader::new(&bytes),
-        ),
-        LoadProfile::riscv64(ElfType::Dyn),
+        )),
+        ArtifactRole::ExecutableRoot,
+        LoadProfile::riscv64(),
         SessionLimits::DEFAULT,
         &mut memory,
     );
@@ -113,13 +119,14 @@ fn runtime_shared_root_accepts_zero_entry_without_weakening_executable_admission
     assert!(RecordingMemory::recorded(&sink).is_none());
 
     let mut shared = DynamicLinker::new(Riscv64Relocator)
-        .begin_shared(
+        .begin(
             DependencyResolution::Load(ResolvedArtifact::new(
                 identity(b"dso"),
                 ImageOwnership::SessionPrivate,
                 SliceElfReader::new(&bytes),
             )),
-            LoadProfile::riscv64(ElfType::Dyn),
+            ArtifactRole::SharedObject,
+            LoadProfile::riscv64(),
             SessionLimits::DEFAULT,
             &mut memory,
         )
@@ -135,10 +142,23 @@ fn runtime_imported_root_and_duplicate_scope_do_not_allocate_backings() {
     let provider = descriptor(b"ready", SymbolTable::empty());
     let sink = Rc::new(RefCell::new(None));
     let mut memory = RecordingMemory::new(sink.clone());
+    let executable = DynamicLinker::new(Riscv64Relocator).begin::<SliceElfReader<'static>, _>(
+        DependencyResolution::Import(ImportedImageDescriptor::namespace(provider.clone())),
+        ArtifactRole::ExecutableRoot,
+        LoadProfile::riscv64(),
+        SessionLimits::DEFAULT,
+        &mut memory,
+    );
+    let error = executable
+        .err()
+        .expect("an executable root must be newly loaded");
+    assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
+    assert!(RecordingMemory::recorded(&sink).is_none());
     let mut shared = DynamicLinker::new(Riscv64Relocator)
-        .begin_shared::<SliceElfReader<'static>, _>(
+        .begin::<SliceElfReader<'static>, _>(
             DependencyResolution::Import(ImportedImageDescriptor::namespace(provider.clone())),
-            LoadProfile::riscv64(ElfType::Dyn),
+            ArtifactRole::SharedObject,
+            LoadProfile::riscv64(),
             SessionLimits::DEFAULT,
             &mut memory,
         )
@@ -171,12 +191,13 @@ fn failed_runtime_scope_import_poisoning_prevents_partial_publication() {
     let sink = Rc::new(RefCell::new(None));
     let mut memory = RecordingMemory::new(sink.clone());
     let mut shared = DynamicLinker::new(Riscv64Relocator)
-        .begin_shared::<SliceElfReader<'static>, _>(
+        .begin::<SliceElfReader<'static>, _>(
             DependencyResolution::Import(ImportedImageDescriptor::namespace(descriptor(
                 b"root",
                 SymbolTable::empty(),
             ))),
-            LoadProfile::riscv64(ElfType::Dyn),
+            ArtifactRole::SharedObject,
+            LoadProfile::riscv64(),
             limits,
             &mut memory,
         )

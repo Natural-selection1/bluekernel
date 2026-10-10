@@ -22,7 +22,32 @@
 //! dependency is a shared system DSO (the normalized catalog path is the
 //! registry key). Neither operation depends on the ELF carrying `DT_SONAME`.
 
-use blueos_loader::{DependencyName, LoadResult};
+use alloc::vec::Vec;
+use blueos_loader::{
+    error::{ErrorContext, LoadErrorKind},
+    LoadError, LoadResult,
+};
+
+/// Kernel registry identity: a canonical catalog path, independent of ELF metadata.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SystemLibraryKey(Vec<u8>);
+
+impl SystemLibraryKey {
+    pub fn from_bytes(path: &[u8]) -> LoadResult<Self> {
+        if path.is_empty() || path.contains(&0) {
+            return Err(LoadError::new(LoadErrorKind::Backend, ErrorContext::None));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(path.len())
+            .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
+        bytes.extend_from_slice(path);
+        Ok(Self(bytes))
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 /// One fixed mapping from a system lookup name to its on-device path.
 #[derive(Clone, Copy, Debug)]
@@ -41,8 +66,8 @@ pub struct SystemLibraryEntry {
 impl SystemLibraryEntry {
     /// The canonical registry key. System instances are keyed by catalog path,
     /// not by optional ELF `DT_SONAME` metadata.
-    pub fn key(&self) -> LoadResult<DependencyName> {
-        DependencyName::from_bytes(self.path.as_bytes())
+    pub fn key(&self) -> LoadResult<SystemLibraryKey> {
+        SystemLibraryKey::from_bytes(self.path.as_bytes())
     }
 }
 
@@ -76,7 +101,7 @@ impl SystemLibraryPaths {
     }
 
     /// Look up an entry from its canonical registry key.
-    pub fn resolve_key(&self, key: &DependencyName) -> Option<&'static SystemLibraryEntry> {
+    pub fn resolve_key(&self, key: &SystemLibraryKey) -> Option<&'static SystemLibraryEntry> {
         self.resolve_path(core::str::from_utf8(key.as_bytes()).ok()?)
     }
 }

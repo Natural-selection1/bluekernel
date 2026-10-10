@@ -29,7 +29,8 @@
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
-use blueos_loader::{DependencyName, ImageMemory, LinkProduct};
+use super::adapters::system_paths::SystemLibraryKey;
+use blueos_loader::memory::ImageMemory;
 
 use crate::{
     application::{
@@ -258,7 +259,7 @@ impl ApplicationReaper {
         }
 
         let imported_dsos = system_leases.len();
-        let mut quiescence: Vec<DependencyName> = Vec::new();
+        let mut quiescence: Vec<SystemLibraryKey> = Vec::new();
         for lease in system_leases {
             let key = lease.key().clone();
             quiescence.push(key);
@@ -291,8 +292,7 @@ impl ApplicationReaper {
                                 // allocation is still mapped — it is released only
                                 // after every destructor completed.
                                 unsafe {
-                                    let function: extern "C" fn() =
-                                        core::mem::transmute(entry.function().get() as usize);
+                                    let function: extern "C" fn() = core::mem::transmute(*entry);
                                     function();
                                 }
                             }

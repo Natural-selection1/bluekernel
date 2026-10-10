@@ -26,10 +26,11 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::{
     address::{TargetAddress, TargetRange},
     elf::LoadSegmentInfo,
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
-    identity::{ElfClass, ElfData},
+    error::{ErrorContext, LoadErrorKind},
     image::{read_u16, read_u32, read_u64},
-    MemoryPermissions,
+    memory_mapper::MemoryPermissions,
+    profile::{ElfClass, ElfData},
+    LoadError, LoadResult,
 };
 
 /// ELF symbol binding (`STB_*`). OS/processor-specific bindings are rejected.

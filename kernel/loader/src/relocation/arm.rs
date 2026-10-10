@@ -15,13 +15,13 @@
 use goblin::elf::reloc::{R_ARM_ABS32, R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT, R_ARM_RELATIVE};
 
 use crate::{
-    identity::{ElfClass, ElfMachine},
+    profile::{ElfClass, ElfMachine},
     relocation::{AddendEncoding, ArchRelocator, RelocationKind},
 };
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub struct ArmRelocator;
+pub(crate) struct ArmRelocator;
 
 impl ArchRelocator for ArmRelocator {
     fn machine(&self) -> ElfMachine {
@@ -30,10 +30,6 @@ impl ArchRelocator for ArmRelocator {
 
     fn class(&self) -> super::ElfClass {
         ElfClass::Elf32
-    }
-
-    fn relative_type(&self) -> u32 {
-        R_ARM_RELATIVE
     }
 
     fn addend_encoding(&self) -> super::AddendEncoding {

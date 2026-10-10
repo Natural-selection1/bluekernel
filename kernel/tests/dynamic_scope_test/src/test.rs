@@ -21,7 +21,7 @@
 // COUNT: SCOPE_BIND requester=.* name=missing_data provider=none == 4
 // COUNT: SCOPE_BIND requester=7 name=sys_target provider=7 == 3
 // COUNT: SCOPE_BIND requester=7 name=strlen provider=1 == 3
-// COUNT: LINK_EDGE requester=7 provider=1 == 3
+// COUNT: LINK_EDGE requester=7 provider=1 == 4
 
 #![no_main]
 #![no_std]
@@ -46,6 +46,8 @@
 //! even though the root defines a same-named symbol;
 //! * undefined weak data — `missing_data` binds to zero
 //! (SCOPE_BIND provider=none; the app prints weakdata=0).
+//! * reused provider closure — the system-to-libc edge remains in all four
+//! link results, while only the three fresh instances need relocation;
 //! * atomic concurrent acquisition — two linker workers race the same system
 //! closure and share one `libscope_sys` instance;
 

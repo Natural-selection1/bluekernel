@@ -34,7 +34,7 @@ use blueos_header::application::{
     auxv, BlueOsApplicationStartInfo, BlueOsAuxvEntry, BlueOsFunctionPlan, BlueOsStringView,
     APPLICATION_START_INFO_ABI_VERSION, FUNCTION_PLAN_ABI_VERSION,
 };
-use blueos_loader::{LinkProduct, TargetAddress};
+use blueos_loader::{memory::TargetAddress, LoadedImage};
 
 use crate::application::publication::KernelLinkReceipt;
 
@@ -42,6 +42,7 @@ use crate::application::publication::KernelLinkReceipt;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartStorageError {
     OutOfMemory,
+    MissingEntry,
 }
 
 /// Owned, pinned application start storage.
@@ -93,7 +94,7 @@ impl ApplicationStartStorage {
         path: &[u8],
         argv: &[BlueOsStringView],
         envp: &[BlueOsStringView],
-        product: &LinkProduct<KernelLinkReceipt>,
+        product: &LoadedImage<KernelLinkReceipt>,
         page_granule: u64,
     ) -> Result<Self, StartStorageError> {
         let (argv_bytes, argv_ptrs) = build_strings(argv)?;
@@ -101,13 +102,13 @@ impl ApplicationStartStorage {
 
         let execfn_bytes = nul_terminated(path)?;
         let execfn_ptr = execfn_bytes.as_ptr();
-        let entry = product.entry();
-        let program_headers = root_program_headers(product);
+        let entry = product.entry().ok_or(StartStorageError::MissingEntry)?;
+        let program_headers = product.program_headers();
         // The application runs the startup plan and, at exit,
         // only the root/private fini — a system DSO's destructors belong to
         // the registry's instance reap, never to an application exit.
-        let init_targets = build_plan_targets(product.lifecycle_plans().startup().iter())?;
-        let fini_targets = build_plan_targets(product.lifecycle_plans().group_fini().iter())?;
+        let init_targets = build_plan_targets(product.startup())?;
+        let fini_targets = build_plan_targets(product.fini())?;
 
         let (auxv, auxv_count) = build_auxv(entry, program_headers, execfn_ptr, page_granule)?;
 
@@ -222,41 +223,20 @@ fn nul_terminated(bytes: &[u8]) -> Result<Box<[u8]>, StartStorageError> {
 
 /// Flatten an init/fini plan into a boxed array of runtime function addresses
 /// (Thumb bit preserved on ARM).
-fn build_plan_targets<'a, I>(plan: I) -> Result<Box<[usize]>, StartStorageError>
-where
-    I: IntoIterator<Item = &'a blueos_loader::LifecycleEntry>,
-{
+fn build_plan_targets(plan: &[usize]) -> Result<Box<[usize]>, StartStorageError> {
     let mut targets = Vec::new();
-    for entry in plan {
-        targets
-            .try_reserve(1)
-            .map_err(|_| StartStorageError::OutOfMemory)?;
-        targets.push(entry.function().get() as usize);
-    }
+    targets
+        .try_reserve_exact(plan.len())
+        .map_err(|_| StartStorageError::OutOfMemory)?;
+    targets.extend_from_slice(plan);
     Ok(targets.into_boxed_slice())
-}
-
-/// The root image's program-header summary, for `AT_PHDR/AT_PHENT/AT_PHNUM`.
-///
-/// The root is the committed image with `owner == 0`; a link result
-/// always has exactly one.
-fn root_program_headers(
-    product: &LinkProduct<KernelLinkReceipt>,
-) -> blueos_loader::ProgramHeaderRuntimeInfo {
-    product
-        .context()
-        .images()
-        .iter()
-        .find(|image| image.owner().get() == 0)
-        .map(|image| *image.descriptor().program_headers())
-        .unwrap_or_else(blueos_loader::ProgramHeaderRuntimeInfo::empty)
 }
 
 /// Build the auxv table (plus a `AT_NULL` terminator) and return it with its
 /// length.
 fn build_auxv(
     entry: TargetAddress,
-    program_headers: blueos_loader::ProgramHeaderRuntimeInfo,
+    program_headers: (Option<TargetAddress>, u16, u16),
     execfn_ptr: *const u8,
     page_granule: u64,
 ) -> Result<(Box<[BlueOsAuxvEntry]>, usize), StartStorageError> {
@@ -270,7 +250,7 @@ fn build_auxv(
         key: auxv::AT_ENTRY,
         value: entry.get() as usize,
     });
-    if let Some(phdr) = program_headers.runtime_vaddr() {
+    if let Some(phdr) = program_headers.0 {
         auxv.push(BlueOsAuxvEntry {
             key: auxv::AT_PHDR,
             value: phdr.get() as usize,
@@ -278,11 +258,11 @@ fn build_auxv(
     }
     auxv.push(BlueOsAuxvEntry {
         key: auxv::AT_PHENT,
-        value: program_headers.entry_size() as usize,
+        value: program_headers.1 as usize,
     });
     auxv.push(BlueOsAuxvEntry {
         key: auxv::AT_PHNUM,
-        value: program_headers.count() as usize,
+        value: program_headers.2 as usize,
     });
     auxv.push(BlueOsAuxvEntry {
         key: auxv::AT_PAGESZ,

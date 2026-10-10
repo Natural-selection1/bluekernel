@@ -24,7 +24,7 @@
 //! a loader directly.
 //!
 //! `spawn` uses the manager's `prepare` closure to open the
-//! root, run the staged link, pin the start storage, install the product,
+//! root, prepare and publish the link, pin the start storage, install the product,
 //! and start the main thread at the relocated entry after registering it with
 //! the group. Every failure before the install drops the armed
 //! link session and cancels the registry permits; a failure after the
@@ -36,7 +36,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Once;
 
 use blueos_header::application::BlueOsStringView;
-use blueos_loader::ImageProtectionMemory;
+use blueos_loader::memory::ImageProtectionMemory;
 
 use crate::{
     application::{
@@ -47,7 +47,6 @@ use crate::{
             ApplicationHandle, ApplicationLaunchError, ApplicationManager, OwnedLaunchRequest,
         },
         namespace::ApplicationNamespace,
-        planner::NamespaceLoadPlanner,
         reaper::ApplicationReaper,
         registry::SystemDsoRegistry,
         start_storage::ApplicationStartStorage,
@@ -60,7 +59,7 @@ use crate::{
 
 /// Stack for the thread that performs one launch's link.
 ///
-/// The staged link's depth follows the size of the dependency closure, so it
+/// The loader's work follows the size of the dependency closure, so it
 /// must not be inherited from whichever thread called `spawn` — at boot that is
 /// the shell's main thread, and in the QEMU tests it is the test's main thread.
 /// Owning the stack here turns "deep enough" into a decision that this constant
@@ -157,7 +156,7 @@ impl ApplicationService {
     pub(crate) fn fail_runtime_init(
         &self,
         batch: super::registry::SystemInitBatch,
-    ) -> Vec<blueos_loader::AllocationLease> {
+    ) -> Vec<blueos_loader::memory::AllocationLease> {
         self.loader.registry().fail_initialization_batch(batch)
     }
 
@@ -305,7 +304,7 @@ impl ApplicationService {
             .expect("the worker stores its outcome before bumping the epoch")
     }
 
-    /// The manager's slow prepare closure: VFS open, staged link, start
+    /// The manager's slow prepare closure: VFS open, link preparation, start
     /// storage and main-thread creation all run outside the manager's table
     /// lock.
     fn prepare(
@@ -331,16 +330,9 @@ impl ApplicationService {
             .collect();
 
         let root_path = namespace.root_path();
-        let plan = NamespaceLoadPlanner::new(
-            namespace,
-            self.loader.catalog(),
-            blueos_loader::SessionLimits::DEFAULT,
-        )
-        .plan()
-        .map_err(|error| prepare_failed("plan namespace", &error))?;
         let product = self
             .loader
-            .link(plan, namespace.profile(), group)
+            .link(namespace, group)
             .map_err(|error| prepare_failed("link application", &error))?;
 
         let granule = self.loader.memory().protection_capabilities().granule();
@@ -356,11 +348,14 @@ impl ApplicationService {
         // The storage heap allocations never move; the pointer stays valid
         // after the install moved the storage into the group.
         let start_info = storage.start_info_ptr();
-        let entry = product.entry().get() as usize;
+        let entry = product
+            .entry()
+            .ok_or(ApplicationLaunchError::PrepareFailed)?
+            .get() as usize;
         let runtime = super::dynamic::RuntimeNamespace::new(namespace.clone(), &product)
             .map_err(|_| ApplicationLaunchError::PrepareFailed)?;
         group.install_runtime(runtime);
-        let receipt = product.into_publication();
+        let receipt = product.into_receipt();
         group
             .install_resources(receipt, storage)
             .map_err(|_| ApplicationLaunchError::PrepareFailed)?;

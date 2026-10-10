@@ -31,8 +31,9 @@ use crate::{
         graph::DependencyGraph, session::SessionUsage, ImageId, ImageOwnership, SymbolBinding,
         SymbolDefinition, SymbolEntry, SymbolTable, SymbolType, SymbolVisibility,
     },
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
-    identity::SessionLimits,
+    error::{ErrorContext, LoadErrorKind, LoadStage},
+    profile::SessionLimits,
+    LoadError, LoadResult,
 };
 
 /// Region a resolved symbol's canonical target must live in, derived from its
@@ -180,9 +181,8 @@ impl ScopeSet {
                 }
             }
         }
-        // BFS discovery order is the search order.
-        session_private.sort_by_key(|id| nodes[id.get() as usize].discovery_index());
-        system_candidates.sort_by_key(|id| nodes[id.get() as usize].discovery_index());
+        // Nodes are appended in discovery order, so filtering preserves the
+        // search order without another sort.
 
         let mut application_order = session_private;
         application_order
@@ -304,35 +304,23 @@ impl ScopeSet {
 /// The frozen scope decision is captured per relocation, not re-derived after
 /// publication: `provider` names the image whose definition the lookup
 /// returned (`None` for a relative relocation or an undefined weak bound to
-/// zero), `offset` is the relocation's image-relative target, and `name` is
-/// the referenced symbol's byte name (empty when the relocation names no
-/// symbol). Tests compare normalized image ids, symbol names and owners —
+/// zero), and `name` is the referenced symbol's byte name (empty when the
+/// relocation names no symbol). Tests compare normalized image ids, symbol names and owners —
 /// never raw addresses.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelocationBinding {
     requester: ImageId,
     name: Vec<u8>,
     provider: Option<ImageId>,
-    kind: crate::relocation::RelocationKind,
-    offset: TargetAddress,
 }
 
 impl RelocationBinding {
     #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        requester: ImageId,
-        name: Vec<u8>,
-        provider: Option<ImageId>,
-        kind: crate::relocation::RelocationKind,
-        offset: TargetAddress,
-    ) -> Self {
+    pub(crate) fn new(requester: ImageId, name: Vec<u8>, provider: Option<ImageId>) -> Self {
         Self {
             requester,
             name,
             provider,
-            kind,
-            offset,
         }
     }
 
@@ -354,18 +342,6 @@ impl RelocationBinding {
     #[inline]
     pub const fn provider(&self) -> Option<ImageId> {
         self.provider
-    }
-
-    /// The relocation kind this binding was produced for.
-    #[inline]
-    pub const fn kind(&self) -> crate::relocation::RelocationKind {
-        self.kind
-    }
-
-    /// The relocation's image-relative target offset.
-    #[inline]
-    pub const fn offset(&self) -> TargetAddress {
-        self.offset
     }
 }
 

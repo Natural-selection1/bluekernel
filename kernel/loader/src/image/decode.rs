@@ -15,18 +15,11 @@
 use alloc::vec::Vec;
 
 use crate::{
-    address::{FileRange, TargetAddress, TargetRange},
-    dynamic_linker::{RuntimeImageMetadata, RuntimeImageState},
-    elf::{DynamicSegmentInfo, LoadSegmentInfo},
-    error::{ErrorContext, HeaderField, LoadError, LoadErrorKind, LoadResult, LoadStage},
-    identity::LoadRequest,
-    image::{inspect::StackKind, map::LoadedRegion, relocate::RelocatedImage},
-    memory::{
-        AllocationOffset, AllocationRollbackLog, ImageAllocation, ImageLoadTransaction,
-        ImageMemory, SessionAllocation,
-    },
-    reader::ElfReader,
-    relocation::{AddendEncoding, ArchRelocator, RelocationOperation, TargetWord, WordWidth},
+    address::TargetAddress,
+    dynamic_linker::RuntimeImageState,
+    error::{ErrorContext, LoadErrorKind},
+    memory::{AllocationRollbackLog, ImageLoadTransaction, ImageMemory, SessionAllocation},
+    LoadError, LoadResult,
 };
 
 #[derive(Clone, Copy)]
@@ -81,262 +74,19 @@ impl RelocationRecord {
 }
 
 #[must_use = "dropping a decoded image aborts its allocation"]
-pub(crate) struct DecodedImage<R: ElfReader, M: ImageMemory> {
-    reader: R,
-    transaction: ImageLoadTransaction<M>,
-    load_bias: TargetAddress,
-    request: LoadRequest,
-    entry_vaddr: TargetAddress,
-    canonical_entry_vaddr: TargetAddress,
-    load_segments: Vec<LoadSegmentInfo>,
-    regions: Vec<LoadedRegion>,
-    dynamic: Option<DynamicSegmentInfo>,
-    metadata: RuntimeImageMetadata,
-    relro: Option<TargetRange>,
-    stack: StackKind,
-    interpreter: Option<FileRange>,
-    tls: Option<TargetRange>,
+pub(crate) struct DecodedImage<M: ImageMemory> {
+    pub(crate) transaction: ImageLoadTransaction<M>,
+    pub(crate) runtime: RuntimeImageState,
 }
 
-impl<R: ElfReader, M: ImageMemory> DecodedImage<R, M> {
-    #[inline]
-    pub fn new(
-        reader: R,
-        transaction: ImageLoadTransaction<M>,
-        load_bias: TargetAddress,
-        request: LoadRequest,
-        entry_vaddr: TargetAddress,
-        canonical_entry_vaddr: TargetAddress,
-        load_segments: Vec<LoadSegmentInfo>,
-        regions: Vec<LoadedRegion>,
-        dynamic: Option<DynamicSegmentInfo>,
-        metadata: RuntimeImageMetadata,
-        relro: Option<TargetRange>,
-        stack: StackKind,
-        interpreter: Option<FileRange>,
-        tls: Option<TargetRange>,
-    ) -> Self {
-        Self {
-            reader,
-            transaction,
-            load_bias,
-            request,
-            entry_vaddr,
-            canonical_entry_vaddr,
-            load_segments,
-            regions,
-            dynamic,
-            metadata,
-            relro,
-            stack,
-            interpreter,
-            tls,
-        }
-    }
-
-    fn validate_relocator<A: ArchRelocator>(&self, relocator: &A) -> LoadResult<()> {
-        let profile = self.request.profile();
-        if relocator.machine() == profile.machine() && relocator.class() == profile.class() {
-            Ok(())
-        } else {
-            let (field, value) = if relocator.machine() != profile.machine() {
-                (HeaderField::Machine, u64::from(relocator.machine()))
-            } else {
-                (HeaderField::Class, u64::from(relocator.class()))
-            };
-            Err(LoadError::new(
-                LoadErrorKind::UnsupportedByProfile,
-                ErrorContext::HeaderField { field, value },
-            ))
-        }
-    }
-
-    fn locate_vaddr_at(&self, vaddr: TargetAddress, len: u64) -> LoadResult<AllocationOffset> {
-        let region = self
-            .regions
-            .iter()
-            .find(|region| region.vaddr_range().contains_span(vaddr, len))
-            .ok_or_else(|| {
-                LoadError::new(
-                    LoadErrorKind::OutOfBounds,
-                    ErrorContext::TargetRange {
-                        start: vaddr,
-                        len,
-                        align: 0,
-                    },
-                )
-            })?;
-        let offset = vaddr.checked_sub(region.vaddr_range().start())?;
-        region.allocation_offset().checked_add(offset)
-    }
-
-    fn preflight_relative<A: ArchRelocator>(
-        &self,
-        record: RelocationRecord,
-        relocator: &A,
-        target_word: TargetWord,
-    ) -> LoadResult<RelocationOperation> {
-        if record.raw_type() != relocator.relative_type() || record.symbol_index() != 0 {
-            return Err(relocation_error(
-                record,
-                LoadErrorKind::UnsupportedByProfile,
-            ));
-        }
-        let width = target_word.width().bytes();
-        if record.offset().get() % width != 0 {
-            return Err(relocation_error(record, LoadErrorKind::InvalidAlignment));
-        }
-        let offset = self
-            .locate_vaddr_at(record.offset(), width)
-            .map_err(|_| relocation_error(record, LoadErrorKind::OutOfBounds))?;
-        let writable = self.load_segments.iter().any(|segment| {
-            segment
-                .permissions()
-                .contains(crate::MemoryPermissions::WRITE)
-                && TargetRange::new(segment.vaddr(), segment.memory_size())
-                    .contains_span(record.offset(), width)
-        });
-        if !writable {
-            return Err(relocation_error(record, LoadErrorKind::PermissionConflict));
-        }
-        let addend = match (relocator.addend_encoding(), record.addend()) {
-            (AddendEncoding::Explicit, RelocationAddend::Explicit(value)) => i128::from(value),
-            (AddendEncoding::Implicit, RelocationAddend::Implicit) => match target_word.width() {
-                WordWidth::U32 => {
-                    i128::from(target_word.read_via(&self.transaction, offset)? as u32 as i32)
-                }
-                WordWidth::U64 => {
-                    i128::from(target_word.read_via(&self.transaction, offset)? as u64 as i64)
-                }
-            },
-            _ => {
-                return Err(relocation_error(
-                    record,
-                    LoadErrorKind::UnsupportedByProfile,
-                ))
-            }
-        };
-        let result = i128::from(self.load_bias.get())
-            .checked_add(addend)
-            .filter(|value| *value >= 0 && *value <= i128::from(target_word.width().maximum()))
-            .ok_or_else(|| relocation_error(record, LoadErrorKind::IntegerOverflow))?;
-        let value = result as u64;
-        let allocation = self.transaction.allocation();
-        if !TargetRange::new(allocation.base(), allocation.len())
-            .contains_span(TargetAddress::new(value), 1)
-        {
-            return Err(relocation_error(record, LoadErrorKind::OutOfBounds));
-        }
-        Ok(RelocationOperation::new(offset, value, record))
-    }
-
-    pub fn relocation<A: ArchRelocator>(mut self, relocator: A) -> LoadResult<RelocatedImage<M>> {
-        self.validate_relocator(&relocator)
-            .map_err(|error| error.at_stage(LoadStage::Relocate))?;
-        let target_word = TargetWord::new(
-            WordWidth::for_elf_class(self.request.profile().class()),
-            self.request.profile().endian(),
-        );
-        let mut operations = Vec::new();
-        let operation_bytes = self
-            .metadata
-            .relocations()
-            .records()
-            .len()
-            .checked_mul(core::mem::size_of::<RelocationOperation>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .unwrap_or(u64::MAX);
-        self.request
-            .limits()
-            .check_relocation_operation_bytes(operation_bytes)
-            .map_err(|error| error.at_stage(LoadStage::Relocate))?;
-        operations
-            .try_reserve_exact(self.metadata.relocations().records().len())
-            .map_err(|_| {
-                LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
-                    .at_stage(LoadStage::Relocate)
-            })?;
-
-        for record in self.metadata.relocations().records().iter() {
-            operations.push(
-                self.preflight_relative(*record, &relocator, target_word)
-                    .map_err(|error| error.at_stage(LoadStage::Relocate))?,
-            );
-        }
-        operations.sort_unstable_by_key(|operation| operation.offset().value());
-        for pair in operations.windows(2) {
-            let end = pair[0]
-                .offset()
-                .checked_add(target_word.width().bytes())
-                .map_err(|_| {
-                    relocation_error(pair[0].record(), LoadErrorKind::IntegerOverflow)
-                        .at_stage(LoadStage::Relocate)
-                })?;
-            if pair[1].offset() < end {
-                return Err(relocation_error(pair[1].record(), LoadErrorKind::BadElf)
-                    .at_stage(LoadStage::Relocate));
-            }
-        }
-        for operation in operations {
-            target_word
-                .write_via(&mut self.transaction, operation.offset(), operation.value())
-                .map_err(|error| error.at_stage(LoadStage::Relocate))?;
-        }
-        Ok(RelocatedImage::new(
-            self.transaction,
-            self.load_bias,
-            self.request,
-            self.entry_vaddr,
-            self.canonical_entry_vaddr,
-            self.load_segments,
-            self.regions,
-            self.metadata,
-            self.relro,
-            self.stack,
-        ))
-    }
-}
-
-/// Consume a fully decoded image and absorb its allocation lease into the
-/// session rollback log, producing the copyable session descriptor plus the
-/// owned runtime state.
-///
-/// `decoded` owns an `ImageLoadTransaction<&mut M>`: the short reborrow of the
-/// session memory ends when the lease is transferred here. On success the
-/// unique lease lives only in the rollback log; on failure the transaction's
-/// `Drop` aborts the image.
-pub(crate) fn absorb_into_session<R, M>(
-    decoded: DecodedImage<R, &mut M>,
+/// Transfer the decoded image's unique allocation lease into the session's
+/// rollback log. The transaction remains armed until transfer succeeds.
+pub(crate) fn absorb_into_session<M: ImageMemory + ?Sized>(
+    decoded: DecodedImage<&mut M>,
     rollback: &mut AllocationRollbackLog,
-) -> LoadResult<(SessionAllocation, RuntimeImageState)>
-where
-    R: ElfReader,
-    M: ImageMemory + ?Sized,
-{
-    let DecodedImage {
-        transaction,
-        load_bias,
-        regions,
-        load_segments,
-        metadata,
-        entry_vaddr,
-        canonical_entry_vaddr,
-        relro,
-        stack,
-        ..
-    } = decoded;
-    let session_allocation = transaction.transfer_to(rollback)?;
-    let state = RuntimeImageState::new(
-        regions,
-        load_segments,
-        metadata,
-        load_bias,
-        entry_vaddr,
-        canonical_entry_vaddr,
-        relro,
-        stack,
-    );
-    Ok((session_allocation, state))
+) -> LoadResult<(SessionAllocation, RuntimeImageState)> {
+    let allocation = decoded.transaction.transfer_to(rollback)?;
+    Ok((allocation, decoded.runtime))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -547,16 +297,6 @@ impl DynamicTags {
     }
 
     #[inline]
-    pub const fn flags(&self) -> Option<u64> {
-        self.flags
-    }
-
-    #[inline]
-    pub const fn flags_1(&self) -> Option<u64> {
-        self.flags_1
-    }
-
-    #[inline]
     pub fn flags_mut(&mut self) -> &mut Option<u64> {
         &mut self.flags
     }
@@ -645,15 +385,4 @@ impl DynamicTags {
     pub fn fini_arraysz_mut(&mut self) -> &mut Option<u64> {
         &mut self.fini_arraysz
     }
-}
-
-fn relocation_error(record: RelocationRecord, kind: LoadErrorKind) -> LoadError {
-    LoadError::new(
-        kind,
-        ErrorContext::Relocation {
-            offset: record.offset(),
-            raw_type: record.raw_type(),
-            symbol_index: record.symbol_index(),
-        },
-    )
 }

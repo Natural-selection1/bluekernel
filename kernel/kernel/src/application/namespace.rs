@@ -28,7 +28,7 @@
 
 use alloc::{string::String, vec::Vec};
 
-use blueos_loader::LoadProfile;
+use blueos_loader::profile::LoadProfile;
 
 use crate::vfs::{join_path, normalize_path};
 

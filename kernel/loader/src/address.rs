@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{ErrorContext, LoadError, LoadErrorKind, LoadResult};
+use crate::{
+    error::{ErrorContext, LoadErrorKind},
+    LoadError, LoadResult,
+};
 
 #[non_exhaustive]
 #[derive(PartialEq, PartialOrd, Clone, Copy, Debug, Eq, Ord)]
@@ -138,7 +141,7 @@ impl TargetRange {
 }
 
 #[derive(Clone, Copy)]
-pub struct FileRange {
+pub(crate) struct FileRange {
     offset: u64,
     len: u64,
 }

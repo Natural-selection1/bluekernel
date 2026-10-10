@@ -26,34 +26,32 @@ use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
     address::TargetAddress,
-    cache::{CacheSyncOutcome, CodeCache},
+    cache::CodeCache,
     dynamic_linker::{
         graph::{DependencyGraph, DiscoveryItem, DiscoveryQueue},
-        lifecycle::{self, FiniPlan, InitPlan, LifecycleImage, LifecyclePlans},
+        lifecycle::{self, LifecycleImage, LifecyclePlans},
         publish::{
             self, CommittedImage, CommittingLinkProduct, LinkContext, LinkMapImage, LinkProduct,
             LinkPublisher, PreparedLinkManifest,
         },
-        relocate::{self, ProviderRegion, RelocationImage, RelocationPolicy, RelocationSource},
+        relocate::{self, ProviderRegion, RelocationImage, RelocationSource, RelocationTypeSet},
         scope::RelocationBinding,
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
-        DependencyRequester, DependencyResolution, ImageId, ImageOwnership,
-        ImportedImageDescriptor, PublishedImageDescriptor, PublishedRegion, ResolvedArtifact,
-        RuntimeImageMetadata, RuntimeImageState, ScopeSet, SymbolTable,
+        DependencyResolution, ImageId, ImageOwnership, ImportedImageDescriptor,
+        PublishedImageDescriptor, PublishedRegion, ResolvedArtifact, RuntimeImageMetadata,
+        RuntimeImageState, ScopeSet, SymbolTable,
     },
     elf::LoadSegmentInfo,
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage},
-    identity::{
-        ElfType, LoadLimits, LoadPolicy, LoadProfile, LoadRequest, SessionLimits,
-        DYNAMIC_LINK_LOAD_POLICY,
-    },
+    error::{ErrorContext, LoadErrorKind, LoadStage},
     image::{
-        absorb_into_session, AppliedProtectionSet, ImageLoader, LoadedRegion,
-        PreparedProtectionPlan, ProtectionBatch, SealPlan, SealedState,
+        absorb_into_session, ImageLoader, LoadedRegion, PreparedProtectionPlan, ProtectionBatch,
+        SealPlan,
     },
     memory::{AllocationRollbackLog, ImageMemory, ImageProtectionMemory, SessionAllocation},
+    profile::{LoadLimits, LoadProfile, LoadRequest, SessionLimits},
     reader::ElfReader,
     relocation::ArchRelocator,
+    LoadError, LoadResult,
 };
 
 /// Resource usage that must be accumulated across a link session to enforce
@@ -117,16 +115,17 @@ impl SessionUsage {
     }
 }
 
-/// One image admitted into the session, parameterized by its pipeline state.
+/// One image admitted into the session. The enclosing session type records
+/// which loading and linking stages have completed.
 ///
 /// `allocation` is a copyable descriptor plus an unforgeable rollback slot: it
 /// can select the image for reads/writes but has no authority to abort or
 /// commit the allocation. The unique lease lives only in the session rollback
 /// log.
-pub(crate) struct SessionImage<S> {
+pub(crate) struct SessionImage {
     image_id: ImageId,
     allocation: SessionAllocation,
-    state: S,
+    state: RuntimeImageState,
 }
 
 /// One Ready system image imported from the registry instead of loaded.
@@ -149,8 +148,8 @@ impl ImportedImage {
 }
 
 /// Immutable session state while dependencies are being discovered.
-pub struct BuildingState {
-    images: Vec<SessionImage<RuntimeImageState>>,
+pub(crate) struct BuildingState {
+    images: Vec<SessionImage>,
     imported: Vec<ImportedImage>,
     scope_prefix: Vec<ImageId>,
     discovery: DiscoveryQueue,
@@ -159,90 +158,24 @@ pub struct BuildingState {
 }
 
 /// Immutable session state once scopes are frozen.
-pub struct ScopedState {
-    images: Vec<SessionImage<RuntimeImageState>>,
+pub(crate) struct ScopedState {
+    images: Vec<SessionImage>,
     imported: Vec<ImportedImage>,
     scopes: ScopeSet,
 }
 
-/// Owned runtime state after session-wide relocation. Relocation only
-/// rewrites memory; the decoded metadata, load regions and segments are
-/// unchanged, so this newtypes the decoded state to make a second relocation
-/// unrepresentable.
-pub struct RelocatedImageState(RuntimeImageState);
-
-impl RelocatedImageState {
-    #[inline]
-    pub(crate) fn regions(&self) -> &[LoadedRegion] {
-        self.0.regions()
-    }
-
-    #[inline]
-    pub(crate) fn load_segments(&self) -> &[LoadSegmentInfo] {
-        self.0.load_segments()
-    }
-
-    #[inline]
-    pub(crate) const fn metadata(&self) -> &RuntimeImageMetadata {
-        self.0.metadata()
-    }
-
-    #[inline]
-    pub(crate) const fn load_bias(&self) -> TargetAddress {
-        self.0.load_bias()
-    }
-
-    #[inline]
-    pub(crate) const fn runtime_entry(&self) -> TargetAddress {
-        self.0.runtime_entry()
-    }
-}
-
 /// Immutable session state once every image is relocated.
-pub struct RelocatedState {
-    images: Vec<SessionImage<RelocatedImageState>>,
+pub(crate) struct RelocatedState {
+    images: Vec<SessionImage>,
     imported: Vec<ImportedImage>,
     /// Recorded scope decision for each relocation.
     bindings: Vec<RelocationBinding>,
 }
 
-/// Per-image state after cache synchronization and memory protection.
-pub struct SealedImageState {
-    runtime: RuntimeImageState,
-    sealed: SealedState,
-}
-
-impl SealedImageState {
-    #[inline]
-    pub(crate) fn regions(&self) -> &[LoadedRegion] {
-        self.runtime.regions()
-    }
-
-    #[inline]
-    pub(crate) fn load_segments(&self) -> &[LoadSegmentInfo] {
-        self.runtime.load_segments()
-    }
-
-    #[inline]
-    pub(crate) const fn metadata(&self) -> &RuntimeImageMetadata {
-        self.runtime.metadata()
-    }
-
-    #[inline]
-    pub(crate) const fn load_bias(&self) -> TargetAddress {
-        self.runtime.load_bias()
-    }
-
-    #[inline]
-    pub(crate) const fn runtime_entry(&self) -> TargetAddress {
-        self.runtime.runtime_entry()
-    }
-}
-
 /// Immutable session state once every image has crossed the cache and
 /// protection boundary.
-pub struct SealedSessionState {
-    images: Vec<SessionImage<SealedImageState>>,
+pub(crate) struct SealedSessionState {
+    images: Vec<SessionImage>,
     imported: Vec<ImportedImage>,
     /// Recorded scope decision for each relocation.
     bindings: Vec<RelocationBinding>,
@@ -267,99 +200,43 @@ impl<M: ImageMemory + ?Sized> Drop for RollbackGuard<'_, M> {
 
 /// A staged, multi-image link session.
 ///
-/// `S` is one of [`BuildingState`], [`ScopedState`] or [`RelocatedState`]
-/// (and, in , a sealed state). The session owns the dependency graph, the
-/// rollback log and the cross-image resource usage; the trusted [`LoadProfile`],
-/// [`LoadPolicy`] and the single [`ArchRelocator`] are carried so every image
+/// `S` tracks building, frozen scopes, relocation and sealing. The session
+/// owns the dependency graph, rollback log and cross-image resource usage;
+/// the trusted [`LoadProfile`] and single [`ArchRelocator`] ensure every image
 /// reuses the same profile and relocation semantics without re-deriving them.
-pub struct LinkSession<'a, M: ImageMemory + ?Sized, S, A> {
+#[must_use = "dropping a link session aborts its allocations"]
+pub(crate) struct LinkSession<'a, M: ImageMemory + ?Sized, S, A> {
     rollback: RollbackGuard<'a, M>,
     graph: DependencyGraph,
     limits: SessionLimits,
     usage: SessionUsage,
     profile: LoadProfile,
-    policy: LoadPolicy,
     arch: A,
     state: S,
 }
 
-pub type BuildingSession<'a, M, A> = LinkSession<'a, M, BuildingState, A>;
-pub type ScopedSession<'a, M, A> = LinkSession<'a, M, ScopedState, A>;
-pub type RelocatedSession<'a, M, A> = LinkSession<'a, M, RelocatedState, A>;
-pub type SealedSession<'a, M, A> = LinkSession<'a, M, SealedSessionState, A>;
+pub(crate) type BuildingSession<'a, M, A> = LinkSession<'a, M, BuildingState, A>;
+pub(crate) type ScopedSession<'a, M, A> = LinkSession<'a, M, ScopedState, A>;
+pub(crate) type RelocatedSession<'a, M, A> = LinkSession<'a, M, RelocatedState, A>;
+pub(crate) type SealedSession<'a, M, A> = LinkSession<'a, M, SealedSessionState, A>;
 
 /// Multi-image linker configured with a trusted profile, a session budget and
 /// the single [`ArchRelocator`] used by every image in the link.
-pub struct DynamicLinker<A> {
+pub(crate) struct DynamicLinker<A> {
     arch: A,
-    policy: LoadPolicy,
 }
 
 impl<A: ArchRelocator> DynamicLinker<A> {
-    pub fn new(arch: A) -> Self {
-        Self {
-            arch,
-            policy: DYNAMIC_LINK_LOAD_POLICY,
-        }
+    pub(crate) fn new(arch: A) -> Self {
+        Self { arch }
     }
 
-    /// Run a complete link in one call: admit the root, close the dependency
-    /// closure, freeze scopes, relocate, seal, and publish.
-    ///
-    /// This is the convenience wrapper over the staged API; it consumes the
-    /// linker because the single [`ArchRelocator`] is moved through every
-    /// session transition. The `memory` backend must support protection
-    /// (`ImageProtectionMemory`) so the session can reach the seal stage.
-    pub fn link<R, Resolver, Memory, Cache, Publisher>(
-        self,
-        root: ResolvedArtifact<R>,
-        profile: LoadProfile,
-        limits: SessionLimits,
-        resolver: &mut Resolver,
-        memory: &mut Memory,
-        cache: &mut Cache,
-        publisher: &mut Publisher,
-    ) -> LoadResult<LinkProduct<Publisher::Receipt>>
-    where
-        R: ElfReader,
-        Resolver: ArtifactResolver,
-        Memory: ImageProtectionMemory + ?Sized,
-        Cache: CodeCache + ?Sized,
-        Publisher: LinkPublisher,
-    {
-        let mut building = self.begin(root, profile, limits, memory)?;
-        building.close_dependencies(resolver)?;
-        building
-            .freeze_scopes()?
-            .relocate()?
-            .seal(cache)?
-            .publish(publisher)
-    }
-
-    /// Admit the root and open a building session.
-    ///
-    /// The root is always an [`ArtifactRole::ExecutableRoot`]; its reader is
-    /// consumed by the image pipeline and the resulting allocation lease is absorbed
-    /// into the session rollback log before the session is returned.
-    pub fn begin<R, Memory>(
-        self,
-        root: ResolvedArtifact<R>,
-        profile: LoadProfile,
-        limits: SessionLimits,
-        memory: &mut Memory,
-    ) -> LoadResult<BuildingSession<'_, Memory, A>>
-    where
-        R: ElfReader,
-        Memory: ImageMemory + ?Sized,
-    {
-        self.begin_role(root, profile, limits, memory, ArtifactRole::ExecutableRoot)
-    }
-
-    /// Start a runtime shared-object link. A DSO root may have no entry point,
-    /// and may already be initialized in a host-owned namespace or registry.
-    pub fn begin_shared<R, Memory>(
+    /// Begin a session for a scanned root. Newly resolved roots enter the
+    /// image pipeline; published shared roots reuse their pinned descriptor.
+    pub(crate) fn begin<R, Memory>(
         self,
         root: DependencyResolution<R>,
+        role: ArtifactRole,
         profile: LoadProfile,
         limits: SessionLimits,
         memory: &mut Memory,
@@ -368,19 +245,23 @@ impl<A: ArchRelocator> DynamicLinker<A> {
         R: ElfReader,
         Memory: ImageMemory + ?Sized,
     {
+        if self.arch.machine() != profile.machine() || self.arch.class() != profile.class() {
+            return Err(
+                session_error(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
+                    .at_stage(LoadStage::Beginning),
+            );
+        }
         match root {
             DependencyResolution::Load(root) => {
-                self.begin_role(root, profile, limits, memory, ArtifactRole::SharedObject)
+                self.begin_loaded(root, profile, limits, memory, role)
             }
             DependencyResolution::Import(root) => {
-                if self.arch.machine() != profile.machine()
-                    || self.arch.class() != profile.class()
-                    || profile.r#type() != ElfType::Dyn
-                {
+                if role != ArtifactRole::SharedObject {
                     return Err(session_error(
                         LoadErrorKind::UnsupportedByProfile,
                         ErrorContext::None,
-                    ));
+                    )
+                    .at_stage(LoadStage::Beginning));
                 }
                 let (descriptor, ownership) = root.into_parts();
                 let mut graph = DependencyGraph::new(limits);
@@ -403,7 +284,6 @@ impl<A: ArchRelocator> DynamicLinker<A> {
                     limits,
                     usage,
                     profile,
-                    policy: self.policy,
                     arch: self.arch,
                     state: BuildingState {
                         images: Vec::new(),
@@ -421,7 +301,7 @@ impl<A: ArchRelocator> DynamicLinker<A> {
         }
     }
 
-    fn begin_role<R, Memory>(
+    fn begin_loaded<R, Memory>(
         self,
         root: ResolvedArtifact<R>,
         profile: LoadProfile,
@@ -433,26 +313,8 @@ impl<A: ArchRelocator> DynamicLinker<A> {
         R: ElfReader,
         Memory: ImageMemory + ?Sized,
     {
-        if self.arch.machine() != profile.machine() || self.arch.class() != profile.class() {
-            return Err(
-                LoadError::new(LoadErrorKind::UnsupportedByProfile, ErrorContext::None)
-                    .at_stage(LoadStage::Beginning),
-            );
-        }
-        // The link root is always an allocated `ET_DYN` image owned by this
-        // session. A fixed `ET_EXEC` stays on the single-image path,
-        // and a system-candidate root would let an application reserve system
-        // symbol space it cannot own.
-        if profile.r#type() != ElfType::Dyn {
-            return Err(LoadError::new(
-                LoadErrorKind::UnsupportedByProfile,
-                ErrorContext::HeaderField {
-                    field: crate::error::HeaderField::Type,
-                    value: u64::from(profile.r#type()),
-                },
-            )
-            .at_stage(LoadStage::Beginning));
-        }
+        // Executable roots remain session-private. Their inspected ELF type
+        // decides fixed ET_EXEC or movable ET_DYN placement in the same pipeline.
         if !matches!(
             root.ownership(),
             ImageOwnership::SessionPrivate | ImageOwnership::SystemCandidate
@@ -477,7 +339,6 @@ impl<A: ArchRelocator> DynamicLinker<A> {
             reader,
             profile,
             role,
-            self.policy,
             limits.per_image(),
             &mut guard.log,
             &mut *guard.memory,
@@ -516,7 +377,6 @@ impl<A: ArchRelocator> DynamicLinker<A> {
             limits,
             usage,
             profile,
-            policy: self.policy,
             arch: self.arch,
             state: BuildingState {
                 images,
@@ -533,13 +393,16 @@ impl<A: ArchRelocator> DynamicLinker<A> {
 impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
     /// Borrow the host's global scope before discovering the new dependency
     /// closure. No image is relocated or initialized a second time.
-    pub fn import_scope(&mut self, providers: Vec<ImportedImageDescriptor>) -> LoadResult<()> {
+    pub(crate) fn import_scope(
+        &mut self,
+        providers: Vec<ImportedImageDescriptor>,
+    ) -> LoadResult<()> {
         self.import_providers(providers, true)
     }
 
     /// Borrow providers reachable through the new closure without making them
     /// part of the existing global prefix.
-    pub fn import_dependencies(
+    pub(crate) fn import_dependencies(
         &mut self,
         providers: Vec<ImportedImageDescriptor>,
     ) -> LoadResult<()> {
@@ -551,7 +414,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
         providers: Vec<ImportedImageDescriptor>,
         global: bool,
     ) -> LoadResult<()> {
-        if self.state.closed || self.state.poisoned {
+        if self.state.poisoned || (self.state.closed && global) {
             return Err(session_error(LoadErrorKind::BadElf, ErrorContext::None));
         }
         let result = self.add_providers(providers, global);
@@ -602,13 +465,57 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
         Ok(())
     }
 
+    /// Restore edges beneath reused providers from the read-only closure plan.
+    /// Their backing is already linked, but consumers still need the complete
+    /// graph for transitive scopes, SCCs and retention. Discovery has finished,
+    /// so adding these structural edges cannot admit another allocation.
+    pub(crate) fn connect_dependencies(
+        &mut self,
+        connections: &[(ArtifactIdentity, ArtifactIdentity, u16)],
+    ) -> LoadResult<()> {
+        if !self.state.closed || self.state.poisoned {
+            return Err(session_error(LoadErrorKind::BadElf, ErrorContext::None));
+        }
+        for (requester, provider, needed_index) in connections {
+            let requester = self
+                .graph
+                .find_identity(requester)
+                .ok_or_else(|| session_error(LoadErrorKind::BadElf, ErrorContext::None))?;
+            let provider = self
+                .graph
+                .find_identity(provider)
+                .ok_or_else(|| session_error(LoadErrorKind::BadElf, ErrorContext::None))?;
+            if let Some(edge) =
+                self.graph.edges().iter().find(|edge| {
+                    edge.requester() == requester && edge.needed_index() == *needed_index
+                })
+            {
+                // A changed file between scan and mapping must fail rather
+                // than publish a graph disagreeing with the pre-acquired closure.
+                if edge.provider() != provider {
+                    return Err(session_error(LoadErrorKind::BadElf, ErrorContext::None));
+                }
+                continue;
+            }
+            if !matches!(
+                self.graph.node(requester).map(|node| node.ownership()),
+                Some(ImageOwnership::ExternalReady | ImageOwnership::NamespaceReady)
+            ) {
+                return Err(session_error(LoadErrorKind::BadElf, ErrorContext::None));
+            }
+            self.graph
+                .link_existing(requester, provider, *needed_index)?;
+        }
+        Ok(())
+    }
+
     /// Drive the bounded BFS closure until the discovery queue is empty.
     ///
     /// Each resolved dependency is de-duplicated by identity *before* it is
     /// loaded; an already-loaded provider only records an extra edge. A new
     /// artifact runs the load pipeline, is absorbed into the session
     /// rollback log, and its own `DT_NEEDED` are enqueued in encounter order.
-    pub fn close_dependencies<Resolver: ArtifactResolver>(
+    pub(crate) fn close_dependencies<Resolver: ArtifactResolver>(
         &mut self,
         resolver: &mut Resolver,
     ) -> LoadResult<()> {
@@ -639,17 +546,10 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                     .node(requester)
                     .ok_or_else(|| session_error(LoadErrorKind::BadElf, ErrorContext::None))?;
                 let needed = needed_for(&self.state.images, requester, item.needed_index())?;
-                // The resolver sees the full requester context: the
-                // session-local image id, its identity and its ownership — so
-                // package/system resolution can be decided per requester.
-                let request = DependencyRequest::new(
-                    DependencyRequester::new(
-                        requester,
-                        requester_node.artifact(),
-                        requester_node.ownership(),
-                    ),
-                    needed,
-                );
+                // Resolve against the already scanned requester's identity.
+                // File lookup and sharing policy were decided by the backend
+                // while building the complete load plan.
+                let request = DependencyRequest::new(requester_node.artifact(), needed);
                 resolver.resolve(&request).map_err(|error| {
                     error
                         .at_stage(LoadStage::Discover)
@@ -677,7 +577,6 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                         reader,
                         self.profile,
                         ArtifactRole::SharedObject,
-                        self.policy,
                         self.limits.per_image(),
                         &mut self.rollback.log,
                         &mut *self.rollback.memory,
@@ -787,14 +686,13 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
     ///
     /// Consumes the building session; on any error the session is dropped and
     /// every absorbed allocation is aborted in reverse creation order.
-    pub fn freeze_scopes(self) -> LoadResult<ScopedSession<'a, M, A>> {
+    pub(crate) fn freeze_scopes(self) -> LoadResult<ScopedSession<'a, M, A>> {
         let LinkSession {
             rollback,
             graph,
             limits,
             usage,
             profile,
-            policy,
             arch,
             state,
         } = self;
@@ -812,29 +710,8 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                 .at_stage(LoadStage::Scope));
         }
 
-        // The symbol table array is image-id indexed and must include imported
-        // Ready images at their graph-assigned positions, so a lookup
-        // into an imported provider resolves against its retained export table.
-        let mut symbols = Vec::new();
-        symbols
-            .try_reserve_exact(images.len() + imported.len())
-            .map_err(|_| scope_session_oom())?;
-        let mut tables: Vec<Option<&SymbolTable>> = Vec::new();
-        tables
-            .try_reserve_exact(images.len() + imported.len())
-            .map_err(|_| scope_session_oom())?;
-        tables.resize_with(images.len() + imported.len(), || None);
-        for image in &images {
-            tables[image.image_id.get() as usize] = Some(image.state.metadata().symbols());
-        }
-        for imported in &imported {
-            tables[imported.image_id.get() as usize] = Some(imported.descriptor().exports());
-        }
-        for table in tables {
-            symbols.push(table.ok_or_else(|| {
-                LoadError::new(LoadErrorKind::BadElf, ErrorContext::None).at_stage(LoadStage::Scope)
-            })?);
-        }
+        // Freezing scopes only needs graph structure. Symbol tables are
+        // indexed and checked when relocation consumes the frozen scope.
         let scopes = if scope_prefix.is_empty() {
             ScopeSet::freeze(&graph)
         } else {
@@ -848,7 +725,6 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
             limits,
             usage,
             profile,
-            policy,
             arch,
             state: ScopedState {
                 images,
@@ -865,14 +741,9 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
     /// Consumes the scoped session; every decoded relocation record is
     /// preflighted and applied against the frozen scopes. On any error the
     /// session is dropped and all absorbed allocations aborted.
-    pub fn relocate(mut self) -> LoadResult<RelocatedSession<'a, M, A>> {
+    pub(crate) fn relocate(mut self) -> LoadResult<RelocatedSession<'a, M, A>> {
         let image_count = self.state.images.len();
         let total_images = image_count + self.state.imported.len();
-        let mut relocated_images = Vec::new();
-        relocated_images
-            .try_reserve_exact(image_count)
-            .map_err(|_| link_relocation_oom())?;
-
         // Both arrays are image-id indexed over every admitted image — loaded
         // and imported — because relocation resolves a symbol's owner
         // id back into them. `symbols` supplies each imported provider's
@@ -884,14 +755,14 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             .try_reserve_exact(total_images)
             .map_err(|_| link_relocation_oom())?;
         symbol_slots.resize_with(total_images, || None);
-        let mut relocation_slots: Vec<Option<RelocationImage<'_>>> = Vec::new();
-        relocation_slots
+        let mut relocation_images: Vec<Option<RelocationImage<'_>>> = Vec::new();
+        relocation_images
             .try_reserve_exact(total_images)
             .map_err(|_| link_relocation_oom())?;
-        relocation_slots.resize_with(total_images, || None);
+        relocation_images.resize_with(total_images, || None);
         for image in &self.state.images {
             symbol_slots[image.image_id.get() as usize] = Some(image.state.metadata().symbols());
-            relocation_slots[image.image_id.get() as usize] = Some(RelocationImage::new(
+            relocation_images[image.image_id.get() as usize] = Some(RelocationImage::new(
                 image.image_id,
                 image.allocation,
                 image.state.regions(),
@@ -913,12 +784,6 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
                     .at_stage(LoadStage::LinkRelocate)
             })?);
         }
-        let mut relocation_images = Vec::new();
-        relocation_images
-            .try_reserve_exact(total_images)
-            .map_err(|_| link_relocation_oom())?;
-        relocation_images.extend(relocation_slots);
-
         // The provider-region array is image-id indexed over every admitted
         // image, loaded and imported, so a symbol resolved into an
         // imported provider is range-checked against the same facts a fresh
@@ -950,7 +815,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             provider_regions[imported.image_id.get() as usize] = regions;
         }
 
-        let policy = RelocationPolicy::for_profile(&self.profile);
+        let policy = RelocationTypeSet::for_profile(&self.profile);
         let operations = relocate::run(
             &self.arch,
             &symbols,
@@ -968,7 +833,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
 
         // Record every relocation's scope decision:
         // requester, symbol name and winning provider — into the published
-        // snapshot before any state is rewrapped.
+        // snapshot before moving into the next session state.
         let bindings = record_bindings(&operations, &symbols, &self.limits, &mut self.usage)?;
 
         drop(relocation_images);
@@ -979,25 +844,17 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> ScopedSession<'a, M, A> {
             imported,
             scopes: _,
         } = self.state;
-        // Rewrap the decoded state so a second relocation is unrepresentable.
-        // Frozen scopes have served their only purpose and are dropped here.
-        for image in images {
-            relocated_images.push(SessionImage {
-                image_id: image.image_id,
-                allocation: image.allocation,
-                state: RelocatedImageState(image.state),
-            });
-        }
+        // Consuming ScopedState prevents a second relocation; image storage
+        // moves unchanged into the next session state.
         Ok(LinkSession {
             rollback: self.rollback,
             graph: self.graph,
             limits: self.limits,
             usage: self.usage,
             profile: self.profile,
-            policy: self.policy,
             arch: self.arch,
             state: RelocatedState {
-                images: relocated_images,
+                images,
                 imported,
                 bindings,
             },
@@ -1011,7 +868,7 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
     /// Every logical seal plan, backend protection plan and executable range
     /// is prepared before the first cache/protection mutation. Publication is
     /// available only on the returned [`SealedSession`].
-    pub fn seal<C: CodeCache + ?Sized>(
+    pub(crate) fn seal<C: CodeCache + ?Sized>(
         mut self,
         cache: &mut C,
     ) -> LoadResult<SealedSession<'a, M, A>> {
@@ -1025,7 +882,7 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
                     .filter(|segment| {
                         segment
                             .permissions()
-                            .contains(crate::MemoryPermissions::EXECUTE)
+                            .contains(crate::memory_mapper::MemoryPermissions::EXECUTE)
                             && segment.memory_size() != 0
                     })
                     .count();
@@ -1043,17 +900,8 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
         prepared_seals
             .try_reserve_exact(image_count)
             .map_err(|_| link_seal_oom())?;
-        let mut sealed_images = Vec::new();
-        sealed_images
-            .try_reserve_exact(image_count)
-            .map_err(|_| link_seal_oom())?;
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(image_count)
-            .map_err(|_| link_seal_oom())?;
-
         for image in &self.state.images {
-            let runtime = &image.state.0;
+            let runtime = &image.state;
             let allocation = image.allocation.allocation();
             let seal_plan = SealPlan::build(
                 &allocation,
@@ -1073,31 +921,16 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
             )
             .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
 
-            let executable_count = runtime
-                .load_segments()
-                .iter()
-                .filter(|segment| {
-                    segment
-                        .permissions()
-                        .contains(crate::MemoryPermissions::EXECUTE)
-                        && segment.memory_size() != 0
-                })
-                .count();
-            let mut image_executable_ranges = Vec::new();
-            image_executable_ranges
-                .try_reserve_exact(executable_count)
-                .map_err(|_| link_seal_oom())?;
             for (segment, region) in runtime.load_segments().iter().zip(runtime.regions().iter()) {
                 if segment
                     .permissions()
-                    .contains(crate::MemoryPermissions::EXECUTE)
+                    .contains(crate::memory_mapper::MemoryPermissions::EXECUTE)
                     && !region.runtime_range().is_empty()
                 {
-                    image_executable_ranges.push(region.runtime_range());
                     executable_ranges.push(region.runtime_range());
                 }
             }
-            prepared_seals.push((seal_plan, prepared, image_executable_ranges));
+            prepared_seals.push(prepared);
         }
 
         let requirements = cache.requirements();
@@ -1115,9 +948,7 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
         cache_sync
             .validate_completion(&executable_ranges, cache_scope, cache_maintenance)
             .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
-        for (image, (seal_plan, prepared, image_executable_ranges)) in
-            self.state.images.iter().zip(prepared_seals.into_iter())
-        {
+        for (image, prepared) in self.state.images.iter().zip(prepared_seals.into_iter()) {
             let allocation = image.allocation.allocation();
             let mut protection_records = prepared.into_ranges();
             self.rollback
@@ -1128,19 +959,6 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
                 .memory
                 .apply_protection(&allocation, ProtectionBatch::new(&mut protection_records))
                 .map_err(|error| error.at_stage(LoadStage::LinkSeal))?;
-            let image_cache_sync = CacheSyncOutcome::from_synchronized_ranges(
-                image_executable_ranges,
-                cache_scope,
-                cache_maintenance,
-            );
-            sealed_images.push(SealedState::new(
-                image.state.load_bias(),
-                image.state.runtime_entry(),
-                image.state.0.canonical_runtime_entry(),
-                image_cache_sync,
-                seal_plan,
-                AppliedProtectionSet::new(protection_records),
-            ));
         }
 
         let RelocatedState {
@@ -1148,29 +966,15 @@ impl<'a, M: ImageProtectionMemory + ?Sized, A: ArchRelocator> RelocatedSession<'
             imported,
             bindings,
         } = self.state;
-        let mut images = images.into_iter();
-        let mut sealed_states = sealed_images.into_iter();
-        while let (Some(image), Some(sealed)) = (images.next(), sealed_states.next()) {
-            output.push(SessionImage {
-                image_id: image.image_id,
-                allocation: image.allocation,
-                state: SealedImageState {
-                    runtime: image.state.0,
-                    sealed,
-                },
-            });
-        }
-
         Ok(LinkSession {
             rollback: self.rollback,
             graph: self.graph,
             limits: self.limits,
             usage: self.usage,
             profile: self.profile,
-            policy: self.policy,
             arch: self.arch,
             state: SealedSessionState {
-                images: output,
+                images,
                 imported,
                 bindings,
             },
@@ -1185,7 +989,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
     /// session memory backend and validates each non-sentinel function target
     /// against its owner's executable region (and Thumb bit on ARM). The plans
     /// only *name* targets — nothing here calls a constructor.
-    pub fn build_lifecycle_plans(&self) -> LoadResult<LifecyclePlans> {
+    pub(crate) fn build_lifecycle_plans(&self) -> LoadResult<LifecyclePlans> {
         let mut images = Vec::new();
         images
             .try_reserve_exact(self.state.images.len())
@@ -1210,7 +1014,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
     /// uses the root's runtime entry computed during mapping. The
     /// result holds no lease: it is the pure description the host publisher
     /// validates in `prepare_batch` before the committed snapshot is swapped.
-    pub fn prepare_link_manifest(&self) -> LoadResult<PreparedLinkManifest> {
+    pub(crate) fn prepare_link_manifest(&self) -> LoadResult<PreparedLinkManifest> {
         let total = self.state.images.len() + self.state.imported.len();
         // Image-id indexed: the root and every loaded image contribute a
         // `Loaded` entry, and every imported Ready image a `Imported` entry at
@@ -1256,7 +1060,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
     /// `prepare_batch` failure the session drops and aborts every absorbed
     /// allocation; after a successful commit the rollback log is empty and the
     /// publisher's `Receipt` is the long-term owner of the committed images.
-    pub fn publish<P: LinkPublisher>(
+    pub(crate) fn publish<P: LinkPublisher>(
         self,
         publisher: &mut P,
     ) -> LoadResult<LinkProduct<P::Receipt>> {
@@ -1279,10 +1083,9 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         let LinkSession {
             mut rollback,
             graph,
-            limits: _,
-            usage: _,
+            limits,
+            usage,
             profile: _,
-            policy: _,
             arch: _,
             state,
         } = self;
@@ -1301,9 +1104,8 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
                 LoadError::new(LoadErrorKind::BadElf, ErrorContext::None)
                     .at_stage(LoadStage::Publish)
             })?;
-            let SealedImageState { runtime, sealed: _ } = image.state;
             let (regions, load_segments, load_bias, program_headers, symbols) =
-                runtime.into_publish_parts();
+                image.state.into_publish_parts();
             let ownership = node.ownership();
             let descriptor = Arc::new(
                 PublishedImageDescriptor::from_node_and_state(
@@ -1340,6 +1142,14 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         }
 
         let context = LinkContext::new(graph, committed);
+        let extra_metadata = publisher
+            .prepare_metadata(&context, &plans, &bindings)
+            .map_err(|error| error.at_stage(LoadStage::Publish))?;
+        let metadata_bytes = usage
+            .runtime_metadata_bytes
+            .checked_add(extra_metadata)
+            .ok_or_else(session_overflow)?;
+        limits.check_total_runtime_metadata_bytes(metadata_bytes)?;
         let prepared = publisher
             .prepare_batch(&manifest)
             .map_err(|error| error.at_stage(LoadStage::Publish))?;
@@ -1357,14 +1167,13 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
     }
 }
 
-/// Run the single-image – pipeline on `reader` under `profile`/`role`, then
+/// Parse, map and decode one image under `profile`/`role`, then
 /// transfer the resulting allocation lease into the session rollback log and
 /// return the decoded runtime state.
 fn load_runtime<R, Memory>(
     reader: R,
     profile: LoadProfile,
     role: ArtifactRole,
-    policy: LoadPolicy,
     limits: &LoadLimits,
     rollback: &mut AllocationRollbackLog,
     memory: &mut Memory,
@@ -1376,13 +1185,12 @@ where
     let request = LoadRequest::new(profile, *limits);
     let decoded = ImageLoader::new(reader, request)
         .admit()?
-        .inspect_with_policy(policy)
         .with_role(role)
         .inspect()?
         .plan()?
         .allocate(memory)?
         .map()?
-        .decode_with_policy(policy)?;
+        .decode()?;
     absorb_into_session(decoded, rollback)
 }
 
@@ -1455,7 +1263,7 @@ fn imported_metadata_bytes(descriptor: &PublishedImageDescriptor) -> LoadResult<
 }
 
 fn needed_for(
-    images: &[SessionImage<RuntimeImageState>],
+    images: &[SessionImage],
     requester: ImageId,
     needed_index: u16,
 ) -> LoadResult<&DependencyName> {
@@ -1540,17 +1348,11 @@ fn record_bindings(
             ),
         };
         // Fixed overhead per binding plus the copied name bytes.
-        let bytes = 24u64
+        let bytes = (core::mem::size_of::<RelocationBinding>() as u64)
             .checked_add(name.len() as u64)
             .ok_or_else(session_overflow)?;
         usage.record_relocation_bindings(bytes, limits)?;
-        bindings.push(RelocationBinding::new(
-            operation.owner(),
-            name,
-            provider,
-            operation.kind(),
-            record.offset(),
-        ));
+        bindings.push(RelocationBinding::new(operation.owner(), name, provider));
     }
     Ok(bindings)
 }

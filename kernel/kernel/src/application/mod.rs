@@ -13,44 +13,41 @@
 // limitations under the License.
 
 //! Dynamic application loading: platform adapters that bind the loader's
-//! neutral contracts (`ElfReader`, `ArtifactResolver`, `ImageMemory`, …) to
+//! contracts (`LoaderBackend`, `ElfReader`, `ImageMemory`) to
 //! the kernel's VFS, memory and cache services.
 //!
-//! A launch freezes an [`namespace::ApplicationNamespace`], then
-//! [`planner::NamespaceLoadPlanner`] scans the actual VFS ELF closure and
-//! resolves each dependency to a concrete path. The resolver atomically
-//! acquires that plan's system-library keys before the linker maps anything;
-//! private images stay group-owned while system images are published through
-//! [`registry::SystemDsoRegistry`]. Manager/group/start-storage/reaper modules
-//! own the remaining execution and lifecycle state.
+//! A launch freezes an [`namespace::ApplicationNamespace`] and calls the
+//! loader's complete-load interface through kernel platform services.
+//! The loader owns dependency traversal and linking; the registry, thread
+//! groups, runtime namespace and reaper own execution and resource lifetimes.
 
 /// The board policy's dynamic-application profile: the single place
 /// where the board ABI decides which loader profile an application links with.
 /// ARM float calling conventions follow the target ABI, independently of the
 /// CPU generation.
 #[cfg(all(target_arch = "arm", target_feature = "mclass", target_abi = "eabi"))]
-pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
-    blueos_loader::LoadProfile::arm_thumb_soft_float(blueos_loader::ElfType::Dyn)
+pub fn board_dynamic_profile() -> blueos_loader::profile::LoadProfile {
+    blueos_loader::profile::LoadProfile::arm_thumb_soft_float()
 }
 
 #[cfg(all(target_arch = "arm", target_feature = "mclass", target_abi = "eabihf"))]
-pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
-    blueos_loader::LoadProfile::arm_thumb_hard_float(blueos_loader::ElfType::Dyn)
+pub fn board_dynamic_profile() -> blueos_loader::profile::LoadProfile {
+    blueos_loader::profile::LoadProfile::arm_thumb_hard_float()
 }
 
 #[cfg(target_arch = "riscv32")]
-pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
-    blueos_loader::LoadProfile::riscv32(blueos_loader::ElfType::Dyn)
+pub fn board_dynamic_profile() -> blueos_loader::profile::LoadProfile {
+    blueos_loader::profile::LoadProfile::riscv32()
 }
 
 #[cfg(target_arch = "riscv64")]
-pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
-    blueos_loader::LoadProfile::riscv64(blueos_loader::ElfType::Dyn)
+pub fn board_dynamic_profile() -> blueos_loader::profile::LoadProfile {
+    blueos_loader::profile::LoadProfile::riscv64()
 }
 
 #[cfg(target_arch = "aarch64")]
-pub fn board_dynamic_profile() -> blueos_loader::LoadProfile {
-    blueos_loader::LoadProfile::aarch64(blueos_loader::ElfType::Dyn)
+pub fn board_dynamic_profile() -> blueos_loader::profile::LoadProfile {
+    blueos_loader::profile::LoadProfile::aarch64()
 }
 
 pub mod adapters;
@@ -59,7 +56,6 @@ pub mod group;
 pub mod loader;
 pub mod manager;
 pub mod namespace;
-pub mod planner;
 pub mod publication;
 pub mod reaper;
 pub mod registry;

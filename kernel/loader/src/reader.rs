@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage};
+//! Positional ELF reads supplied by a kernel or another artifact source.
+
+use crate::LoadResult;
 
 pub trait ElfReader {
     fn len(&self) -> LoadResult<u64>;
@@ -23,79 +25,4 @@ pub trait ElfReader {
     }
 
     fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> LoadResult<()>;
-}
-
-pub(crate) struct SliceElfReader<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> SliceElfReader<'a> {
-    #[inline]
-    pub const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes }
-    }
-}
-
-impl ElfReader for SliceElfReader<'_> {
-    fn len(&self) -> LoadResult<u64> {
-        u64::try_from(self.bytes.len())
-            .map_err(|_| LoadError::new(LoadErrorKind::IntegerOverflow, ErrorContext::None))
-    }
-
-    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> LoadResult<()> {
-        let file_len = self.len()?;
-        let len = u64::try_from(dst.len()).map_err(|_| {
-            LoadError::new(
-                LoadErrorKind::IntegerOverflow,
-                ErrorContext::FileRange {
-                    offset,
-                    len: u64::MAX,
-                    file_len,
-                },
-            )
-        })?;
-        let end = offset.checked_add(len).ok_or_else(|| {
-            LoadError::new(
-                LoadErrorKind::IntegerOverflow,
-                ErrorContext::FileRange {
-                    offset,
-                    len,
-                    file_len,
-                },
-            )
-        })?;
-        if end > file_len {
-            return Err(LoadError::new(
-                LoadErrorKind::OutOfBounds,
-                ErrorContext::FileRange {
-                    offset,
-                    len,
-                    file_len,
-                },
-            ));
-        }
-
-        let start = usize::try_from(offset).map_err(|_| {
-            LoadError::new(
-                LoadErrorKind::OutOfBounds,
-                ErrorContext::FileRange {
-                    offset,
-                    len,
-                    file_len,
-                },
-            )
-        })?;
-        let end = usize::try_from(end).map_err(|_| {
-            LoadError::new(
-                LoadErrorKind::OutOfBounds,
-                ErrorContext::FileRange {
-                    offset,
-                    len,
-                    file_len,
-                },
-            )
-        })?;
-        dst.copy_from_slice(&self.bytes[start..end]);
-        Ok(())
-    }
 }

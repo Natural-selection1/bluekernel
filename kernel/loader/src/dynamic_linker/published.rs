@@ -37,9 +37,10 @@ use crate::{
         SymbolVisibility,
     },
     elf::LoadSegmentInfo,
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult},
+    error::{ErrorContext, LoadErrorKind},
     image::LoadedRegion,
-    MemoryPermissions,
+    memory_mapper::MemoryPermissions,
+    LoadError, LoadResult,
 };
 
 /// One published runtime region of a Ready image, sufficient for control-flow
@@ -74,7 +75,7 @@ impl PublishedRegion {
 /// resolve symbols against it without re-decoding the image.
 ///
 /// The inner table is kept crate-private: only the loader performs lookups.
-pub struct PublishedSymbolTable {
+pub(crate) struct PublishedSymbolTable {
     table: SymbolTable,
 }
 
@@ -87,13 +88,6 @@ impl PublishedSymbolTable {
     #[inline]
     pub(crate) const fn table(&self) -> &SymbolTable {
         &self.table
-    }
-
-    /// Owned metadata bytes retained by the export surface, charged against
-    /// `SessionLimits::total_runtime_metadata_bytes` when imported.
-    #[inline]
-    pub fn metadata_bytes(&self) -> u64 {
-        self.table.metadata_bytes()
     }
 }
 
@@ -221,11 +215,6 @@ impl ImportedImageDescriptor {
             descriptor,
             ownership: ImageOwnership::NamespaceReady,
         }
-    }
-
-    #[inline]
-    pub fn descriptor(&self) -> &PublishedImageDescriptor {
-        self.descriptor.as_ref()
     }
 
     #[inline]

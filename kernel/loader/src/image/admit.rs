@@ -27,15 +27,16 @@ use crate::{
     address::{FileRange, TargetAddress, TargetRange},
     dynamic_linker::{ArtifactRole, ProgramHeaderGeometry},
     elf::{DynamicSegmentInfo, ElfHeaderInfo, LoadSegmentInfo, ProgramHeaderInfo},
-    error::{ErrorContext, LoadError, LoadErrorKind, LoadResult, LoadStage, ProgramHeaderField},
-    identity::{ElfMachine, LoadPolicy, LoadRequest, SINGLE_IMAGE_LOAD_POLICY},
+    error::{ErrorContext, LoadErrorKind, LoadStage, ProgramHeaderField},
     image::{
         features::validate_dynamic_features,
         inspect::{InspectedImage, StackKind},
         DynamicFeatureSummary,
     },
+    memory_mapper::MemoryPermissions,
+    profile::{supports_segment_permissions, ElfMachine, ElfType, LoadRequest},
     reader::ElfReader,
-    MemoryPermissions,
+    LoadError, LoadResult,
 };
 
 /// A dependency shared object without a `PT_DYNAMIC` has nowhere to keep its
@@ -57,8 +58,7 @@ pub(crate) struct AdmittedImage<R: ElfReader> {
     header: ElfHeaderInfo,
     request: LoadRequest,
     file_len: u64,
-    policy: LoadPolicy,
-    role: ArtifactRole,
+    role: Option<ArtifactRole>,
 }
 
 impl<R: ElfReader> AdmittedImage<R> {
@@ -74,19 +74,8 @@ impl<R: ElfReader> AdmittedImage<R> {
             header,
             request,
             file_len,
-            policy: SINGLE_IMAGE_LOAD_POLICY,
-            role: ArtifactRole::ExecutableRoot,
+            role: Some(ArtifactRole::ExecutableRoot),
         }
-    }
-
-    /// Override the policy used by `inspect`/`plan` and later decode. The
-    /// public `prepare_image`/`load_elf` entry stays on [`SINGLE_IMAGE_LOAD_POLICY`];
-    /// only the crate-internal `DynamicLinker` may pass
-    /// [`crate::identity::DYNAMIC_LINK_LOAD_POLICY`].
-    #[inline]
-    pub(crate) fn inspect_with_policy(mut self, policy: LoadPolicy) -> Self {
-        self.policy = policy;
-        self
     }
 
     /// Mark this artifact as a shared object rather than the executable root.
@@ -94,7 +83,13 @@ impl<R: ElfReader> AdmittedImage<R> {
     /// still requires a `PT_DYNAMIC` (checked during `inspect`).
     #[inline]
     pub(crate) const fn with_role(mut self, role: ArtifactRole) -> Self {
-        self.role = role;
+        self.role = Some(role);
+        self
+    }
+
+    /// Infer the root role from the ELF rather than a caller-selected mode.
+    pub(crate) const fn infer_role(mut self) -> Self {
+        self.role = None;
         self
     }
 
@@ -151,7 +146,7 @@ impl<R: ElfReader> AdmittedImage<R> {
                         .at_stage(LoadStage::Inspect));
                     }
                     let permissions = permissions_from_flags(program_header.flags());
-                    if !self.policy.allows_segment_permissions(permissions) {
+                    if !supports_segment_permissions(permissions) {
                         return Err(LoadError::new(
                             LoadErrorKind::UnsupportedByProfile,
                             ErrorContext::ProgramHeader {
@@ -296,21 +291,19 @@ impl<R: ElfReader> AdmittedImage<R> {
                 PT_ARM_EXIDX if self.header.machine() == ElfMachine::Arm => {}
                 PT_RISCV_ATTRIBUTES if self.header.machine() == ElfMachine::Riscv => {}
                 t => {
-                    if !self.policy.allows_unknown_program_headers() {
-                        return Err(LoadError::new(
-                            LoadErrorKind::UnsupportedByProfile,
-                            ErrorContext::ProgramHeader {
-                                index,
-                                field: ProgramHeaderField::UnknownField,
-                                value: t.into(),
-                            },
-                        )
-                        .at_stage(LoadStage::Inspect));
-                    }
+                    return Err(LoadError::new(
+                        LoadErrorKind::UnsupportedByProfile,
+                        ErrorContext::ProgramHeader {
+                            index,
+                            field: ProgramHeaderField::UnknownField,
+                            value: t.into(),
+                        },
+                    )
+                    .at_stage(LoadStage::Inspect));
                 }
             }
         }
-        if !self.policy.allows_executable_stack() && stack == StackKind::Executable {
+        if stack == StackKind::Executable {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::ProgramHeader {
@@ -321,7 +314,7 @@ impl<R: ElfReader> AdmittedImage<R> {
             )
             .at_stage(LoadStage::Inspect));
         }
-        if !self.policy.allows_interpreter() && interpreter.is_some() {
+        if interpreter.is_some() {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::ProgramHeader {
@@ -332,7 +325,7 @@ impl<R: ElfReader> AdmittedImage<R> {
             )
             .at_stage(LoadStage::Inspect));
         }
-        if !self.policy.allows_tls() && tls.is_some() {
+        if tls.is_some() {
             return Err(LoadError::new(
                 LoadErrorKind::UnsupportedByProfile,
                 ErrorContext::ProgramHeader {
@@ -356,17 +349,43 @@ impl<R: ElfReader> AdmittedImage<R> {
             Some(dynamic) => validate_dynamic_features(
                 &self.reader,
                 dynamic,
-                self.policy,
                 self.header.class(),
                 self.header.endian(),
                 self.request.limits(),
             )
             .map_err(|error| error.at_stage(LoadStage::Inspect))?,
-            None if self.role == ArtifactRole::SharedObject => {
-                return Err(missing_dynamic_error().at_stage(LoadStage::Inspect));
-            }
             None => DynamicFeatureSummary::empty(),
         };
+
+        // ET_EXEC and an explicitly marked PIE are executable roots. Older
+        // PIE toolchains may omit DF_1_PIE; a SONAME-less root with an entry
+        // still supplies an executable entry. A DSO with no entry needs no
+        // caller-selected shared mode.
+        let role = self.role.unwrap_or_else(|| {
+            if self.header.r#type() == ElfType::Exec
+                || summary.is_pie()
+                || (self.header.entry() != 0 && summary.soname().is_none())
+            {
+                ArtifactRole::ExecutableRoot
+            } else {
+                ArtifactRole::SharedObject
+            }
+        });
+        if role == ArtifactRole::SharedObject {
+            if self.header.r#type() != ElfType::Dyn || summary.is_pie() {
+                return Err(LoadError::new(
+                    LoadErrorKind::UnsupportedByProfile,
+                    ErrorContext::HeaderField {
+                        field: crate::error::HeaderField::Type,
+                        value: u64::from(self.header.r#type()),
+                    },
+                )
+                .at_stage(LoadStage::Inspect));
+            }
+            if dynamic.is_none() {
+                return Err(missing_dynamic_error().at_stage(LoadStage::Inspect));
+            }
+        }
 
         // GNU ld does not necessarily emit PT_PHDR for a PIE even when the
         // program-header table is part of a mapped PT_LOAD. In that common
@@ -395,13 +414,10 @@ impl<R: ElfReader> AdmittedImage<R> {
             dynamic,
             relro,
             stack,
-            interpreter,
-            tls,
             summary,
             phdr_geometry,
         )
-        .with_policy(self.policy)
-        .with_role(self.role))
+        .with_role(role))
     }
 }
 
