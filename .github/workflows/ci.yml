@@ -16,10 +16,12 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+    types: [checks_requested]
 permissions:
   contents: read
 concurrency:
-  group: pr-ci-${{ github.event.pull_request.number }}
+  group: blueos-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
   static-checks:
@@ -38,7 +40,7 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Check changed files
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.sha }}
         run: |
           python3 tools/ci/check_changes.py \
