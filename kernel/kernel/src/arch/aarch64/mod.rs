@@ -118,8 +118,10 @@ macro_rules! enter_el1 {
         adrp x2, {cont}
         add x2, x2, :lo12:{cont}
         add x2, x2, x12
-        // adr is PC-relative
-        adr x3, {entry}
+        // Keep the EL1 trampoline address PC-relative at the physical alias.
+        // ADR's +/-1 MiB range is too small for larger debug/test images.
+        adrp x3, {entry}
+        add x3, x3, :lo12:{entry}
         msr elr_el2, x3
         eret
         "
