@@ -15,20 +15,19 @@
 use crate::{
     address::TargetAddress,
     dynamic_linker::{
-        ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyGraph, DependencyRequest,
-        DependencyResolution, DynamicLinker, ImageOwnership, ImportedImageDescriptor,
-        ProgramHeaderRuntimeInfo, PublishedImageDescriptor, PublishedLoadSnapshot,
-        ResolvedArtifact, ScopeSet, SessionUsage, SymbolTable,
+        ArtifactIdentity, ArtifactRole, DependencyGraph, DependencyResolution, DynamicLinker,
+        ImageOwnership, ImportedImageDescriptor, ProgramHeaderRuntimeInfo,
+        PublishedImageDescriptor, PublishedLoadSnapshot, ResolvedArtifact, ScopeSet, SessionUsage,
+        SymbolTable,
     },
     error::LoadErrorKind,
-    profile::{ElfClass, ElfData, LoadLimits, LoadProfile, SessionLimits},
-    relocation::Riscv64Relocator,
-    tests::fixture::{ElfFixtureBuilder, RecordingMemory, SliceElfReader},
-    LoadResult,
+    profile::{ElfClass, ElfData, LoadLimits, SessionLimits},
+    tests::fixture::{
+        native_fixture_builder, NativeRelocator, NoDependencies, SharedMemory, SliceElfReader,
+        NATIVE_PROFILE,
+    },
 };
-use alloc::{rc::Rc, sync::Arc, vec::Vec};
-use core::cell::RefCell;
-use goblin::elf::header::{EM_RISCV, ET_DYN};
+use alloc::{sync::Arc, vec::Vec};
 
 use blueos_test_macro::test;
 
@@ -77,53 +76,41 @@ fn descriptor(name: &[u8], table: SymbolTable) -> Arc<PublishedImageDescriptor> 
             TargetAddress::new(0),
             ProgramHeaderRuntimeInfo::from_headers(0, 0, None, TargetAddress::new(0)).unwrap(),
             table,
-            PublishedLoadSnapshot::new(
-                LoadProfile::riscv64(),
-                ArtifactRole::SharedObject,
-                Vec::new(),
-            ),
+            PublishedLoadSnapshot::new(NATIVE_PROFILE, ArtifactRole::SharedObject, Vec::new()),
         )
         .unwrap(),
     )
 }
 
-struct NoDependencies;
-impl ArtifactResolver for NoDependencies {
-    type Reader = SliceElfReader<'static>;
-    fn resolve(
-        &mut self,
-        _: &DependencyRequest<'_>,
-    ) -> LoadResult<DependencyResolution<Self::Reader>> {
-        panic!("an already-published empty closure must not call its resolver")
-    }
-}
-
 #[test]
 fn runtime_shared_root_accepts_zero_entry_without_weakening_executable_admission() {
-    let bytes = ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN)
+    // PT_DYNAMIC follows two program headers. PT_LOAD starts at the ELF
+    // header's end, so the dynamic table is two native phdr widths beyond it.
+    let dynamic_vaddr = match NATIVE_PROFILE.class() {
+        ElfClass::Elf32 => 0x1040,
+        ElfClass::Elf64 => 0x1070,
+    };
+    let bytes = native_fixture_builder()
         .with_load_segment(0x1000, 0x200, 0x200, 4)
-        // ELF64 headers put DT_NULL at file offset 176, 112 bytes after
-        // the load segment's file offset 64.
-        .with_dynamic_segment(0x1070)
+        .with_dynamic_segment(dynamic_vaddr)
         .build();
-    let sink = Rc::new(RefCell::new(None));
-    let mut memory = RecordingMemory::new(sink.clone());
-    let executable = DynamicLinker::new(Riscv64Relocator).begin(
+    let mut memory = SharedMemory::new(true);
+    let executable = DynamicLinker::new(NativeRelocator).begin(
         DependencyResolution::Load(ResolvedArtifact::new(
             identity(b"app"),
             ImageOwnership::SessionPrivate,
             SliceElfReader::new(&bytes),
         )),
         ArtifactRole::ExecutableRoot,
-        LoadProfile::riscv64(),
+        NATIVE_PROFILE,
         SessionLimits::DEFAULT,
         &mut memory,
     );
     assert!(executable.is_err());
     drop(executable);
-    assert!(RecordingMemory::recorded(&sink).is_none());
+    assert_eq!(memory.allocations.get(), 0);
 
-    let mut shared = DynamicLinker::new(Riscv64Relocator)
+    let mut shared = DynamicLinker::new(NativeRelocator)
         .begin(
             DependencyResolution::Load(ResolvedArtifact::new(
                 identity(b"dso"),
@@ -131,7 +118,7 @@ fn runtime_shared_root_accepts_zero_entry_without_weakening_executable_admission
                 SliceElfReader::new(&bytes),
             )),
             ArtifactRole::SharedObject,
-            LoadProfile::riscv64(),
+            NATIVE_PROFILE,
             SessionLimits::DEFAULT,
             &mut memory,
         )
@@ -139,18 +126,18 @@ fn runtime_shared_root_accepts_zero_entry_without_weakening_executable_admission
     shared.close_dependencies(&mut NoDependencies).unwrap();
     let relocated = shared.freeze_scopes().unwrap().relocate().unwrap();
     drop(relocated);
-    assert!(RecordingMemory::recorded(&sink).is_some());
+    assert_eq!(memory.allocations.get(), 1);
+    assert!(memory.mappers.borrow().is_empty());
 }
 
 #[test]
 fn runtime_imported_root_and_duplicate_scope_do_not_allocate_backings() {
     let provider = descriptor(b"ready", SymbolTable::empty());
-    let sink = Rc::new(RefCell::new(None));
-    let mut memory = RecordingMemory::new(sink.clone());
-    let executable = DynamicLinker::new(Riscv64Relocator).begin::<SliceElfReader<'static>, _>(
+    let mut memory = SharedMemory::new(true);
+    let executable = DynamicLinker::new(NativeRelocator).begin::<SliceElfReader<'static>, _>(
         DependencyResolution::Import(ImportedImageDescriptor::namespace(provider.clone())),
         ArtifactRole::ExecutableRoot,
-        LoadProfile::riscv64(),
+        NATIVE_PROFILE,
         SessionLimits::DEFAULT,
         &mut memory,
     );
@@ -158,12 +145,12 @@ fn runtime_imported_root_and_duplicate_scope_do_not_allocate_backings() {
         .err()
         .expect("an executable root must be newly loaded");
     assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
-    assert!(RecordingMemory::recorded(&sink).is_none());
-    let mut shared = DynamicLinker::new(Riscv64Relocator)
+    assert_eq!(memory.allocations.get(), 0);
+    let mut shared = DynamicLinker::new(NativeRelocator)
         .begin::<SliceElfReader<'static>, _>(
             DependencyResolution::Import(ImportedImageDescriptor::namespace(provider.clone())),
             ArtifactRole::SharedObject,
-            LoadProfile::riscv64(),
+            NATIVE_PROFILE,
             SessionLimits::DEFAULT,
             &mut memory,
         )
@@ -176,7 +163,7 @@ fn runtime_imported_root_and_duplicate_scope_do_not_allocate_backings() {
         .unwrap();
     shared.close_dependencies(&mut NoDependencies).unwrap();
     drop(shared.freeze_scopes().unwrap().relocate().unwrap());
-    assert!(RecordingMemory::recorded(&sink).is_none());
+    assert_eq!(memory.allocations.get(), 0);
 }
 
 #[test]
@@ -193,16 +180,15 @@ fn failed_runtime_scope_import_poisoning_prevents_partial_publication() {
         256,
         256,
     );
-    let sink = Rc::new(RefCell::new(None));
-    let mut memory = RecordingMemory::new(sink.clone());
-    let mut shared = DynamicLinker::new(Riscv64Relocator)
+    let mut memory = SharedMemory::new(true);
+    let mut shared = DynamicLinker::new(NativeRelocator)
         .begin::<SliceElfReader<'static>, _>(
             DependencyResolution::Import(ImportedImageDescriptor::namespace(descriptor(
                 b"root",
                 SymbolTable::empty(),
             ))),
             ArtifactRole::SharedObject,
-            LoadProfile::riscv64(),
+            NATIVE_PROFILE,
             limits,
             &mut memory,
         )
@@ -216,7 +202,7 @@ fn failed_runtime_scope_import_poisoning_prevents_partial_publication() {
     assert!(matches!(error.kind(), LoadErrorKind::ResourceLimit));
     assert!(shared.close_dependencies(&mut NoDependencies).is_err());
     assert!(shared.freeze_scopes().is_err());
-    assert!(RecordingMemory::recorded(&sink).is_none());
+    assert_eq!(memory.allocations.get(), 0);
 }
 
 #[test]

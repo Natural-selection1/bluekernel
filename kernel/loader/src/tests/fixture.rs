@@ -13,25 +13,73 @@
 // limitations under the License.
 
 use alloc::{rc::Rc, vec::Vec};
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 use goblin::{
     elf::header::{
-        EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFMAG, EV_CURRENT,
+        EI_CLASS, EI_DATA, EI_VERSION, ELFCLASS32, ELFCLASS64, ELFDATA2LSB, ELFMAG, ET_DYN,
+        EV_CURRENT,
     },
     elf32, elf64,
 };
 
 use crate::{
+    dynamic_linker::{ArtifactResolver, DependencyRequest, DependencyResolution},
     error::{ErrorContext, LoadErrorKind},
+    profile::{ElfClass, LoadProfile},
     reader::ElfReader,
     LoadError, LoadResult,
 };
 
 use crate::memory::{
-    AllocationId, AllocationLease, AllocationOwnership, AllocationRequest, ImageAllocation,
-    ImageMemory, MutationProgress, Placement,
+    AllocationId, AllocationLease, AllocationOffset, AllocationOwnership, AllocationRequest,
+    ImageAllocation, ImageMemory, ImageProtectionMemory, MemoryMapper, MemoryPermissions,
+    MemoryRegion, MutationProgress, Placement, PreparedProtectionPlan, ProtectionCapabilities,
+    ProtectionLevel,
 };
+
+// Use one native linking configuration across pipeline tests so each backend
+// and relocator does not instantiate another copy of the complete loader.
+#[cfg(target_arch = "aarch64")]
+pub(super) use crate::relocation::AArch64Relocator as NativeRelocator;
+#[cfg(target_arch = "arm")]
+pub(super) use crate::relocation::ArmRelocator as NativeRelocator;
+#[cfg(target_arch = "riscv32")]
+pub(super) use crate::relocation::Riscv32Relocator as NativeRelocator;
+#[cfg(target_arch = "riscv64")]
+pub(super) use crate::relocation::Riscv64Relocator as NativeRelocator;
+
+pub(super) const NATIVE_PROFILE: LoadProfile = {
+    #[cfg(target_arch = "arm")]
+    {
+        LoadProfile::arm_thumb_soft_float()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        LoadProfile::aarch64()
+    }
+    #[cfg(target_arch = "riscv32")]
+    {
+        LoadProfile::riscv32()
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        LoadProfile::riscv64()
+    }
+};
+
+pub(super) fn native_fixture_builder() -> ElfFixtureBuilder {
+    let machine = u64::from(NATIVE_PROFILE.machine()) as u16;
+    let builder = match NATIVE_PROFILE.class() {
+        ElfClass::Elf32 => ElfFixtureBuilder::elf32(machine, ET_DYN),
+        ElfClass::Elf64 => ElfFixtureBuilder::elf64(machine, ET_DYN),
+    };
+    builder.with_flags(if cfg!(target_arch = "arm") {
+        0x0500_0200
+    } else {
+        0
+    })
+}
 
 pub struct ElfFixtureBuilder {
     bytes: Vec<u8>,
@@ -352,6 +400,158 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+pub(super) struct NoDependencies;
+
+impl ArtifactResolver for NoDependencies {
+    type Reader = SliceElfReader<'static>;
+
+    fn resolve(
+        &mut self,
+        _: &DependencyRequest<'_>,
+    ) -> LoadResult<DependencyResolution<Self::Reader>> {
+        panic!("fixture has no dependencies")
+    }
+}
+
+/// Shared real-memory backend for load, link and runtime pipeline tests.
+#[derive(Clone)]
+pub(super) struct SharedMemory {
+    pub(super) mappers: Rc<RefCell<Vec<(ImageAllocation, MemoryMapper)>>>,
+    pub(super) regions: Option<&'static [MemoryRegion]>,
+    pub(super) acquired: Rc<Cell<bool>>,
+    pub(super) allocations: Rc<Cell<usize>>,
+    pub(super) releases: Rc<Cell<usize>>,
+}
+impl SharedMemory {
+    pub(super) fn new(acquired: bool) -> Self {
+        Self {
+            mappers: Rc::new(RefCell::new(Vec::new())),
+            regions: None,
+            acquired: Rc::new(Cell::new(acquired)),
+            allocations: Rc::new(Cell::new(0)),
+            releases: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
+impl ImageMemory for SharedMemory {
+    fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
+        assert!(self.acquired.get(), "reserve closure before mapping");
+        let mut mapper = MemoryMapper::new(self.regions);
+        let lease = mapper.allocate_image(request)?;
+        self.mappers
+            .borrow_mut()
+            .push((*lease.allocation(), mapper));
+        self.allocations.set(self.allocations.get() + 1);
+        Ok(lease)
+    }
+    fn abort_image(&mut self, lease: AllocationLease, progress: MutationProgress) {
+        let mut mappers = self.mappers.borrow_mut();
+        let index = mappers
+            .iter()
+            .position(|(allocation, _)| allocation == lease.allocation())
+            .unwrap();
+        mappers.swap_remove(index).1.abort_image(lease, progress);
+    }
+    fn release_committed(&mut self, lease: AllocationLease) {
+        self.releases.set(self.releases.get() + 1);
+        let mut mappers = self.mappers.borrow_mut();
+        let index = mappers
+            .iter()
+            .position(|(allocation, _)| allocation == lease.allocation())
+            .unwrap();
+        mappers.swap_remove(index).1.release_committed(lease);
+    }
+    fn image_span(
+        &self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+    ) -> LoadResult<*mut u8> {
+        self.mappers
+            .borrow()
+            .iter()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
+            .image_span(allocation, offset, len)
+    }
+    fn read(
+        &self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        dst: &mut [u8],
+    ) -> LoadResult<()> {
+        self.mappers
+            .borrow()
+            .iter()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
+            .read(allocation, offset, dst)
+    }
+    fn write(
+        &mut self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        bytes: &[u8],
+    ) -> LoadResult<()> {
+        self.mappers
+            .borrow_mut()
+            .iter_mut()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
+            .write(allocation, offset, bytes)
+    }
+    fn zero(
+        &mut self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+    ) -> LoadResult<()> {
+        self.mappers
+            .borrow_mut()
+            .iter_mut()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
+            .zero(allocation, offset, len)
+    }
+}
+impl ImageProtectionMemory for SharedMemory {
+    fn protect(
+        &mut self,
+        allocation: &ImageAllocation,
+        offset: AllocationOffset,
+        len: u64,
+        permissions: MemoryPermissions,
+    ) -> LoadResult<ProtectionLevel> {
+        self.mappers
+            .borrow_mut()
+            .iter_mut()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
+            .protect(allocation, offset, len, permissions)
+    }
+    fn protection_capabilities(&self) -> ProtectionCapabilities {
+        MemoryMapper::new(self.regions).protection_capabilities()
+    }
+    fn validate_protection_aliases(
+        &self,
+        allocation: &ImageAllocation,
+        plan: &PreparedProtectionPlan,
+    ) -> LoadResult<()> {
+        self.mappers
+            .borrow()
+            .iter()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
+            .validate_protection_aliases(allocation, plan)
+    }
+}
 /// An `ImageMemory` impl that records the `AllocationRequest` it received
 /// into a shared cell, so tests can inspect it after `allocate()` consumes
 /// the memory.

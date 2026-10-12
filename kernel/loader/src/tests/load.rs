@@ -15,148 +15,17 @@
 use crate::{
     error::{ErrorContext, LoadErrorKind},
     load,
-    memory::{
-        AllocationLease, AllocationOffset, AllocationRequest, ImageAllocation, ImageMemory,
-        ImageProtectionMemory, MemoryMapper, MemoryPermissions, MemoryRegion, MutationProgress,
-        PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel,
-    },
+    memory::{AllocationLease, AllocationOffset, ImageMemory, MemoryPermissions, MemoryRegion},
     planning::LoadPlan,
     profile::{LoadLimits, LoadProfile, SessionLimits},
     reader::ElfReader,
-    tests::fixture::SliceElfReader,
+    tests::fixture::{SharedMemory, SliceElfReader},
     CommittedAllocations, ImageDependency, ImageHandle, LoadError, LoadRequest, LoadResult,
     LoadedImage, LoaderBackend, Publication,
 };
 use alloc::{rc::Rc, vec::Vec};
 use blueos_test_macro::test;
-use core::cell::{Cell, RefCell};
 
-#[derive(Clone)]
-struct SharedMemory {
-    mappers: Rc<RefCell<Vec<(ImageAllocation, MemoryMapper)>>>,
-    regions: Option<&'static [MemoryRegion]>,
-    acquired: Rc<Cell<bool>>,
-    allocations: Rc<Cell<usize>>,
-    releases: Rc<Cell<usize>>,
-}
-impl ImageMemory for SharedMemory {
-    fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
-        assert!(self.acquired.get(), "reserve closure before mapping");
-        let mut mapper = MemoryMapper::new(self.regions);
-        let lease = mapper.allocate_image(request)?;
-        self.mappers
-            .borrow_mut()
-            .push((*lease.allocation(), mapper));
-        self.allocations.set(self.allocations.get() + 1);
-        Ok(lease)
-    }
-    fn abort_image(&mut self, lease: AllocationLease, progress: MutationProgress) {
-        let mut mappers = self.mappers.borrow_mut();
-        let index = mappers
-            .iter()
-            .position(|(allocation, _)| allocation == lease.allocation())
-            .unwrap();
-        mappers.swap_remove(index).1.abort_image(lease, progress);
-    }
-    fn release_committed(&mut self, lease: AllocationLease) {
-        self.releases.set(self.releases.get() + 1);
-        let mut mappers = self.mappers.borrow_mut();
-        let index = mappers
-            .iter()
-            .position(|(allocation, _)| allocation == lease.allocation())
-            .unwrap();
-        mappers.swap_remove(index).1.release_committed(lease);
-    }
-    fn image_span(
-        &self,
-        allocation: &ImageAllocation,
-        offset: AllocationOffset,
-        len: u64,
-    ) -> LoadResult<*mut u8> {
-        self.mappers
-            .borrow()
-            .iter()
-            .find(|(key, _)| key == allocation)
-            .unwrap()
-            .1
-            .image_span(allocation, offset, len)
-    }
-    fn read(
-        &self,
-        allocation: &ImageAllocation,
-        offset: AllocationOffset,
-        dst: &mut [u8],
-    ) -> LoadResult<()> {
-        self.mappers
-            .borrow()
-            .iter()
-            .find(|(key, _)| key == allocation)
-            .unwrap()
-            .1
-            .read(allocation, offset, dst)
-    }
-    fn write(
-        &mut self,
-        allocation: &ImageAllocation,
-        offset: AllocationOffset,
-        bytes: &[u8],
-    ) -> LoadResult<()> {
-        self.mappers
-            .borrow_mut()
-            .iter_mut()
-            .find(|(key, _)| key == allocation)
-            .unwrap()
-            .1
-            .write(allocation, offset, bytes)
-    }
-    fn zero(
-        &mut self,
-        allocation: &ImageAllocation,
-        offset: AllocationOffset,
-        len: u64,
-    ) -> LoadResult<()> {
-        self.mappers
-            .borrow_mut()
-            .iter_mut()
-            .find(|(key, _)| key == allocation)
-            .unwrap()
-            .1
-            .zero(allocation, offset, len)
-    }
-}
-impl ImageProtectionMemory for SharedMemory {
-    fn protect(
-        &mut self,
-        allocation: &ImageAllocation,
-        offset: AllocationOffset,
-        len: u64,
-        permissions: MemoryPermissions,
-    ) -> LoadResult<ProtectionLevel> {
-        self.mappers
-            .borrow_mut()
-            .iter_mut()
-            .find(|(key, _)| key == allocation)
-            .unwrap()
-            .1
-            .protect(allocation, offset, len, permissions)
-    }
-    fn protection_capabilities(&self) -> ProtectionCapabilities {
-        MemoryMapper::new(self.regions).protection_capabilities()
-    }
-    fn validate_protection_aliases(
-        &self,
-        allocation: &ImageAllocation,
-        plan: &PreparedProtectionPlan,
-    ) -> LoadResult<()> {
-        self.mappers
-            .borrow()
-            .iter()
-            .find(|(key, _)| key == allocation)
-            .unwrap()
-            .1
-            .validate_protection_aliases(allocation, plan)
-    }
-}
 struct Reader(Rc<[u8]>);
 impl ElfReader for Reader {
     fn len(&self) -> LoadResult<u64> {
@@ -203,13 +72,7 @@ impl Backend {
                 .into_iter()
                 .map(|(name, bytes)| (name, Rc::from(bytes)))
                 .collect(),
-            memory: SharedMemory {
-                mappers: Rc::new(RefCell::new(Vec::new())),
-                regions: None,
-                acquired: Rc::new(Cell::new(false)),
-                allocations: Rc::new(Cell::new(0)),
-                releases: Rc::new(Cell::new(0)),
-            },
+            memory: SharedMemory::new(false),
             reject_acquire: false,
             reject_publish: false,
             reject_complete: false,

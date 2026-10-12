@@ -1,3 +1,5 @@
+// TOTAL-TIMEOUT: 120
 // NEWLINE-TIMEOUT: 30
 // ASSERT-SUCC: Loader unittest ended
+// ASSERT-FAIL: No bootable app partitions in the partition table
 // ASSERT-FAIL: Backtrace in Panic.*

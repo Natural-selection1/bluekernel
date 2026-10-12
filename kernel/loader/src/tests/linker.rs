@@ -15,60 +15,30 @@
 use alloc::vec::Vec;
 
 use blueos_test_macro::test;
-use goblin::elf::header::{EM_AARCH64, EM_ARM, EM_RISCV, ET_DYN};
 
 use crate::{
     dynamic_linker::{
-        ArtifactIdentity, ArtifactResolver, ArtifactRole, CommittingLinkProduct, DependencyRequest,
-        DependencyResolution, ImageOwnership, LinkPublisher, PreparedLinkManifest,
-        ResolvedArtifact,
+        ArtifactIdentity, ArtifactRole, CommittingLinkProduct, DependencyResolution,
+        ImageOwnership, LinkPublisher, PreparedLinkManifest, ResolvedArtifact,
     },
     error::{ErrorContext, LoadErrorKind, LoadStage},
     linker::{prepare_link, LinkRequest},
-    memory::{
-        AllocationLease, AllocationRequest, ImageMemory, MemoryMapper, MutationProgress, Placement,
-    },
+    memory::{AllocationLease, AllocationRequest, ImageMemory, MutationProgress, Placement},
     profile::{LoadProfile, SessionLimits},
-    tests::fixture::{ElfFixtureBuilder, SliceElfReader},
+    tests::fixture::{
+        native_fixture_builder, NoDependencies, SharedMemory, SliceElfReader, NATIVE_PROFILE,
+    },
     LoadError, LoadResult,
 };
 
 pub(super) fn native_fixture() -> (Vec<u8>, LoadProfile) {
-    #[cfg(target_arch = "arm")]
-    let (fixture, profile, flags, entry) = (
-        ElfFixtureBuilder::elf32(EM_ARM, ET_DYN),
-        LoadProfile::arm_thumb_soft_float(),
-        0x0500_0200,
-        0x1001,
-    );
-    #[cfg(target_arch = "riscv32")]
-    let (fixture, profile, flags, entry) = (
-        ElfFixtureBuilder::elf32(EM_RISCV, ET_DYN),
-        LoadProfile::riscv32(),
-        0,
-        0x1000,
-    );
-    #[cfg(target_arch = "riscv64")]
-    let (fixture, profile, flags, entry) = (
-        ElfFixtureBuilder::elf64(EM_RISCV, ET_DYN),
-        LoadProfile::riscv64(),
-        0,
-        0x1000,
-    );
-    #[cfg(target_arch = "aarch64")]
-    let (fixture, profile, flags, entry) = (
-        ElfFixtureBuilder::elf64(EM_AARCH64, ET_DYN),
-        LoadProfile::aarch64(),
-        0,
-        0x1000,
-    );
+    let entry = 0x1000 | u64::from(NATIVE_PROFILE.entry_mode().is_thumb());
     (
-        fixture
-            .with_flags(flags)
+        native_fixture_builder()
             .with_load_segment(0x1000, 0x100, 0x100, 4)
             .with_entry(entry)
             .build(),
-        profile,
+        NATIVE_PROFILE,
     )
 }
 
@@ -83,19 +53,6 @@ fn request(bytes: &[u8], profile: LoadProfile) -> LinkRequest<SliceElfReader<'_>
         profile,
         SessionLimits::DEFAULT,
     )
-}
-
-struct NoDependencies;
-
-impl ArtifactResolver for NoDependencies {
-    type Reader = SliceElfReader<'static>;
-
-    fn resolve(
-        &mut self,
-        _: &DependencyRequest<'_>,
-    ) -> LoadResult<DependencyResolution<Self::Reader>> {
-        panic!("fixture has no dependencies")
-    }
 }
 
 #[derive(Default)]
@@ -122,7 +79,11 @@ impl LinkPublisher for Publisher {
     }
 }
 
-fn assert_memory_reusable(memory: &mut MemoryMapper) {
+fn assert_memory_reusable(memory: &mut SharedMemory) {
+    assert!(
+        memory.mappers.borrow().is_empty(),
+        "preparation must have rolled back every allocation"
+    );
     let lease = memory
         .allocate_image(AllocationRequest::new(Placement::Anywhere, 16, 4))
         .expect("preparation must have rolled back its allocation");
@@ -132,7 +93,7 @@ fn assert_memory_reusable(memory: &mut MemoryMapper) {
 #[test]
 fn prepared_link_drop_rolls_back_allocation() {
     let (bytes, profile) = native_fixture();
-    let mut memory = MemoryMapper::new(None);
+    let mut memory = SharedMemory::new(true);
     let prepared = prepare_link(request(&bytes, profile), &mut NoDependencies, &mut memory)
         .expect("prepare complete link");
     drop(prepared);
@@ -142,7 +103,7 @@ fn prepared_link_drop_rolls_back_allocation() {
 #[test]
 fn prepared_link_publish_transfers_allocation_once() {
     let (bytes, profile) = native_fixture();
-    let mut memory = MemoryMapper::new(None);
+    let mut memory = SharedMemory::new(true);
     let mut publisher = Publisher::default();
     let prepared = prepare_link(request(&bytes, profile), &mut NoDependencies, &mut memory)
         .expect("prepare complete link");
@@ -160,7 +121,7 @@ fn prepared_link_publish_transfers_allocation_once() {
 #[test]
 fn prepared_link_publish_failure_rolls_back_allocation() {
     let (bytes, profile) = native_fixture();
-    let mut memory = MemoryMapper::new(None);
+    let mut memory = SharedMemory::new(true);
     let mut publisher = Publisher {
         reject: true,
         commits: 0,
