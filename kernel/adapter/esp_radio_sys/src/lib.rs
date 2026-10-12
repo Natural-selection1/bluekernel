@@ -189,7 +189,7 @@ impl WaitQueueImplementation for EspWaitQueue {
 
     unsafe fn delete(queue: WaitQueuePtr) {
         let ptr = queue.as_ptr() as *mut EspWaitQueue;
-        let _ = Box::from_raw(ptr);
+        drop(Box::from_raw(ptr));
     }
 
     #[allow(clippy::drop_non_drop)]
@@ -562,7 +562,8 @@ mod tests {
     static ALLOCATOR: KernelAllocator = KernelAllocator;
 
     #[used]
-    #[link_section = ".bk_app_array"]
+    #[cfg_attr(compatible_old_toolchain, link_section = ".bk_app_array")]
+    #[cfg_attr(not(compatible_old_toolchain), unsafe(link_section = ".bk_app_array"))]
     static INIT_TEST: extern "C" fn() = init_test;
 
     #[inline(never)]
