@@ -20,7 +20,9 @@ use crate::{
     arch::Context,
     config,
     config::DEFAULT_STACK_SIZE,
-    debug, scheduler,
+    debug,
+    process::Process,
+    scheduler,
     support::{Region, RegionalObjectBuilder, Storage},
     sync::{
         mutex::{MutexList, MutexListIterator},
@@ -29,11 +31,11 @@ use crate::{
     thread::builder::GlobalQueue,
     time::Tick,
     types::{
-        impl_simple_intrusive_adapter, Arc, ArcCas, ArcList, AtomicUint, IlistHead, ThreadPriority,
-        Uint, UniqueListHead,
+        impl_simple_intrusive_adapter, Arc, ArcCas, ArcList, ArcListIterator, AtomicUint,
+        GenericList, IlistHead, ThreadPriority, Uint, UniqueListHead,
     },
 };
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Weak};
 use core::{
     alloc::Layout,
     cell::Cell,
@@ -112,7 +114,7 @@ impl Stack {
         if base.is_null() {
             return None;
         }
-        if base as usize % ALIGN != 0 {
+        if !(base as usize).is_multiple_of(ALIGN) {
             return None;
         }
         Some(Self(unsafe { Storage::from_raw(base, size) }))
@@ -126,6 +128,12 @@ impl Stack {
 impl_simple_intrusive_adapter!(OffsetOfSchedNode, Thread, sched_node);
 impl_simple_intrusive_adapter!(OffsetOfGlobal, Thread, global);
 impl_simple_intrusive_adapter!(OffsetOfLock, Thread, lock);
+impl_simple_intrusive_adapter!(OffsetOfProcessNode, Thread, process_node);
+
+// Intrusive list of the threads owned by a process.
+pub(crate) type ThreadList = ArcList<Thread, OffsetOfProcessNode>;
+pub(crate) type ThreadListIterator<'a> = ArcListIterator<'a, Thread, OffsetOfProcessNode>;
+pub(crate) type ThreadListNode = <ThreadList as GenericList>::Node;
 
 // When a thread is created or is removed from the RQ.
 pub const IDLE: Uint = 0;
@@ -238,6 +246,13 @@ pub struct Thread {
     // - Check mutex's pending queue
     acquired_mutexes: SpinLock<MutexList>,
     signal_context: Option<Box<SignalContext>>,
+    // A weak reference to the process this thread belongs to. Kernel/system
+    // threads that are not owned by any process carry a dangling `Weak`
+    // (constructed via `Weak::new()`, whose `upgrade()` returns `None`).
+    process: Weak<Process>,
+    // Intrusive node linking this thread into its owning process's thread
+    // list. Protected by the process's `threads` spinlock.
+    process_node: ThreadListNode,
     #[cfg(round_robin)]
     rr: RoundRobin,
 }
@@ -411,7 +426,7 @@ impl Thread {
     pub fn remove_acquired_mutex(&self, mu: &Arc<Mutex>) -> bool {
         self.acquired_mutexes
             .irqsave_write()
-            .remove_if(|e| Arc::as_ptr(mu) == e as *const _)
+            .remove_if(|e| core::ptr::eq(Arc::as_ptr(mu), e))
             .is_some()
     }
 
@@ -428,6 +443,16 @@ impl Thread {
     #[inline]
     pub fn replace_pending_on_mutex(&self, mu: Option<Arc<Mutex>>) -> Option<Arc<Mutex>> {
         self.pending_on_mutex.swap(mu, Ordering::Release)
+    }
+
+    pub fn process(&self) -> Option<alloc::sync::Arc<Process>> {
+        self.process.upgrade()
+    }
+
+    /// Set the owning process. Called by `Process::add_thread`/
+    /// `Process::remove_thread` while holding the thread's spinlock.
+    pub fn set_process(&mut self, process: Weak<Process>) {
+        self.process = process;
     }
 
     const fn new(kind: ThreadKind) -> Self {
@@ -453,6 +478,8 @@ impl Thread {
             pending_on_mutex: ArcCas::new(None),
             acquired_mutexes: SpinLock::new(MutexList::new()),
             signal_context: None,
+            process: Weak::new(),
+            process_node: ThreadListNode::new(),
             #[cfg(round_robin)]
             rr: RoundRobin::new(),
         }
@@ -620,7 +647,7 @@ impl Thread {
         // to run the function safely.
         match entry {
             Entry::C(f) => ctx
-                .set_return_address(run_simple_c as usize)
+                .set_return_address(run_simple_c as *const () as usize)
                 .set_arg(0, unsafe { f as usize }),
             Entry::Closure(boxed) => {
                 // FIXME: We need to make a new box to contain Box<dyn
@@ -628,11 +655,11 @@ impl Thread {
                 // FnOnce() + Send + 'static) is 64 bits in 32-bit
                 // platform, aka, it's a fat pointer.
                 let raw = Box::into_raw(Box::new(boxed));
-                ctx.set_return_address(run_closure as usize)
+                ctx.set_return_address(run_closure as *const () as usize)
                     .set_arg(0, raw as *mut Box<dyn FnOnce()> as usize)
             }
             Entry::Posix(f, arg) => ctx
-                .set_return_address(run_posix as usize)
+                .set_return_address(run_posix as *const () as usize)
                 .set_arg(0, unsafe { f as usize })
                 .set_arg(1, unsafe { arg as usize }),
         };
@@ -827,9 +854,14 @@ impl Thread {
 impl Drop for Thread {
     fn drop(&mut self) {
         debug_assert!(self.sched_node.is_detached());
+        // The thread must have been detached from its owning process's
+        // thread list before it is dropped; otherwise the process would
+        // still hold a dangling strong reference to this thread.
+        debug_assert!(self.process_node.is_detached());
     }
 }
 
+#[must_use]
 pub(crate) struct PreemptGuard {
     t: ThreadNode,
     pub status: bool,
