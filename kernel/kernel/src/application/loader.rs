@@ -163,12 +163,10 @@ impl<'a> KernelLoaderBackend<'a> {
                 .resolve_key(&key)
                 .ok_or_else(loader_error)?
                 .keep_cached;
-            let mut scc_members = image_keys(product.shared_component(image))?;
+            let scc_members = image_keys(product.shared_component(image))?;
             if scc_members.is_empty() {
                 return Err(loader_error());
             }
-            scc_members.sort();
-            scc_members.dedup();
             let mut dependency_keys = image_keys(product.shared_dependencies(image))?;
             dependency_keys.sort();
             dependency_keys.dedup();

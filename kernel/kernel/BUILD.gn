@@ -106,6 +106,9 @@ build_rust("kernel_unittest") {
   ]
   rustenv = [ "TARGET_BOARD=${board}" ]
   cfgs = _kernel_default_cfgs
+  if (dynamic_loader) {
+    cfgs += [ "dynamic_loader" ]
+  }
   deps = _shared_deps
   deps += [ "//external/vendor/semihosting-0.1.20:semihosting" ]
   configs += [

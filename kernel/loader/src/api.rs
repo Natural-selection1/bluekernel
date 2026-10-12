@@ -17,9 +17,9 @@ use core::fmt;
 
 use crate::{
     dynamic_linker::{
-        ArtifactRole, CommittingLinkProduct, DependencyResolution, ImageOwnership,
-        ImportedImageDescriptor, LifecyclePlans, LinkContext, LinkProduct, LinkPublisher,
-        PreparedLinkManifest, PublishedImageDescriptor, RelocationBinding,
+        order_components, ArtifactRole, CommittingLinkProduct, DependencyResolution, ImageId,
+        ImageOwnership, ImportedImageDescriptor, LifecyclePlans, LinkContext, LinkProduct,
+        LinkPublisher, PreparedLinkManifest, PublishedImageDescriptor, RelocationBinding,
     },
     error::{ErrorContext, LoadErrorKind},
     linker::{prepare_link, LinkRequest},
@@ -256,14 +256,17 @@ impl<Receipt> LoadedImage<Receipt> {
             .map(|facts| facts.lookup.as_slice())
             .unwrap_or(&[])
     }
-    /// Shared images that must be retained and quiesced as one cycle.
+    /// Shared images that must quiesce together, in destructor order (the
+    /// reverse of lifecycle image order). Both declared dependencies and actual
+    /// relocation providers contribute retention edges and cycles.
     pub fn shared_component(&self, image: &ImageHandle) -> &[ImageHandle] {
         self.image_facts(image)
             .map(|facts| facts.component.as_slice())
             .unwrap_or(&[])
     }
-    /// Outgoing shared providers outside this image's cycle. The registry
-    /// retains these; internal cycle edges must not become counted references.
+    /// Outgoing declared dependencies and actual relocation providers outside
+    /// this shared image's cycle. The registry retains these; internal cycle
+    /// edges must not become counted references.
     pub fn shared_dependencies(&self, image: &ImageHandle) -> &[ImageHandle] {
         self.image_facts(image)
             .map(|facts| facts.dependencies.as_slice())
@@ -468,12 +471,41 @@ fn handle(image: &crate::dynamic_linker::CommittedImage) -> ImageHandle {
     }
 }
 
+fn shared_retention_edges<'a>(
+    context: &'a LinkContext,
+    bindings: &'a [RelocationBinding],
+) -> impl Iterator<Item = (ImageId, ImageId)> + Clone + 'a {
+    context
+        .graph_edges()
+        .iter()
+        .map(|edge| (edge.requester(), edge.provider()))
+        .chain(bindings.iter().filter_map(|binding| {
+            binding
+                .provider()
+                .map(|provider| (binding.requester(), provider))
+        }))
+        .filter(|(requester, provider)| {
+            [requester, provider].iter().all(|owner| {
+                matches!(
+                    context.images()[owner.get() as usize].ownership(),
+                    ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady
+                )
+            })
+        })
+}
+
 fn build_facts<S, R>(
     plan: &LoadPlan<S, R>,
     context: &LinkContext,
     plans: &LifecyclePlans,
     bindings: &[RelocationBinding],
 ) -> LoadResult<LoadFacts> {
+    // Keep lifetime SCCs separate from the DT_NEEDED lifecycle graph. Actual
+    // bindings can add providers (and cycles) without changing constructor order.
+    let components = order_components(
+        context.images().len(),
+        shared_retention_edges(context, bindings),
+    )?;
     let mut facts = LoadFacts {
         entry: None,
         images: Vec::new(),
@@ -521,8 +553,7 @@ fn build_facts<S, R>(
                 .ok_or_else(invalid)?;
             lookup.push(handle(provider));
         }
-        let scc = plans
-            .sccs()
+        let scc = components
             .iter()
             .find(|members| members.contains(&image.owner()))
             .ok_or_else(invalid)?;
@@ -532,19 +563,25 @@ fn build_facts<S, R>(
         dependencies
             .try_reserve_exact(context.images().len())
             .map_err(|_| oom())?;
-        for owner in scc {
+        for owner in plans
+            .sccs()
+            .iter()
+            .rev()
+            .flat_map(|members| members.iter().rev())
+        {
+            if !scc.contains(owner) {
+                continue;
+            }
             let member = &context.images()[owner.get() as usize];
             let member = handle(member);
             if member.shared {
                 component.push(member);
             }
         }
-        for edge in context
-            .graph_edges()
-            .iter()
-            .filter(|edge| edge.requester() == image.owner() && !scc.contains(&edge.provider()))
+        for (_, provider) in shared_retention_edges(context, bindings)
+            .filter(|(requester, provider)| *requester == image.owner() && !scc.contains(provider))
         {
-            let provider = handle(&context.images()[edge.provider().get() as usize]);
+            let provider = handle(&context.images()[provider.get() as usize]);
             if provider.shared
                 && !dependencies
                     .iter()

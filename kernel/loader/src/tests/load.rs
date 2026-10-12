@@ -17,7 +17,7 @@ use crate::{
     load,
     memory::{
         AllocationLease, AllocationOffset, AllocationRequest, ImageAllocation, ImageMemory,
-        ImageProtectionMemory, MemoryMapper, MemoryPermissions, MutationProgress,
+        ImageProtectionMemory, MemoryMapper, MemoryPermissions, MemoryRegion, MutationProgress,
         PreparedProtectionPlan, ProtectionCapabilities, ProtectionLevel,
     },
     planning::LoadPlan,
@@ -33,7 +33,8 @@ use core::cell::{Cell, RefCell};
 
 #[derive(Clone)]
 struct SharedMemory {
-    mapper: Rc<RefCell<MemoryMapper>>,
+    mappers: Rc<RefCell<Vec<(ImageAllocation, MemoryMapper)>>>,
+    regions: Option<&'static [MemoryRegion]>,
     acquired: Rc<Cell<bool>>,
     allocations: Rc<Cell<usize>>,
     releases: Rc<Cell<usize>>,
@@ -41,15 +42,30 @@ struct SharedMemory {
 impl ImageMemory for SharedMemory {
     fn allocate_image(&mut self, request: AllocationRequest) -> LoadResult<AllocationLease> {
         assert!(self.acquired.get(), "reserve closure before mapping");
+        let mut mapper = MemoryMapper::new(self.regions);
+        let lease = mapper.allocate_image(request)?;
+        self.mappers
+            .borrow_mut()
+            .push((*lease.allocation(), mapper));
         self.allocations.set(self.allocations.get() + 1);
-        self.mapper.borrow_mut().allocate_image(request)
+        Ok(lease)
     }
     fn abort_image(&mut self, lease: AllocationLease, progress: MutationProgress) {
-        self.mapper.borrow_mut().abort_image(lease, progress);
+        let mut mappers = self.mappers.borrow_mut();
+        let index = mappers
+            .iter()
+            .position(|(allocation, _)| allocation == lease.allocation())
+            .unwrap();
+        mappers.swap_remove(index).1.abort_image(lease, progress);
     }
     fn release_committed(&mut self, lease: AllocationLease) {
         self.releases.set(self.releases.get() + 1);
-        self.mapper.borrow_mut().release_committed(lease);
+        let mut mappers = self.mappers.borrow_mut();
+        let index = mappers
+            .iter()
+            .position(|(allocation, _)| allocation == lease.allocation())
+            .unwrap();
+        mappers.swap_remove(index).1.release_committed(lease);
     }
     fn image_span(
         &self,
@@ -57,7 +73,13 @@ impl ImageMemory for SharedMemory {
         offset: AllocationOffset,
         len: u64,
     ) -> LoadResult<*mut u8> {
-        self.mapper.borrow().image_span(allocation, offset, len)
+        self.mappers
+            .borrow()
+            .iter()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
+            .image_span(allocation, offset, len)
     }
     fn read(
         &self,
@@ -65,7 +87,13 @@ impl ImageMemory for SharedMemory {
         offset: AllocationOffset,
         dst: &mut [u8],
     ) -> LoadResult<()> {
-        self.mapper.borrow().read(allocation, offset, dst)
+        self.mappers
+            .borrow()
+            .iter()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
+            .read(allocation, offset, dst)
     }
     fn write(
         &mut self,
@@ -73,7 +101,13 @@ impl ImageMemory for SharedMemory {
         offset: AllocationOffset,
         bytes: &[u8],
     ) -> LoadResult<()> {
-        self.mapper.borrow_mut().write(allocation, offset, bytes)
+        self.mappers
+            .borrow_mut()
+            .iter_mut()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
+            .write(allocation, offset, bytes)
     }
     fn zero(
         &mut self,
@@ -81,7 +115,13 @@ impl ImageMemory for SharedMemory {
         offset: AllocationOffset,
         len: u64,
     ) -> LoadResult<()> {
-        self.mapper.borrow_mut().zero(allocation, offset, len)
+        self.mappers
+            .borrow_mut()
+            .iter_mut()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
+            .zero(allocation, offset, len)
     }
 }
 impl ImageProtectionMemory for SharedMemory {
@@ -92,20 +132,28 @@ impl ImageProtectionMemory for SharedMemory {
         len: u64,
         permissions: MemoryPermissions,
     ) -> LoadResult<ProtectionLevel> {
-        self.mapper
+        self.mappers
             .borrow_mut()
+            .iter_mut()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
             .protect(allocation, offset, len, permissions)
     }
     fn protection_capabilities(&self) -> ProtectionCapabilities {
-        self.mapper.borrow().protection_capabilities()
+        MemoryMapper::new(self.regions).protection_capabilities()
     }
     fn validate_protection_aliases(
         &self,
         allocation: &ImageAllocation,
         plan: &PreparedProtectionPlan,
     ) -> LoadResult<()> {
-        self.mapper
+        self.mappers
             .borrow()
+            .iter()
+            .find(|(key, _)| key == allocation)
+            .unwrap()
+            .1
             .validate_protection_aliases(allocation, plan)
     }
 }
@@ -148,7 +196,8 @@ impl Backend {
                 .map(|(name, bytes)| (name, Rc::from(bytes)))
                 .collect(),
             memory: SharedMemory {
-                mapper: Rc::new(RefCell::new(MemoryMapper::new(None))),
+                mappers: Rc::new(RefCell::new(Vec::new())),
+                regions: None,
                 acquired: Rc::new(Cell::new(false)),
                 allocations: Rc::new(Cell::new(0)),
                 releases: Rc::new(Cell::new(0)),
@@ -214,7 +263,11 @@ impl LoaderBackend for Backend {
         if self.reject_publish {
             return Err(failure());
         }
-        assert_eq!(publication.shared_images(), usize::from(self.shared));
+        if self.shared {
+            assert_eq!(publication.private_images(), 0);
+        } else {
+            assert_eq!(publication.shared_images(), 0);
+        }
         let mut leases = Vec::new();
         leases
             .try_reserve_exact(publication.private_images() + publication.shared_images())
@@ -392,7 +445,7 @@ fn load_detects_fixed_exec_without_a_selected_mode() {
         )
     }]));
     let mut backend = Backend::new(alloc::vec![("root", bytes)]);
-    backend.memory.mapper = Rc::new(RefCell::new(MemoryMapper::new(Some(regions))));
+    backend.memory.regions = Some(regions);
     let mut loaded = load(
         LoadRequest::new("root", profile, SessionLimits::DEFAULT),
         &mut backend,
@@ -543,9 +596,23 @@ fn native_dso(needed: &[&str]) -> Vec<u8> {
 }
 
 fn native_dso_with_flags(needed: &[&str], dynamic_flags: u64) -> Vec<u8> {
+    native_dso_with_symbols(needed, dynamic_flags, &[], None)
+}
+
+// Absolute exports and one real symbolic data relocation allow retention
+// tests to exercise provider selection through the complete public load API.
+fn native_dso_with_symbols(
+    needed: &[&str],
+    dynamic_flags: u64,
+    symbols: &[(&str, bool)],
+    relocation: Option<usize>,
+) -> Vec<u8> {
     use super::fixture::ElfFixtureBuilder;
     use goblin::elf::{
-        dynamic::{DT_FLAGS_1, DT_HASH, DT_NEEDED, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB},
+        dynamic::{
+            DT_FLAGS_1, DT_HASH, DT_NEEDED, DT_REL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_RELENT,
+            DT_RELSZ, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
+        },
         header::*,
     };
     #[cfg(target_arch = "arm")]
@@ -587,12 +654,31 @@ fn native_dso_with_flags(needed: &[&str], dynamic_flags: u64) -> Vec<u8> {
         names.extend_from_slice(name.as_bytes());
         names.push(0);
     }
+    let mut symbol_offsets = Vec::new();
+    for (name, _) in symbols {
+        symbol_offsets.push(names.len());
+        names.extend_from_slice(name.as_bytes());
+        names.push(0);
+    }
     entries.push((DT_FLAGS_1 as u32, dynamic_flags));
-    entries.push((DT_SYMTAB as u32, 0x1200));
+    entries.push((DT_SYMTAB as u32, 0x1180));
     entries.push((DT_SYMENT as u32, if header == 52 { 16 } else { 24 }));
     entries.push((DT_HASH as u32, 0x1240));
     entries.push((DT_STRTAB as u32, 0x1300));
     entries.push((DT_STRSZ as u32, names.len() as u64));
+    let rel = cfg!(target_arch = "arm");
+    let rel_size = if rel {
+        8
+    } else if header == 52 {
+        12
+    } else {
+        24
+    };
+    if relocation.is_some() {
+        entries.push((if rel { DT_REL } else { DT_RELA } as u32, 0x1280));
+        entries.push((if rel { DT_RELSZ } else { DT_RELASZ } as u32, rel_size));
+        entries.push((if rel { DT_RELENT } else { DT_RELAENT } as u32, rel_size));
+    }
     let mut bytes = builder
         .with_flags(flags)
         .with_load_segment(0x1000, 0x400, 0x400, 4)
@@ -600,11 +686,166 @@ fn native_dso_with_flags(needed: &[&str], dynamic_flags: u64) -> Vec<u8> {
         .with_dynamic_entries(0x1000 + 2 * phdr, &entries)
         .with_dynstr(header + 0x300, &names)
         .build();
-    for (index, word) in [1u32, 1, 0, 0].into_iter().enumerate() {
+    let mut hash = alloc::vec![
+        1u32,
+        (symbols.len() + 1) as u32,
+        u32::from(!symbols.is_empty()),
+        0
+    ];
+    for index in 1..=symbols.len() {
+        hash.push(if index < symbols.len() {
+            index as u32 + 1
+        } else {
+            0
+        });
+    }
+    for (index, word) in hash.into_iter().enumerate() {
         let at = header + 0x240 + index * 4;
         bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
     }
+    for (index, ((_, defined), name)) in symbols.iter().zip(symbol_offsets).enumerate() {
+        let size = if header == 52 { 16 } else { 24 };
+        let at = header + 0x180 + (index + 1) * size;
+        bytes[at..at + 4].copy_from_slice(&(name as u32).to_le_bytes());
+        let section = if *defined { 0xfff1u16 } else { 0 };
+        if header == 52 {
+            bytes[at + 4..at + 8].copy_from_slice(&0x1234u32.to_le_bytes());
+            bytes[at + 12] = 0x10; // STB_GLOBAL, STT_NOTYPE
+            bytes[at + 14..at + 16].copy_from_slice(&section.to_le_bytes());
+        } else {
+            bytes[at + 4] = 0x10;
+            bytes[at + 6..at + 8].copy_from_slice(&section.to_le_bytes());
+            bytes[at + 8..at + 16].copy_from_slice(&0x1234u64.to_le_bytes());
+        }
+    }
+    if let Some(symbol) = relocation {
+        let at = header + 0x280;
+        let kind = if rel {
+            2
+        } else if cfg!(target_arch = "aarch64") {
+            257
+        } else if header == 52 {
+            1
+        } else {
+            2
+        };
+        if header == 52 {
+            bytes[at..at + 4].copy_from_slice(&0x13c0u32.to_le_bytes());
+            bytes[at + 4..at + 8]
+                .copy_from_slice(&(((symbol as u32 + 1) << 8) | kind).to_le_bytes());
+        } else {
+            bytes[at..at + 8].copy_from_slice(&0x13c0u64.to_le_bytes());
+            bytes[at + 8..at + 16]
+                .copy_from_slice(&(((symbol as u64 + 1) << 32) | u64::from(kind)).to_le_bytes());
+        }
+        // This shared fixture has only data and no executable entry.
+        set_entry(&mut bytes, 0);
+        let flags_at = if header == 52 {
+            header + 24
+        } else {
+            header + 4
+        };
+        bytes[flags_at..flags_at + 4].copy_from_slice(&6u32.to_le_bytes());
+    }
     bytes
+}
+
+#[test]
+fn shared_image_retains_an_actual_global_provider_without_dt_needed() {
+    let (_, profile) = super::linker::native_fixture();
+    let mut provider_backend = Backend::new(alloc::vec![(
+        "provider",
+        native_dso_with_symbols(&[], 0, &[("probe", true)], None)
+    )]);
+    provider_backend.shared = true;
+    let provider = load(
+        LoadRequest::new("provider", profile, SessionLimits::DEFAULT),
+        &mut provider_backend,
+    )
+    .unwrap();
+    let provider_handle = provider.images().next().unwrap().clone();
+    let mut backend = Backend::new(alloc::vec![(
+        "root",
+        native_dso_with_symbols(&[], 0, &[("probe", false)], Some(0))
+    )]);
+    backend.shared = true;
+    let mut image = load(
+        LoadRequest::new("root", profile, SessionLimits::DEFAULT).with_namespace(
+            alloc::vec![provider_handle.clone()],
+            alloc::vec![provider_handle],
+        ),
+        &mut backend,
+    )
+    .unwrap();
+    let root = image.images().next().unwrap();
+    assert_eq!(
+        image.lookup_scope(root).len(),
+        1,
+        "provider is outside DT_NEEDED"
+    );
+    assert_eq!(
+        image
+            .shared_dependencies(root)
+            .iter()
+            .map(ImageHandle::identity)
+            .collect::<Vec<_>>(),
+        [b"provider".as_slice()]
+    );
+    assert_eq!(image.retained_images().len(), 1);
+    let mut value = [0u8; 8];
+    let word_size = if profile.class() == crate::profile::ElfClass::Elf32 {
+        4
+    } else {
+        8
+    };
+    backend
+        .memory
+        .read(
+            image.receipt_mut().leases[0].allocation(),
+            AllocationOffset::new(0x3c0),
+            &mut value[..word_size],
+        )
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(value),
+        0x1234,
+        "the relocation used the retained export"
+    );
+}
+
+#[test]
+fn shared_binding_cycle_is_structural_and_preserves_reverse_lifecycle_order() {
+    let (_, profile) = super::linker::native_fixture();
+    let mut backend = Backend::new(alloc::vec![
+        (
+            "root",
+            native_dso_with_symbols(&["child"], 0, &[("a", true), ("b", false)], Some(1))
+        ),
+        (
+            "child",
+            native_dso_with_symbols(&[], 0, &[("b", true), ("a", false)], Some(1))
+        ),
+    ]);
+    backend.shared = true;
+    let image = load(
+        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+        &mut backend,
+    )
+    .unwrap();
+    for member in image.images() {
+        assert_eq!(
+            image
+                .shared_component(member)
+                .iter()
+                .map(ImageHandle::identity)
+                .collect::<Vec<_>>(),
+            [b"root".as_slice(), b"child".as_slice()]
+        );
+        assert!(
+            image.shared_dependencies(member).is_empty(),
+            "internal binding edges must not pin the cycle"
+        );
+    }
 }
 
 fn plan_request(limits: SessionLimits) -> LoadRequest<&'static str> {

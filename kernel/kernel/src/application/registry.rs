@@ -132,8 +132,9 @@ pub struct SystemCandidateBacking {
     /// Empty storage pre-reserved for `dependency_keys`, so the Ready
     /// transition and lease minting do not allocate under the registry lock.
     pub dependencies: Vec<SystemDsoLease>,
-    /// Every canonical path key in this candidate's system SCC. Internal edges are
-    /// structural and do not mint self-sustaining leases.
+    /// Every canonical path key in this candidate's retention SCC, in loader
+    /// destructor order. Internal edges are structural and do not mint
+    /// self-sustaining leases.
     pub scc_members: Vec<SystemLibraryKey>,
     /// Cached/unloadable policy captured from the immutable system catalog.
     pub keep_cached: bool,

@@ -28,6 +28,8 @@ mod scope;
 mod session;
 mod symbol;
 
+pub(crate) use graph::order_components;
+
 #[cfg(test)]
 pub(crate) use graph::DependencyGraph;
 #[cfg(test)]

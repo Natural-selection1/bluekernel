@@ -318,76 +318,90 @@ impl DependencyGraph {
     /// by BFS discovery index. The result is stable and independent of the
     /// resolver's map/container iteration order.
     pub(crate) fn dependency_order(&self) -> LoadResult<Vec<Vec<ImageId>>> {
-        let n = self.nodes.len();
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut out_degrees = zero_counts(n)?;
-        let mut in_degrees = zero_counts(n)?;
-        for edge in &self.edges {
-            increment_count(&mut out_degrees[edge.requester.get() as usize])?;
-            increment_count(&mut in_degrees[edge.provider.get() as usize])?;
-        }
-        let mut adj = adjacency_with_capacities(&out_degrees)?;
-        let mut adj_t = adjacency_with_capacities(&in_degrees)?;
-        for edge in &self.edges {
-            adj[edge.requester.get() as usize].push(edge.provider.get());
-            adj_t[edge.provider.get() as usize].push(edge.requester.get());
-        }
-        for neighbors in adj.iter_mut() {
-            neighbors.sort_unstable();
-        }
-        for neighbors in adj_t.iter_mut() {
-            neighbors.sort_unstable();
-        }
-
-        let (scc_count, scc_of) = compute_sccs(&adj, &adj_t)?;
-
-        let mut cond_degrees = zero_counts(scc_count)?;
-        for edge in &self.edges {
-            let u = scc_of[edge.requester.get() as usize];
-            let v = scc_of[edge.provider.get() as usize];
-            if u != v {
-                increment_count(&mut cond_degrees[u as usize])?;
-            }
-        }
-        let mut cond = adjacency_with_capacities(&cond_degrees)?;
-        for edge in &self.edges {
-            let u = scc_of[edge.requester.get() as usize];
-            let v = scc_of[edge.provider.get() as usize];
-            if u != v {
-                cond[u as usize].push(v);
-            }
-        }
-        for neighbors in cond.iter_mut() {
-            neighbors.sort_unstable();
-            neighbors.dedup();
-        }
-
-        let finish = dfs_post_order(&cond, scc_of[0])?;
-
-        let mut member_counts = zero_counts(scc_count)?;
-        for &scc in &scc_of {
-            increment_count(&mut member_counts[scc as usize])?;
-        }
-        let mut members = image_groups_with_capacities(&member_counts)?;
-        for (node, &scc) in self.nodes.iter().zip(scc_of.iter()) {
-            members[scc as usize].push(node.id);
-        }
-        for member in members.iter_mut() {
-            member.sort_unstable();
-        }
-
-        let mut groups = Vec::new();
-        groups
-            .try_reserve_exact(scc_count)
-            .map_err(|_| graph_oom())?;
-        for scc in finish {
-            groups.push(core::mem::take(&mut members[scc as usize]));
-        }
-        Ok(groups)
+        order_components(
+            self.nodes.len(),
+            self.edges
+                .iter()
+                .map(|edge| (edge.requester, edge.provider)),
+        )
     }
+}
+
+/// Dependency-first SCC order for an image graph. Lifecycle and retention
+/// graphs share the algorithm, but keep their edges and ordering policies
+/// separate: a relocation binding retains a provider without changing init.
+pub(crate) fn order_components(
+    n: usize,
+    edges: impl Iterator<Item = (ImageId, ImageId)> + Clone,
+) -> LoadResult<Vec<Vec<ImageId>>> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut out_degrees = zero_counts(n)?;
+    let mut in_degrees = zero_counts(n)?;
+    for (requester, provider) in edges.clone() {
+        increment_count(&mut out_degrees[requester.get() as usize])?;
+        increment_count(&mut in_degrees[provider.get() as usize])?;
+    }
+    let mut adj = adjacency_with_capacities(&out_degrees)?;
+    let mut adj_t = adjacency_with_capacities(&in_degrees)?;
+    for (requester, provider) in edges.clone() {
+        adj[requester.get() as usize].push(provider.get());
+        adj_t[provider.get() as usize].push(requester.get());
+    }
+    for neighbors in adj.iter_mut() {
+        neighbors.sort_unstable();
+    }
+    for neighbors in adj_t.iter_mut() {
+        neighbors.sort_unstable();
+    }
+
+    let (scc_count, scc_of) = compute_sccs(&adj, &adj_t)?;
+
+    let mut cond_degrees = zero_counts(scc_count)?;
+    for (requester, provider) in edges.clone() {
+        let u = scc_of[requester.get() as usize];
+        let v = scc_of[provider.get() as usize];
+        if u != v {
+            increment_count(&mut cond_degrees[u as usize])?;
+        }
+    }
+    let mut cond = adjacency_with_capacities(&cond_degrees)?;
+    for (requester, provider) in edges {
+        let u = scc_of[requester.get() as usize];
+        let v = scc_of[provider.get() as usize];
+        if u != v {
+            cond[u as usize].push(v);
+        }
+    }
+    for neighbors in cond.iter_mut() {
+        neighbors.sort_unstable();
+        neighbors.dedup();
+    }
+
+    let finish = dfs_post_order(&cond, scc_of[0])?;
+
+    let mut member_counts = zero_counts(scc_count)?;
+    for &scc in &scc_of {
+        increment_count(&mut member_counts[scc as usize])?;
+    }
+    let mut members = image_groups_with_capacities(&member_counts)?;
+    for (id, &scc) in scc_of.iter().enumerate() {
+        members[scc as usize].push(ImageId::new(id as u32));
+    }
+    for member in members.iter_mut() {
+        member.sort_unstable();
+    }
+
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(scc_count)
+        .map_err(|_| graph_oom())?;
+    for scc in finish {
+        groups.push(core::mem::take(&mut members[scc as usize]));
+    }
+    Ok(groups)
 }
 
 fn zero_counts(len: usize) -> LoadResult<Vec<usize>> {
