@@ -68,7 +68,7 @@ pub struct ScannedArtifact {
 pub(crate) fn scan_root_or_dependency<R: ElfReader>(
     reader: &R,
     profile: LoadProfile,
-    role: Option<ArtifactRole>,
+    role: ArtifactRole,
     limits: LoadLimits,
 ) -> LoadResult<ScannedArtifact> {
     let request = LoadRequest::new(profile, limits);
@@ -78,10 +78,7 @@ pub(crate) fn scan_root_or_dependency<R: ElfReader>(
     let admitted = ImageLoader::new(ReadRef::new(reader), request)
         .admit()
         .map_err(|error| error.at_stage(LoadStage::Discover))?;
-    let admitted = match role {
-        Some(role) => admitted.with_role(role),
-        None => admitted.infer_role(),
-    };
+    let admitted = admitted.with_role(role);
     let inspected = admitted
         .inspect()
         .map_err(|error| error.at_stage(LoadStage::Discover))?;

@@ -320,7 +320,13 @@ mod test_elf_loader {
         fn open(&mut self, _: &()) -> LoadResult<Self::Reader> {
             Ok(self.reader)
         }
+        fn snapshot(&mut self, _: &()) -> LoadResult<Option<ImageHandle>> {
+            Ok(None)
+        }
         fn resolve(&mut self, _: &(), _: &[u8]) -> LoadResult<()> {
+            Err(io_error())
+        }
+        fn resolve_snapshot(&mut self, _: &blueos_loader::ImageDependency) -> LoadResult<()> {
             Err(io_error())
         }
         fn acquire(&mut self, _: &[()], _: &[ImageHandle]) -> LoadResult<Vec<ImageHandle>> {
@@ -387,7 +393,7 @@ mod test_elf_loader {
             memory: Memory(Rc::new(RefCell::new(mapper))),
         };
         loader::load(
-            LoadRequest::new((), profile(), SessionLimits::DEFAULT),
+            LoadRequest::executable((), profile(), SessionLimits::DEFAULT),
             &mut backend,
         )
     }

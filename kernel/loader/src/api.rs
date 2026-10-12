@@ -15,6 +15,8 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::fmt;
 
+pub use crate::dynamic_linker::ImageDependency;
+
 use crate::{
     dynamic_linker::{
         order_components, ArtifactRole, CommittingLinkProduct, DependencyResolution, ImageId,
@@ -49,12 +51,23 @@ pub trait LoaderBackend {
     /// PIEs are rejected before `acquire` reserves their registry state.
     fn is_shared(&self, source: &Self::Source) -> bool;
     fn open(&mut self, source: &Self::Source) -> LoadResult<Self::Reader>;
+    /// Return an already loaded image without opening its ELF. Retain its
+    /// backing until publication or cancellation. This must not reserve a new
+    /// load permit: closure discovery precedes the atomic acquire below.
+    fn snapshot(&mut self, source: &Self::Source) -> LoadResult<Option<ImageHandle>>;
     /// Locate one dependency. A present but invalid file must not fall back.
     fn resolve(&mut self, requester: &Self::Source, name: &[u8]) -> LoadResult<Self::Source>;
+    /// Restore an exact source from a published dependency snapshot, without
+    /// repeating path search or probing the file. Identity and sharing policy
+    /// must match the snapshot; its loaded provider must remain available.
+    fn resolve_snapshot(&mut self, dependency: &ImageDependency) -> LoadResult<Self::Source>;
     /// Reserve the complete closure atomically before any image is mapped.
     /// Return Ready handles for these sources and retain their backing leases
     /// until publication. `existing` is already pinned by the caller, including
     /// providers whose constructors may still be running in this namespace.
+    /// A Ready result must also be visible to `snapshot` on a later probe:
+    /// if publication raced discovery and changed its closure, the loader
+    /// cancels this batch and retries against the immutable Ready snapshot.
     fn acquire(
         &mut self,
         sources: &[Self::Source],
@@ -104,6 +117,10 @@ impl ImageHandle {
     pub const fn is_shared(&self) -> bool {
         self.shared
     }
+    /// The original ordered DT_NEEDED bindings, frozen at publication.
+    pub fn dependencies(&self) -> &[ImageDependency] {
+        self.descriptor.snapshot().dependencies()
+    }
     /// Find a visible defined export; the backend must still pin its backing.
     pub fn lookup_export(&self, name: &[u8]) -> Option<TargetAddress> {
         self.descriptor.lookup_export(name)
@@ -117,23 +134,38 @@ impl ImageHandle {
     }
 }
 
-/// Load inputs. ELF contents determine placement, entry and dependencies.
+/// Load inputs with an explicit purpose. ELF contents determine placement and
+/// dependencies; a shared object is never inferred from its entry or ownership.
 pub struct LoadRequest<S> {
     pub(crate) source: S,
     pub(crate) profile: LoadProfile,
     pub(crate) limits: SessionLimits,
+    pub(crate) role: ArtifactRole,
     pub(crate) existing: Vec<ImageHandle>,
     pub(crate) global: Vec<ImageHandle>,
 }
 
 impl<S> LoadRequest<S> {
-    /// Load an ELF root and its complete declared dependency closure.
-    /// The profile constrains the target ABI, not the ELF object type.
-    pub fn new(source: S, profile: LoadProfile, limits: SessionLimits) -> Self {
+    /// Load a fresh executable (ET_EXEC or PIE) and validate its runtime entry.
+    pub fn executable(source: S, profile: LoadProfile, limits: SessionLimits) -> Self {
+        Self::for_role(source, profile, limits, ArtifactRole::ExecutableRoot)
+    }
+    /// Load or reuse an ET_DYN shared object. ET_EXEC and DF_1_PIE are rejected,
+    /// and a nonzero entry does not turn the object into an executable launch.
+    pub fn shared_object(source: S, profile: LoadProfile, limits: SessionLimits) -> Self {
+        Self::for_role(source, profile, limits, ArtifactRole::SharedObject)
+    }
+    fn for_role(
+        source: S,
+        profile: LoadProfile,
+        limits: SessionLimits,
+        role: ArtifactRole,
+    ) -> Self {
         Self {
             source,
             profile,
             limits,
+            role,
             existing: Vec::new(),
             global: Vec::new(),
         }
@@ -321,15 +353,49 @@ fn load_inner<B: LoaderBackend>(
     request: LoadRequest<B::Source>,
     backend: &mut B,
 ) -> LoadResult<LoadedImage<B::Receipt>> {
-    let mut plan = LoadPlan::build(&request, backend)?;
-    let sources = plan
-        .images
-        .iter()
-        .map(|image| image.source.clone())
-        .collect::<Vec<_>>();
-    let ready = backend.acquire(&sources, &request.existing)?;
+    for image in request.existing.iter().chain(&request.global) {
+        if image.descriptor.snapshot().profile() != request.profile {
+            return Err(LoadError::new(
+                LoadErrorKind::UnsupportedByProfile,
+                ErrorContext::None,
+            ));
+        }
+    }
+    let (mut plan, ready) = loop {
+        let plan = LoadPlan::build(&request, backend)?;
+        let sources = plan
+            .images
+            .iter()
+            .map(|image| image.source.clone())
+            .collect::<Vec<_>>();
+        let ready = backend.acquire(&sources, &request.existing)?;
+        for image in &ready {
+            if image.descriptor.snapshot().profile() != request.profile {
+                return Err(LoadError::new(
+                    LoadErrorKind::UnsupportedByProfile,
+                    ErrorContext::None,
+                ));
+            }
+            if !plan.contains(image.identity())
+                || (request.role == ArtifactRole::ExecutableRoot
+                    && image.identity() == plan.images[0].identity.as_bytes())
+            {
+                return Err(invalid());
+            }
+        }
+        if ready.iter().all(|image| plan.matches_snapshot(image)) {
+            break (plan, ready);
+        }
+        // A concurrent publisher may win after a vacant source was scanned.
+        // Release this whole reservation before planning its frozen closure;
+        // never enlarge a batch while holding partial load permits.
+        backend.cancel_load();
+    };
     let mut providers = request.existing;
-    for image in ready {
+    providers
+        .try_reserve(plan.images.len() + ready.len())
+        .map_err(|_| oom())?;
+    for image in plan.snapshots().cloned().chain(ready) {
         if !providers
             .iter()
             .any(|provider| provider.identity() == image.identity())

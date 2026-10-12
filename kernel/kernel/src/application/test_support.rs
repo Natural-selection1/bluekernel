@@ -25,8 +25,8 @@ use blueos_loader::{
     memory::ImageAllocation,
     profile::{ElfClass, ElfMachine, SessionLimits},
     reader::ElfReader,
-    CommittedAllocations, ImageHandle, LoadRequest, LoadResult, LoadedImage, LoaderBackend,
-    Publication,
+    CommittedAllocations, ImageDependency, ImageHandle, LoadRequest, LoadResult, LoadedImage,
+    LoaderBackend, Publication,
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -77,7 +77,13 @@ impl LoaderBackend for Backend {
     fn open(&mut self, _: &Self::Source) -> LoadResult<Reader> {
         Ok(Reader(elf(self.shared)))
     }
+    fn snapshot(&mut self, _: &Self::Source) -> LoadResult<Option<ImageHandle>> {
+        Ok(None)
+    }
     fn resolve(&mut self, _: &Self::Source, _: &[u8]) -> LoadResult<Self::Source> {
+        panic!("the test image has no DT_NEEDED")
+    }
+    fn resolve_snapshot(&mut self, _: &ImageDependency) -> LoadResult<Self::Source> {
         panic!("the test image has no DT_NEEDED")
     }
     fn acquire(&mut self, _: &[Self::Source], _: &[ImageHandle]) -> LoadResult<Vec<ImageHandle>> {
@@ -120,11 +126,12 @@ pub(super) fn load_image(
         publisher: KernelLinkPublisher::new(memory.clone()),
         shared,
     };
-    blueos_loader::load(
-        LoadRequest::new(path, super::board_dynamic_profile(), SessionLimits::DEFAULT),
-        &mut backend,
-    )
-    .expect("test ELF loads")
+    let request = if shared {
+        LoadRequest::shared_object(path, super::board_dynamic_profile(), SessionLimits::DEFAULT)
+    } else {
+        LoadRequest::executable(path, super::board_dynamic_profile(), SessionLimits::DEFAULT)
+    };
+    blueos_loader::load(request, &mut backend).expect("test ELF loads")
 }
 
 pub(super) fn publish_candidates(

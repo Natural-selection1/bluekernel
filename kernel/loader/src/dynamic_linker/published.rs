@@ -18,7 +18,8 @@
 //! a Ready system DSO that a registry keeps long-term. It carries exactly what
 //! a later application needs to *import* that image — identity, SONAME,
 //! load bias, published runtime regions, export surface and the
-//! program-header summary — so a second link binds against the same
+//! program-header summary, ABI profile and original dependency bindings —
+//! so a second link binds against the same
 //! provider without re-opening, re-mapping, re-relocating or re-sealing it.
 //!
 //! The descriptor never holds an [`AllocationLease`](crate::memory::AllocationLease):
@@ -33,15 +34,88 @@ use crate::{
         artifact::{ArtifactIdentity, DependencyName},
         graph::DependencyNode,
         symbol::SymbolTable,
-        ImageOwnership, ProgramHeaderRuntimeInfo, SymbolBinding, SymbolDefinition,
+        ArtifactRole, ImageOwnership, ProgramHeaderRuntimeInfo, SymbolBinding, SymbolDefinition,
         SymbolVisibility,
     },
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadErrorKind},
     image::LoadedRegion,
     memory_mapper::MemoryPermissions,
+    profile::LoadProfile,
     LoadError, LoadResult,
 };
+
+/// One original DT_NEEDED binding. The identity names the selected backing,
+/// rather than a filename to search again in a later namespace or filesystem.
+#[derive(Clone, Debug)]
+pub struct ImageDependency {
+    name: DependencyName,
+    identity: ArtifactIdentity,
+    shared: bool,
+}
+
+impl ImageDependency {
+    pub(crate) fn new(name: DependencyName, identity: ArtifactIdentity, shared: bool) -> Self {
+        Self {
+            name,
+            identity,
+            shared,
+        }
+    }
+    pub fn name(&self) -> &[u8] {
+        self.name.as_bytes()
+    }
+    pub fn identity(&self) -> &[u8] {
+        self.identity.as_bytes()
+    }
+    pub const fn is_shared(&self) -> bool {
+        self.shared
+    }
+    pub(crate) fn needed(&self) -> &DependencyName {
+        &self.name
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PublishedLoadSnapshot {
+    profile: LoadProfile,
+    role: ArtifactRole,
+    dependencies: Vec<ImageDependency>,
+}
+
+impl PublishedLoadSnapshot {
+    pub(crate) fn new(
+        profile: LoadProfile,
+        role: ArtifactRole,
+        dependencies: Vec<ImageDependency>,
+    ) -> Self {
+        Self {
+            profile,
+            role,
+            dependencies,
+        }
+    }
+    pub(crate) const fn profile(&self) -> LoadProfile {
+        self.profile
+    }
+    pub(crate) const fn role(&self) -> ArtifactRole {
+        self.role
+    }
+    pub(crate) fn dependencies(&self) -> &[ImageDependency] {
+        &self.dependencies
+    }
+    pub(crate) fn metadata_bytes(&self) -> u64 {
+        core::mem::size_of::<Self>() as u64
+            + (self.dependencies.capacity() * core::mem::size_of::<ImageDependency>()) as u64
+            + self
+                .dependencies
+                .iter()
+                .map(|dependency| {
+                    dependency.name.as_bytes().len() as u64 + dependency.identity.metadata_bytes()
+                })
+                .sum::<u64>()
+    }
+}
 
 /// One published runtime region of a Ready image, sufficient for control-flow
 /// and data target range checks during a later import.
@@ -111,6 +185,7 @@ pub struct PublishedImageDescriptor {
     regions: Vec<PublishedRegion>,
     exports: PublishedSymbolTable,
     program_headers: ProgramHeaderRuntimeInfo,
+    snapshot: PublishedLoadSnapshot,
 }
 
 impl PublishedImageDescriptor {
@@ -129,6 +204,7 @@ impl PublishedImageDescriptor {
         load_bias: TargetAddress,
         program_headers: ProgramHeaderRuntimeInfo,
         symbols: SymbolTable,
+        snapshot: PublishedLoadSnapshot,
     ) -> LoadResult<Self> {
         let published_regions = publish_regions(&load_segments, &regions)?;
         Ok(Self {
@@ -138,12 +214,17 @@ impl PublishedImageDescriptor {
             regions: published_regions,
             exports: PublishedSymbolTable::new(symbols),
             program_headers,
+            snapshot,
         })
     }
 
     #[inline]
     pub const fn identity(&self) -> &ArtifactIdentity {
         &self.identity
+    }
+
+    pub(crate) const fn snapshot(&self) -> &PublishedLoadSnapshot {
+        &self.snapshot
     }
 
     #[inline]

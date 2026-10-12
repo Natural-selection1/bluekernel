@@ -37,9 +37,9 @@ use crate::{
         relocate::{self, ProviderRegion, RelocationImage, RelocationSource, RelocationTypeSet},
         scope::RelocationBinding,
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
-        DependencyResolution, ImageId, ImageOwnership, ImportedImageDescriptor,
-        PublishedImageDescriptor, PublishedRegion, ResolvedArtifact, RuntimeImageMetadata,
-        RuntimeImageState, ScopeSet, SymbolTable,
+        DependencyResolution, ImageDependency, ImageId, ImageOwnership, ImportedImageDescriptor,
+        PublishedImageDescriptor, PublishedLoadSnapshot, PublishedRegion, ResolvedArtifact,
+        RuntimeImageMetadata, RuntimeImageState, ScopeSet, SymbolTable,
     },
     elf::LoadSegmentInfo,
     error::{ErrorContext, LoadErrorKind, LoadStage},
@@ -124,6 +124,7 @@ impl SessionUsage {
 /// log.
 pub(crate) struct SessionImage {
     image_id: ImageId,
+    role: ArtifactRole,
     allocation: SessionAllocation,
     state: RuntimeImageState,
 }
@@ -252,6 +253,10 @@ impl<A: ArchRelocator> DynamicLinker<A> {
             );
         }
         match root {
+            DependencyResolution::Existing(_) => {
+                Err(session_error(LoadErrorKind::BadElf, ErrorContext::None)
+                    .at_stage(LoadStage::Beginning))
+            }
             DependencyResolution::Load(root) => {
                 self.begin_loaded(root, profile, limits, memory, role)
             }
@@ -358,6 +363,7 @@ impl<A: ArchRelocator> DynamicLinker<A> {
             .map_err(|_| LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None))?;
         images.push(SessionImage {
             image_id: root_id,
+            role,
             allocation,
             state: runtime,
         });
@@ -561,6 +567,15 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
             };
 
             match resolved {
+                DependencyResolution::Existing(identity) => {
+                    let provider = self.graph.find_identity(&identity).ok_or_else(|| {
+                        session_error(LoadErrorKind::BadElf, ErrorContext::None)
+                            .at_stage(LoadStage::Discover)
+                    })?;
+                    self.graph
+                        .link_existing(requester, provider, item.needed_index())
+                        .map_err(|error| error.at_stage(LoadStage::Discover))?;
+                }
                 DependencyResolution::Load(artifact) => {
                     let (identity, ownership, reader) = artifact.into_parts();
 
@@ -619,6 +634,7 @@ impl<'a, M: ImageMemory + ?Sized, A: ArchRelocator> BuildingSession<'a, M, A> {
                     })?;
                     self.state.images.push(SessionImage {
                         image_id: provider,
+                        role: ArtifactRole::SharedObject,
                         allocation,
                         state: runtime,
                     });
@@ -1085,7 +1101,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
             graph,
             limits,
             usage,
-            profile: _,
+            profile,
             arch: _,
             state,
         } = self;
@@ -1099,11 +1115,36 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         slots.try_reserve_exact(total).map_err(|_| publish_oom())?;
         slots.resize_with(total, || None);
 
+        let mut snapshot_bytes = 0u64;
         for image in images {
-            let node = graph.node(image.image_id).ok_or_else(|| {
-                LoadError::new(LoadErrorKind::BadElf, ErrorContext::None)
-                    .at_stage(LoadStage::Publish)
-            })?;
+            let node = graph.node(image.image_id).ok_or_else(publish_invalid)?;
+            let needed = image.state.metadata().needed();
+            let mut dependencies = Vec::new();
+            dependencies
+                .try_reserve_exact(needed.len())
+                .map_err(|_| publish_oom())?;
+            for (index, name) in needed.iter().enumerate() {
+                let edge = graph
+                    .edges()
+                    .iter()
+                    .find(|edge| {
+                        edge.requester() == image.image_id && edge.needed_index() as usize == index
+                    })
+                    .ok_or_else(publish_invalid)?;
+                let provider = graph.node(edge.provider()).ok_or_else(publish_invalid)?;
+                dependencies.push(ImageDependency::new(
+                    name.try_clone()?,
+                    provider.artifact().try_clone()?,
+                    matches!(
+                        provider.ownership(),
+                        ImageOwnership::SystemCandidate | ImageOwnership::ExternalReady
+                    ),
+                ));
+            }
+            let snapshot = PublishedLoadSnapshot::new(profile, image.role, dependencies);
+            snapshot_bytes = snapshot_bytes
+                .checked_add(snapshot.metadata_bytes())
+                .ok_or_else(session_overflow)?;
             let (regions, load_segments, load_bias, program_headers, symbols) =
                 image.state.into_publish_parts();
             let ownership = node.ownership();
@@ -1115,6 +1156,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
                     load_bias,
                     program_headers,
                     symbols,
+                    snapshot,
                 )
                 .map_err(|error| error.at_stage(LoadStage::Publish))?,
             );
@@ -1148,6 +1190,7 @@ impl<M: ImageMemory + ?Sized, A: ArchRelocator> SealedSession<'_, M, A> {
         let metadata_bytes = usage
             .runtime_metadata_bytes
             .checked_add(extra_metadata)
+            .and_then(|bytes| bytes.checked_add(snapshot_bytes))
             .ok_or_else(session_overflow)?;
         limits.check_total_runtime_metadata_bytes(metadata_bytes)?;
         let prepared = publisher
@@ -1247,6 +1290,7 @@ fn imported_metadata_bytes(descriptor: &PublishedImageDescriptor) -> LoadResult<
         .exports()
         .metadata_bytes()
         .checked_add(descriptor.identity().metadata_bytes())
+        .and_then(|bytes| bytes.checked_add(descriptor.snapshot().metadata_bytes()))
         .and_then(|bytes| {
             bytes.checked_add(
                 descriptor
@@ -1359,6 +1403,10 @@ fn record_bindings(
 
 fn publish_oom() -> LoadError {
     LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None).at_stage(LoadStage::Publish)
+}
+
+fn publish_invalid() -> LoadError {
+    LoadError::new(LoadErrorKind::BadElf, ErrorContext::None).at_stage(LoadStage::Publish)
 }
 
 fn link_seal_oom() -> LoadError {

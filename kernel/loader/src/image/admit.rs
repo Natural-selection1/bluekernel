@@ -58,7 +58,7 @@ pub(crate) struct AdmittedImage<R: ElfReader> {
     header: ElfHeaderInfo,
     request: LoadRequest,
     file_len: u64,
-    role: Option<ArtifactRole>,
+    role: ArtifactRole,
 }
 
 impl<R: ElfReader> AdmittedImage<R> {
@@ -74,7 +74,7 @@ impl<R: ElfReader> AdmittedImage<R> {
             header,
             request,
             file_len,
-            role: Some(ArtifactRole::ExecutableRoot),
+            role: ArtifactRole::ExecutableRoot,
         }
     }
 
@@ -83,13 +83,7 @@ impl<R: ElfReader> AdmittedImage<R> {
     /// still requires a `PT_DYNAMIC` (checked during `inspect`).
     #[inline]
     pub(crate) const fn with_role(mut self, role: ArtifactRole) -> Self {
-        self.role = Some(role);
-        self
-    }
-
-    /// Infer the root role from the ELF rather than a caller-selected mode.
-    pub(crate) const fn infer_role(mut self) -> Self {
-        self.role = None;
+        self.role = role;
         self
     }
 
@@ -357,20 +351,17 @@ impl<R: ElfReader> AdmittedImage<R> {
             None => DynamicFeatureSummary::empty(),
         };
 
-        // ET_EXEC and an explicitly marked PIE are executable roots. Older
-        // PIE toolchains may omit DF_1_PIE; a SONAME-less root with an entry
-        // still supplies an executable entry. A DSO with no entry needs no
-        // caller-selected shared mode.
-        let role = self.role.unwrap_or_else(|| {
-            if self.header.r#type() == ElfType::Exec
-                || summary.is_pie()
-                || (self.header.entry() != 0 && summary.soname().is_none())
-            {
-                ArtifactRole::ExecutableRoot
-            } else {
-                ArtifactRole::SharedObject
-            }
-        });
+        let role = self.role;
+        if role == ArtifactRole::ExecutableRoot && self.header.entry() == 0 {
+            return Err(LoadError::new(
+                LoadErrorKind::BadElf,
+                ErrorContext::HeaderField {
+                    field: crate::error::HeaderField::Entry,
+                    value: 0,
+                },
+            )
+            .at_stage(LoadStage::Inspect));
+        }
         if role == ArtifactRole::SharedObject {
             if self.header.r#type() != ElfType::Dyn || summary.is_pie() {
                 return Err(LoadError::new(

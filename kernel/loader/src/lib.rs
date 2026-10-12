@@ -25,6 +25,9 @@
 //! Call [`load`] with a [`LoadRequest`] and a [`LoaderBackend`]. The loader
 //! discovers dependencies, links and publishes the complete image closure;
 //! the backend supplies file policy, memory and resource ownership.
+//! Select [`LoadRequest::executable`] for a fresh launch or
+//! [`LoadRequest::shared_object`] for a runtime library load. Ready images
+//! reuse published dependency snapshots without reopening their ELF files.
 //!
 //! Core loading entry points and [`LoadError`]/[`LoadResult`] are available
 //! at the crate root. Reader and memory contracts live in
@@ -53,7 +56,8 @@ mod relocation;
 
 // Frequently used entry points and types.
 pub use api::{
-    load, CommittedAllocations, ImageHandle, LoadRequest, LoadedImage, LoaderBackend, Publication,
+    load, CommittedAllocations, ImageDependency, ImageHandle, LoadRequest, LoadedImage,
+    LoaderBackend, Publication,
 };
 pub use error::{LoadError, LoadResult};
 

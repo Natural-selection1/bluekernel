@@ -24,8 +24,8 @@ use crate::{
     profile::{LoadLimits, LoadProfile, SessionLimits},
     reader::ElfReader,
     tests::fixture::SliceElfReader,
-    CommittedAllocations, ImageHandle, LoadError, LoadRequest, LoadResult, LoadedImage,
-    LoaderBackend, Publication,
+    CommittedAllocations, ImageDependency, ImageHandle, LoadError, LoadRequest, LoadResult,
+    LoadedImage, LoaderBackend, Publication,
 };
 use alloc::{rc::Rc, vec::Vec};
 use blueos_test_macro::test;
@@ -179,6 +179,10 @@ impl Drop for Receipt {
 }
 struct Backend {
     files: Vec<(&'static str, Rc<[u8]>)>,
+    sources: Vec<&'static str>,
+    ready: Vec<ImageHandle>,
+    ready_after_acquire: Vec<ImageHandle>,
+    opens: Vec<&'static str>,
     memory: SharedMemory,
     reject_acquire: bool,
     reject_publish: bool,
@@ -191,6 +195,10 @@ struct Backend {
 impl Backend {
     fn new(files: Vec<(&'static str, Vec<u8>)>) -> Self {
         Self {
+            sources: files.iter().map(|(name, _)| *name).collect(),
+            ready: Vec::new(),
+            ready_after_acquire: Vec::new(),
+            opens: Vec::new(),
             files: files
                 .into_iter()
                 .map(|(name, bytes)| (name, Rc::from(bytes)))
@@ -228,30 +236,58 @@ impl LoaderBackend for Backend {
         self.shared
     }
     fn open(&mut self, source: &Self::Source) -> LoadResult<Reader> {
+        self.opens.push(*source);
         self.files
             .iter()
             .find(|(name, _)| name == source)
             .map(|(_, bytes)| Reader(bytes.clone()))
             .ok_or_else(failure)
     }
-    fn resolve(&mut self, _: &Self::Source, name: &[u8]) -> LoadResult<Self::Source> {
-        self.files
+    fn snapshot(&mut self, source: &Self::Source) -> LoadResult<Option<ImageHandle>> {
+        Ok(self
+            .ready
             .iter()
-            .find(|(source, _)| source.as_bytes() == name)
-            .map(|(source, _)| *source)
+            .find(|image| image.identity() == source.as_bytes())
+            .cloned())
+    }
+    fn resolve(&mut self, _: &Self::Source, name: &[u8]) -> LoadResult<Self::Source> {
+        self.sources
+            .iter()
+            .find(|source| source.as_bytes() == name)
+            .copied()
+            .ok_or_else(failure)
+    }
+    fn resolve_snapshot(&mut self, dependency: &ImageDependency) -> LoadResult<Self::Source> {
+        self.sources
+            .iter()
+            .find(|source| source.as_bytes() == dependency.identity())
+            .copied()
             .ok_or_else(failure)
     }
     fn acquire(
         &mut self,
         sources: &[Self::Source],
-        _: &[ImageHandle],
+        existing: &[ImageHandle],
     ) -> LoadResult<Vec<ImageHandle>> {
-        assert_eq!(sources.len(), self.files.len());
+        assert!(sources.iter().all(|source| self.sources.contains(source)));
         if self.reject_acquire {
             return Err(failure());
         }
         self.memory.acquired.set(true);
-        Ok(Vec::new())
+        self.ready.append(&mut self.ready_after_acquire);
+        Ok(self
+            .ready
+            .iter()
+            .filter(|image| {
+                sources
+                    .iter()
+                    .any(|source| source.as_bytes() == image.identity())
+                    && !existing
+                        .iter()
+                        .any(|previous| previous.identity() == image.identity())
+            })
+            .cloned()
+            .collect())
     }
     fn memory(&mut self) -> SharedMemory {
         self.memory.clone()
@@ -289,7 +325,7 @@ impl LoaderBackend for Backend {
         }
     }
     fn complete_load(&mut self, image: &mut LoadedImage<Receipt>) -> LoadResult<()> {
-        assert_eq!(image.images().count(), self.files.len());
+        assert!(image.images().count() >= 1 && image.images().count() <= self.sources.len());
         if self.reject_complete {
             Err(failure())
         } else {
@@ -310,7 +346,7 @@ fn load_complete_entry_transfers_one_allocation() {
     let (bytes, profile) = super::linker::native_fixture();
     let mut backend = Backend::new(alloc::vec![("root", bytes)]);
     let loaded = load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+        LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
         &mut backend,
     )
     .expect("complete load");
@@ -344,55 +380,79 @@ fn set_entry(bytes: &mut [u8], entry: u64) {
 }
 
 #[test]
-fn load_registry_root_with_entry_remains_shared() {
+fn load_shared_purpose_with_entry_keeps_private_or_registry_ownership() {
     let (_, profile) = super::linker::native_fixture();
-    let mut backend = Backend::new(alloc::vec![("root", native_dso(&[]))]);
-    backend.shared = true;
-    let loaded = load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
-        &mut backend,
-    )
-    .expect("a SONAME-less DSO may have a nonzero entry");
-    assert!(loaded.images().next().unwrap().is_shared());
-    assert!(loaded.entry().is_none());
-    assert_eq!(backend.commits, 1);
-    drop(loaded);
-    assert_eq!(backend.memory.releases.get(), 1);
-}
-
-#[test]
-fn load_registry_rejects_executable_roots_before_acquire() {
-    let (_, profile) = super::linker::native_fixture();
-    let pie = native_dso_with_flags(&[], goblin::elf::dynamic::DF_1_PIE);
-    let mut exec = native_dso(&[]);
-    exec[16..18].copy_from_slice(&goblin::elf::header::ET_EXEC.to_le_bytes());
-    for bytes in [pie, exec] {
-        let mut backend = Backend::new(alloc::vec![("root", bytes)]);
-        backend.shared = true;
-        let error = load(
-            LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+    for shared in [false, true] {
+        let mut backend = Backend::new(alloc::vec![("root", native_dso(&[]))]);
+        backend.shared = shared;
+        let loaded = load(
+            LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT),
             &mut backend,
         )
-        .err()
-        .expect("executables cannot enter the shared-image registry");
-        assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
-        assert!(!backend.memory.acquired.get());
-        assert_eq!(backend.memory.allocations.get(), 0);
-        assert_eq!(backend.cancels, 1);
+        .expect("a SONAME-less DSO may have a nonzero entry");
+        assert_eq!(loaded.images().next().unwrap().is_shared(), shared);
+        assert!(loaded.entry().is_none());
+        assert_eq!(backend.commits, 1);
+        drop(loaded);
+        assert_eq!(backend.memory.releases.get(), 1);
     }
 }
 
 #[test]
-fn load_detects_shared_root_without_an_entry() {
+fn load_shared_purpose_rejects_executable_roots_before_acquire() {
+    let (_, profile) = super::linker::native_fixture();
+    let pie = native_dso_with_flags(&[], goblin::elf::dynamic::DF_1_PIE);
+    let mut exec = native_dso(&[]);
+    exec[16..18].copy_from_slice(&goblin::elf::header::ET_EXEC.to_le_bytes());
+    for shared in [false, true] {
+        for bytes in [&pie, &exec] {
+            let mut backend = Backend::new(alloc::vec![("root", bytes.clone())]);
+            backend.shared = shared;
+            let error = load(
+                LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT),
+                &mut backend,
+            )
+            .err()
+            .expect("shared purpose rejects executables irrespective of ownership");
+            assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
+            assert!(!backend.memory.acquired.get());
+            assert_eq!(backend.memory.allocations.get(), 0);
+            assert_eq!(backend.cancels, 1);
+        }
+    }
+}
+
+#[test]
+fn load_executable_purpose_rejects_zero_entry_and_registry_ownership() {
+    let (_, profile) = super::linker::native_fixture();
+    for shared in [false, true] {
+        let mut bytes = native_dso(&[]);
+        if !shared {
+            set_entry(&mut bytes, 0);
+        }
+        let mut backend = Backend::new(alloc::vec![("root", bytes)]);
+        backend.shared = shared;
+        assert!(load(
+            LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
+            &mut backend,
+        )
+        .is_err());
+        assert!(!backend.memory.acquired.get());
+        assert_eq!(backend.memory.allocations.get(), 0);
+    }
+}
+
+#[test]
+fn load_shared_root_without_an_entry() {
     let (_, profile) = super::linker::native_fixture();
     let mut bytes = native_dso(&[]);
     set_entry(&mut bytes, 0);
     let mut backend = Backend::new(alloc::vec![("root", bytes)]);
     let loaded = load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+        LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT),
         &mut backend,
     )
-    .expect("shared root is inferred from ELF");
+    .expect("shared purpose permits a zero entry");
     assert!(loaded.entry().is_none());
     assert!(loaded.startup().is_empty());
     assert_eq!(backend.memory.allocations.get(), 1);
@@ -407,7 +467,7 @@ fn load_marked_pie_requires_an_executable_entry() {
     set_entry(&mut bytes, 0);
     let mut backend = Backend::new(alloc::vec![("root", bytes)]);
     assert!(load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+        LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
         &mut backend
     )
     .is_err());
@@ -415,7 +475,7 @@ fn load_marked_pie_requires_an_executable_entry() {
 }
 
 #[test]
-fn load_detects_fixed_exec_without_a_selected_mode() {
+fn load_executable_uses_elf_fixed_placement() {
     use crate::memory::{AllocationOwnership, MemoryRegion};
     use blueos_infra::storage::Storage;
     let backing = Storage::try_from_layout(core::alloc::Layout::from_size_align(0x100, 4).unwrap())
@@ -447,7 +507,7 @@ fn load_detects_fixed_exec_without_a_selected_mode() {
     let mut backend = Backend::new(alloc::vec![("root", bytes)]);
     backend.memory.regions = Some(regions);
     let mut loaded = load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+        LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
         &mut backend,
     )
     .expect("ET_EXEC uses the same public load entry");
@@ -471,7 +531,7 @@ fn load_fixed_exec_rejects_unreserved_addresses() {
     bytes[16..18].copy_from_slice(&goblin::elf::header::ET_EXEC.to_le_bytes());
     let mut backend = Backend::new(alloc::vec![("root", bytes)]);
     let error = load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+        LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
         &mut backend,
     )
     .err()
@@ -501,7 +561,7 @@ fn load_completion_failure_releases_committed_receipt_once() {
     let mut backend = Backend::new(alloc::vec![("root", bytes)]);
     backend.reject_complete = true;
     assert!(load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+        LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
         &mut backend
     )
     .is_err());
@@ -517,7 +577,7 @@ fn load_publication_failure_aborts_before_commit() {
     let mut backend = Backend::new(alloc::vec![("root", bytes)]);
     backend.reject_publish = true;
     assert!(load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+        LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
         &mut backend
     )
     .is_err());
@@ -527,7 +587,7 @@ fn load_publication_failure_aborts_before_commit() {
     );
     backend.reject_publish = false;
     let loaded = load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+        LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
         &mut backend,
     )
     .expect("rollback freed mapper");
@@ -539,7 +599,7 @@ fn load_acquire_failure_maps_no_images() {
     let mut backend = Backend::new(alloc::vec![("root", bytes)]);
     backend.reject_acquire = true;
     assert!(load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+        LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
         &mut backend
     )
     .is_err());
@@ -557,24 +617,171 @@ fn load_reused_provider_preserves_transitive_closure() {
     let root_bytes = native_dso(&["B"]);
     let mut c_backend = Backend::new(alloc::vec![("C", c_bytes.clone())]);
     let c = load(
-        LoadRequest::new("C", profile, SessionLimits::DEFAULT),
+        LoadRequest::shared_object("C", profile, SessionLimits::DEFAULT),
         &mut c_backend,
     )
     .expect("load C");
     let c_handle = c.images().next().unwrap().clone();
     let mut b_backend = Backend::new(alloc::vec![("B", b_bytes.clone()), ("C", c_bytes.clone())]);
-    let b_request = LoadRequest::new("B", profile, SessionLimits::DEFAULT)
+    let b_request = LoadRequest::shared_object("B", profile, SessionLimits::DEFAULT)
         .with_namespace(alloc::vec![c_handle.clone()], Vec::new());
     let b = load(b_request, &mut b_backend).expect("load B with existing C");
     let b_handle = b.images().next().unwrap().clone();
-    let mut backend = Backend::new(alloc::vec![
-        ("root", root_bytes),
-        ("B", b_bytes),
-        ("C", c_bytes)
+    assert_eq!(b_handle.dependencies().len(), 1);
+    assert_eq!(b_handle.dependencies()[0].name(), b"C");
+    assert_eq!(b_handle.dependencies()[0].identity(), b"C");
+    assert!(!b_handle.dependencies()[0].is_shared());
+    for replacement in [None, Some(alloc::vec![0; 16]), Some(native_dso(&["new"]))] {
+        let mut backend = Backend::new(alloc::vec![
+            ("root", root_bytes.clone()),
+            ("B", b_bytes.clone()),
+            ("C", c_bytes.clone())
+        ]);
+        backend.files.retain(|(source, _)| *source == "root");
+        if let Some(bytes) = replacement {
+            backend.files.push(("B", Rc::from(bytes)));
+        }
+        let request = LoadRequest::executable("root", profile, SessionLimits::DEFAULT)
+            .with_namespace(alloc::vec![b_handle.clone(), c_handle.clone()], Vec::new());
+        let loaded =
+            load(request, &mut backend).expect("reuse original B -> C despite filesystem changes");
+        let root = loaded.images().next().unwrap();
+        assert_eq!(
+            loaded
+                .lookup_scope(root)
+                .iter()
+                .map(|image| image.identity())
+                .collect::<Vec<_>>(),
+            [b"root".as_slice(), b"B".as_slice(), b"C".as_slice()]
+        );
+        assert_eq!(backend.opens, ["root"]);
+        assert_eq!(loaded.retained_images().len(), 2);
+        assert_eq!(backend.memory.allocations.get(), 1);
+        drop(loaded.into_receipt());
+    }
+    drop(b.into_receipt());
+    drop(c.into_receipt());
+}
+
+#[test]
+fn load_ready_cycle_uses_snapshots_without_elf_files() {
+    let (_, profile) = super::linker::native_fixture();
+    let mut owner = Backend::new(alloc::vec![
+        ("root", native_dso(&["child"])),
+        ("child", native_dso(&["root"]))
     ]);
-    let request = LoadRequest::new("root", profile, SessionLimits::DEFAULT)
-        .with_namespace(alloc::vec![b_handle, c_handle], Vec::new());
-    let loaded = load(request, &mut backend).expect("reuse B and its C dependency");
+    owner.shared = true;
+    let original = load(
+        LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT),
+        &mut owner,
+    )
+    .unwrap();
+    let mut backend = Backend::new(alloc::vec![("root", Vec::new()), ("child", Vec::new())]);
+    backend.shared = true;
+    backend.ready = original.images().cloned().collect();
+    backend.files.clear();
+    let reused = load(
+        LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT),
+        &mut backend,
+    )
+    .unwrap();
+    let root = reused.images().next().unwrap();
+    assert!(!reused.is_new(root));
+    assert_eq!(reused.lookup_scope(root).len(), 2);
+    assert!(reused.entry().is_none());
+    assert!(reused.startup().is_empty());
+    assert!(backend.opens.is_empty());
+    assert_eq!(backend.memory.allocations.get(), 0);
+    assert_eq!(root.dependencies()[0].identity(), b"child");
+    assert!(root.dependencies()[0].is_shared());
+}
+
+#[test]
+fn load_snapshot_requires_its_original_loaded_dependency() {
+    let (_, profile) = super::linker::native_fixture();
+    let mut owner = Backend::new(alloc::vec![
+        ("B", native_dso(&["C"])),
+        ("C", native_dso(&[]))
+    ]);
+    let original = load(
+        LoadRequest::shared_object("B", profile, SessionLimits::DEFAULT),
+        &mut owner,
+    )
+    .unwrap();
+    let mut backend = Backend::new(alloc::vec![("B", native_dso(&[])), ("C", native_dso(&[]))]);
+    backend
+        .ready
+        .push(original.images().next().unwrap().clone());
+    assert!(load(
+        LoadRequest::shared_object("B", profile, SessionLimits::DEFAULT),
+        &mut backend
+    )
+    .is_err());
+    assert!(
+        backend.opens.is_empty(),
+        "a missing pin must not reload an old provider's file"
+    );
+    assert!(!backend.memory.acquired.get());
+}
+
+#[test]
+fn load_snapshot_rejects_incompatible_profile_and_executable_role() {
+    let (bytes, profile) = super::linker::native_fixture();
+    let mut owner = Backend::new(alloc::vec![("root", bytes)]);
+    let executable = load(
+        LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
+        &mut owner,
+    )
+    .unwrap();
+    for requested_profile in [
+        profile,
+        if profile == LoadProfile::riscv64() {
+            LoadProfile::aarch64()
+        } else {
+            LoadProfile::riscv64()
+        },
+    ] {
+        let mut backend = Backend::new(alloc::vec![("root", Vec::new())]);
+        backend.ready = executable.images().cloned().collect();
+        let error = load(
+            LoadRequest::shared_object("root", requested_profile, SessionLimits::DEFAULT),
+            &mut backend,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(error.kind(), LoadErrorKind::UnsupportedByProfile));
+        assert!(backend.opens.is_empty());
+        assert!(!backend.memory.acquired.get());
+    }
+}
+
+#[test]
+fn load_concurrent_ready_provider_replans_its_frozen_closure() {
+    let (_, profile) = super::linker::native_fixture();
+    let mut owner = Backend::new(alloc::vec![
+        ("B", native_dso(&["C"])),
+        ("C", native_dso(&[]))
+    ]);
+    owner.shared = true;
+    let original = load(
+        LoadRequest::shared_object("B", profile, SessionLimits::DEFAULT),
+        &mut owner,
+    )
+    .unwrap();
+    let mut backend = Backend::new(alloc::vec![
+        ("root", native_dso(&["B"])),
+        ("B", native_dso(&["D"])),
+        ("D", native_dso(&[])),
+        ("C", Vec::new())
+    ]);
+    backend.shared = true;
+    backend.ready_after_acquire = original.images().cloned().collect();
+    backend.files.retain(|(source, _)| *source != "C");
+    let loaded = load(
+        LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT),
+        &mut backend,
+    )
+    .unwrap();
     let root = loaded.images().next().unwrap();
     assert_eq!(
         loaded
@@ -584,11 +791,12 @@ fn load_reused_provider_preserves_transitive_closure() {
             .collect::<Vec<_>>(),
         [b"root".as_slice(), b"B".as_slice(), b"C".as_slice()]
     );
-    assert_eq!(loaded.retained_images().len(), 2);
+    assert_eq!(
+        backend.cancels, 1,
+        "cancel the obsolete reservation before replanning"
+    );
     assert_eq!(backend.memory.allocations.get(), 1);
-    drop(loaded.into_receipt());
-    drop(b.into_receipt());
-    drop(c.into_receipt());
+    assert_eq!(backend.opens, ["root", "B", "D", "root"]);
 }
 
 fn native_dso(needed: &[&str]) -> Vec<u8> {
@@ -759,7 +967,7 @@ fn shared_image_retains_an_actual_global_provider_without_dt_needed() {
     )]);
     provider_backend.shared = true;
     let provider = load(
-        LoadRequest::new("provider", profile, SessionLimits::DEFAULT),
+        LoadRequest::shared_object("provider", profile, SessionLimits::DEFAULT),
         &mut provider_backend,
     )
     .unwrap();
@@ -770,7 +978,7 @@ fn shared_image_retains_an_actual_global_provider_without_dt_needed() {
     )]);
     backend.shared = true;
     let mut image = load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT).with_namespace(
+        LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT).with_namespace(
             alloc::vec![provider_handle.clone()],
             alloc::vec![provider_handle],
         ),
@@ -828,7 +1036,7 @@ fn shared_binding_cycle_is_structural_and_preserves_reverse_lifecycle_order() {
     ]);
     backend.shared = true;
     let image = load(
-        LoadRequest::new("root", profile, SessionLimits::DEFAULT),
+        LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT),
         &mut backend,
     )
     .unwrap();
@@ -849,7 +1057,7 @@ fn shared_binding_cycle_is_structural_and_preserves_reverse_lifecycle_order() {
 }
 
 fn plan_request(limits: SessionLimits) -> LoadRequest<&'static str> {
-    LoadRequest::new("root", LoadProfile::arm_thumb_soft_float(), limits)
+    LoadRequest::shared_object("root", LoadProfile::arm_thumb_soft_float(), limits)
 }
 #[test]
 fn planning_closes_diamond_and_cycle_in_bfs_order() {
@@ -901,7 +1109,7 @@ fn planning_enforces_image_and_depth_limits_before_mapping() {
     assert_eq!(backend.memory.allocations.get(), 0);
 }
 #[test]
-fn load_request_discovers_dependencies_without_a_selected_mode() {
+fn load_request_discovers_declared_dependencies() {
     let mut backend = Backend::new(alloc::vec![
         ("root", dso_elf(&["left"], None)),
         ("left", dso_elf(&[], None)),

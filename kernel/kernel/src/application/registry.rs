@@ -109,6 +109,14 @@ pub enum AcquireBatchOutcome {
     Pending(SystemBatchWait),
 }
 
+/// A discovery-time snapshot probe. Vacant paths are left untouched; only a
+/// Ready instance can mint a lease before the full closure is known.
+pub enum SystemSnapshotOutcome {
+    Vacant,
+    Ready(SystemDsoLease, ImageHandle),
+    Pending(SystemBatchWait),
+}
+
 /// The atomically acquired system closure a resolver consumes edge-by-edge.
 pub struct PreparedSystemBatch {
     /// First-load candidates: the canonical path key and publication permit.
@@ -304,6 +312,37 @@ impl SystemDsoRegistry {
             inner: Arc::new(Mutex::new(RegistryInner {
                 slots: Vec::new(),
                 resolution: Arc::new(AtomicUsize::new(0)),
+            })),
+        }
+    }
+
+    pub fn snapshot(&self, key: SystemLibraryKey) -> LoadResult<SystemSnapshotOutcome> {
+        let mut inner = self.inner.lock();
+        let Some(index) = inner.slots.iter().position(|slot| slot.key == key) else {
+            return Ok(SystemSnapshotOutcome::Vacant);
+        };
+        let slot = &mut inner.slots[index];
+        match &mut slot.state {
+            InstanceState::Vacant => Ok(SystemSnapshotOutcome::Vacant),
+            InstanceState::Ready {
+                leases, descriptor, ..
+            } => {
+                *leases = leases.checked_add(1).ok_or_else(|| {
+                    LoadError::new(LoadErrorKind::IntegerOverflow, ErrorContext::None)
+                })?;
+                Ok(SystemSnapshotOutcome::Ready(
+                    SystemDsoLease {
+                        inner: Arc::clone(&self.inner),
+                        slot: index,
+                        generation: slot.generation,
+                        key,
+                    },
+                    descriptor.clone(),
+                ))
+            }
+            _ => Ok(SystemSnapshotOutcome::Pending(SystemBatchWait {
+                observed: inner.resolution.load(Ordering::Acquire),
+                signal: Arc::clone(&inner.resolution),
             })),
         }
     }
@@ -1025,6 +1064,77 @@ mod tests {
             .iter()
             .find(|slot| &slot.key == key)
             .map(|slot| slot.generation)
+    }
+
+    #[test]
+    fn snapshot_discovery_does_not_reserve_vacant_slots() {
+        let registry = SystemDsoRegistry::new();
+        let library = key(b"/system/lib/libsnapshot.so");
+        assert!(matches!(
+            registry.snapshot(library.clone()).unwrap(),
+            SystemSnapshotOutcome::Vacant
+        ));
+        assert_eq!(generation(&registry, &library), None);
+        let AcquireBatchOutcome::Acquired(batch) =
+            registry.acquire_batch(core::slice::from_ref(&library))
+        else {
+            panic!("snapshot discovery must not claim a permit");
+        };
+        assert_eq!(batch.loads.len(), 1);
+        assert_eq!(generation(&registry, &library), Some(1));
+        let SystemSnapshotOutcome::Pending(wait) = registry.snapshot(library.clone()).unwrap()
+        else {
+            panic!("an in-flight publication must wait");
+        };
+        drop(batch);
+        wait.wait();
+        assert!(matches!(
+            registry.snapshot(library.clone()).unwrap(),
+            SystemSnapshotOutcome::Vacant
+        ));
+        assert_eq!(generation(&registry, &library), Some(1));
+    }
+
+    #[test]
+    fn ready_snapshot_pins_backing_until_discovery_finishes() {
+        super::super::test_support::with_loader_stack(|| {
+            use super::super::{
+                adapters::flat_memory::FlatImageMemory, test_support::publish_candidates,
+            };
+            use blueos_loader::memory::ImageMemory;
+            let registry = SystemDsoRegistry::new();
+            let memory = FlatImageMemory::new();
+            let path = b"/system/lib/libsnapshot.so".as_slice();
+            let library = key(path);
+            let (owners, _) = publish_candidates(
+                &registry,
+                &memory,
+                &[path],
+                &[path],
+                &[Vec::new()],
+                &[Vec::new()],
+            );
+            let SystemSnapshotOutcome::Ready(pin, image) =
+                registry.snapshot(library.clone()).unwrap()
+            else {
+                panic!("a published image supplies its immutable snapshot");
+            };
+            assert_eq!(image.identity(), path);
+            assert!(image.dependencies().is_empty());
+            drop(owners);
+            assert!(registry.resolve_quiescence(&library).is_none());
+            drop(pin);
+            let Some(QuiescenceResolution::Unloaded(mut batch)) =
+                registry.resolve_quiescence(&library)
+            else {
+                panic!("discovery pin must be released");
+            };
+            let mut releasing = memory.clone();
+            for backing in batch.take_backings() {
+                releasing.release_committed(backing.allocation);
+            }
+            registry.finish_unload(batch).unwrap();
+        });
     }
 
     #[test]

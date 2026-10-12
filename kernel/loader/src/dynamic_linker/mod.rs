@@ -40,7 +40,10 @@ pub(crate) use artifact::{
     DependencyResolution, ImageId, ImageOwnership, ResolvedArtifact,
 };
 
-pub(crate) use published::{ImportedImageDescriptor, PublishedImageDescriptor, PublishedRegion};
+pub use published::ImageDependency;
+pub(crate) use published::{
+    ImportedImageDescriptor, PublishedImageDescriptor, PublishedLoadSnapshot, PublishedRegion,
+};
 
 pub(crate) use lifecycle::{LifecycleEntry, LifecyclePlans};
 pub(crate) use metadata::{

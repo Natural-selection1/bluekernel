@@ -192,7 +192,7 @@ mod dependency_scan {
         let scanned = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            Some(ArtifactRole::SharedObject),
+            ArtifactRole::SharedObject,
             LoadLimits::DEFAULT,
         )
         .expect("scan");
@@ -212,7 +212,7 @@ mod dependency_scan {
         let scanned = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            Some(ArtifactRole::SharedObject),
+            ArtifactRole::SharedObject,
             LoadLimits::DEFAULT,
         )
         .expect("scan");
@@ -231,7 +231,7 @@ mod dependency_scan {
         let scanned = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            Some(ArtifactRole::ExecutableRoot),
+            ArtifactRole::ExecutableRoot,
             LoadLimits::DEFAULT,
         )
         .expect("scan");
@@ -247,7 +247,7 @@ mod dependency_scan {
         let result = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            Some(ArtifactRole::SharedObject),
+            ArtifactRole::SharedObject,
             LoadLimits::DEFAULT,
         );
         assert!(
@@ -265,7 +265,7 @@ mod dependency_scan {
         let result = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            Some(ArtifactRole::SharedObject),
+            ArtifactRole::SharedObject,
             LoadLimits::DEFAULT,
         );
         assert!(
@@ -282,7 +282,7 @@ mod dependency_scan {
         let result = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            Some(ArtifactRole::SharedObject),
+            ArtifactRole::SharedObject,
             LoadLimits::DEFAULT,
         );
         assert!(
@@ -305,7 +305,7 @@ mod dependency_scan {
         let result = scan_root_or_dependency(
             &SliceElfReader::new(&bytes),
             profile(),
-            Some(ArtifactRole::SharedObject),
+            ArtifactRole::SharedObject,
             LoadLimits::DEFAULT,
         );
         assert!(result.is_err(), "DT_NEEDED without DT_STRTAB must fail");

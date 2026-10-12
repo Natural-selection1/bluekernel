@@ -183,7 +183,8 @@ impl<R> ResolvedArtifact<R> {
 ///
 /// `resolve` returns either a reader for the returned [`ArtifactIdentity`] (a
 /// fresh `Load`) or a Ready provider the
-/// registry already relocated and sealed (an `Import`). A failed
+/// registry already relocated and sealed (an `Import`), or the identity of a
+/// provider already admitted to this session (`Existing`). A failed
 /// resolution must leave no loading entry behind.
 pub trait ArtifactResolver {
     type Reader: ElfReader;
@@ -202,6 +203,8 @@ pub trait ArtifactResolver {
 pub enum DependencyResolution<R> {
     Load(ResolvedArtifact<R>),
     Import(super::ImportedImageDescriptor),
+    /// A repeated edge to an image whose reader already entered this session.
+    Existing(ArtifactIdentity),
 }
 
 fn try_copy_bytes(bytes: &[u8]) -> LoadResult<Vec<u8>> {

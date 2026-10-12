@@ -51,7 +51,7 @@ pub(crate) struct LinkRequest<R> {
 }
 
 impl<R> LinkRequest<R> {
-    /// The root has already been scanned; `role` is a loader-derived fact.
+    /// The root has already been validated for the caller's selected purpose.
     pub(crate) fn new(
         root: DependencyResolution<R>,
         role: ArtifactRole,

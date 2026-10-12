@@ -17,8 +17,8 @@ use crate::{
     dynamic_linker::{
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyGraph, DependencyRequest,
         DependencyResolution, DynamicLinker, ImageOwnership, ImportedImageDescriptor,
-        ProgramHeaderRuntimeInfo, PublishedImageDescriptor, ResolvedArtifact, ScopeSet,
-        SessionUsage, SymbolTable,
+        ProgramHeaderRuntimeInfo, PublishedImageDescriptor, PublishedLoadSnapshot,
+        ResolvedArtifact, ScopeSet, SessionUsage, SymbolTable,
     },
     error::LoadErrorKind,
     profile::{ElfClass, ElfData, LoadLimits, LoadProfile, SessionLimits},
@@ -77,6 +77,11 @@ fn descriptor(name: &[u8], table: SymbolTable) -> Arc<PublishedImageDescriptor> 
             TargetAddress::new(0),
             ProgramHeaderRuntimeInfo::from_headers(0, 0, None, TargetAddress::new(0)).unwrap(),
             table,
+            PublishedLoadSnapshot::new(
+                LoadProfile::riscv64(),
+                ArtifactRole::SharedObject,
+                Vec::new(),
+            ),
         )
         .unwrap(),
     )

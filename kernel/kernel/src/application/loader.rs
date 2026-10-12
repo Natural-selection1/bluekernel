@@ -28,7 +28,7 @@ use crate::application::{
     publication::{KernelLinkPreparedBatch, KernelLinkPublisher, KernelLinkReceipt},
     registry::{
         AcquireBatchOutcome, LoadPermit, PreparedSystemBatch, SystemCandidateBacking,
-        SystemDsoLease, SystemDsoRegistry, SystemInitBatch,
+        SystemDsoLease, SystemDsoRegistry, SystemInitBatch, SystemSnapshotOutcome,
     },
 };
 use alloc::vec::Vec;
@@ -37,8 +37,8 @@ use blueos_loader::{
     load,
     memory::ImageMemory,
     profile::SessionLimits,
-    CommittedAllocations, ImageHandle, LoadError, LoadRequest, LoadResult, LoadedImage,
-    LoaderBackend, Publication,
+    CommittedAllocations, ImageDependency, ImageHandle, LoadError, LoadRequest, LoadResult,
+    LoadedImage, LoaderBackend, Publication,
 };
 
 pub struct ApplicationLoader {
@@ -74,10 +74,10 @@ impl ApplicationLoader {
         namespace: &ApplicationNamespace,
         group: &ThreadGroup,
     ) -> LoadResult<LoadedImage<KernelLinkReceipt>> {
-        let mut backend = KernelLoaderBackend::new(self, namespace, group, false);
+        let mut backend = KernelLoaderBackend::new(self, namespace, group, false, Vec::new());
         let source = backend.files.root(namespace.root_path(), true);
         load(
-            LoadRequest::new(source, namespace.profile(), SessionLimits::DEFAULT),
+            LoadRequest::executable(source, namespace.profile(), SessionLimits::DEFAULT),
             &mut backend,
         )
     }
@@ -89,10 +89,11 @@ impl ApplicationLoader {
         existing: Vec<ImageHandle>,
         global: Vec<ImageHandle>,
     ) -> LoadResult<(LoadedImage<KernelLinkReceipt>, SystemInitBatch)> {
-        let mut backend = KernelLoaderBackend::new(self, namespace, group, true);
+        let mut backend = KernelLoaderBackend::new(self, namespace, group, true, existing.clone());
         let source = backend.files.root(path, false);
-        let request = LoadRequest::new(source, namespace.profile(), SessionLimits::DEFAULT)
-            .with_namespace(existing, global);
+        let request =
+            LoadRequest::shared_object(source, namespace.profile(), SessionLimits::DEFAULT)
+                .with_namespace(existing, global);
         let product = load(request, &mut backend)?;
         Ok((
             product,
@@ -111,6 +112,8 @@ struct KernelLoaderBackend<'a> {
     publisher: KernelLinkPublisher,
     permits: Vec<(SystemLibraryKey, LoadPermit)>,
     leases: Vec<SystemDsoLease>,
+    namespace_images: Vec<ImageHandle>,
+    snapshots: Vec<ImageHandle>,
     batch: Option<SystemInitBatch>,
     runtime: bool,
 }
@@ -121,6 +124,7 @@ impl<'a> KernelLoaderBackend<'a> {
         namespace: &'a ApplicationNamespace,
         group: &ThreadGroup,
         runtime: bool,
+        namespace_images: Vec<ImageHandle>,
     ) -> Self {
         Self {
             loader,
@@ -129,6 +133,8 @@ impl<'a> KernelLoaderBackend<'a> {
             publisher: KernelLinkPublisher::new(loader.memory.clone()),
             permits: Vec::new(),
             leases: Vec::new(),
+            namespace_images,
+            snapshots: Vec::new(),
             batch: None,
             runtime,
         }
@@ -240,8 +246,41 @@ impl LoaderBackend for KernelLoaderBackend<'_> {
     fn open(&mut self, source: &KernelSource) -> LoadResult<VfsElfReader> {
         self.files.open(source)
     }
+    fn snapshot(&mut self, source: &KernelSource) -> LoadResult<Option<ImageHandle>> {
+        if let Some(image) = self
+            .snapshots
+            .iter()
+            .chain(&self.namespace_images)
+            .find(|image| image.identity() == source.path().as_bytes())
+        {
+            return Ok(Some(image.clone()));
+        }
+        if !source.shared() {
+            return Ok(None);
+        }
+        self.snapshots.try_reserve(1).map_err(|_| loader_oom())?;
+        self.leases.try_reserve(1).map_err(|_| loader_oom())?;
+        loop {
+            match self
+                .loader
+                .registry
+                .snapshot(SystemLibraryKey::from_bytes(source.path().as_bytes())?)?
+            {
+                SystemSnapshotOutcome::Vacant => return Ok(None),
+                SystemSnapshotOutcome::Pending(wait) => wait.wait(),
+                SystemSnapshotOutcome::Ready(lease, image) => {
+                    self.leases.push(lease);
+                    self.snapshots.push(image.clone());
+                    return Ok(Some(image));
+                }
+            }
+        }
+    }
     fn resolve(&mut self, requester: &KernelSource, name: &[u8]) -> LoadResult<KernelSource> {
-        self.files.resolve(requester, name)
+        self.files.resolve(requester, name, &self.namespace_images)
+    }
+    fn resolve_snapshot(&mut self, dependency: &ImageDependency) -> LoadResult<KernelSource> {
+        self.files.source_from_snapshot(dependency)
     }
     fn acquire(
         &mut self,
@@ -256,6 +295,10 @@ impl LoaderBackend for KernelLoaderBackend<'_> {
             // Reuse its pinned handles instead of waiting for our own completion.
             if source.shared()
                 && !existing
+                    .iter()
+                    .any(|image| image.identity() == source.path().as_bytes())
+                && !self
+                    .snapshots
                     .iter()
                     .any(|image| image.identity() == source.path().as_bytes())
             {
@@ -325,6 +368,7 @@ impl LoaderBackend for KernelLoaderBackend<'_> {
     fn cancel_load(&mut self) {
         self.permits.clear();
         self.leases.clear();
+        self.snapshots.clear();
         self.publisher.cancel();
     }
     fn trace(&self, message: core::fmt::Arguments<'_>) {
@@ -341,9 +385,83 @@ fn image_keys(images: &[ImageHandle]) -> LoadResult<Vec<SystemLibraryKey>> {
     }
     Ok(keys)
 }
+
 fn loader_error() -> LoadError {
     LoadError::new(LoadErrorKind::Backend, ErrorContext::None)
 }
 fn loader_oom() -> LoadError {
     LoadError::new(LoadErrorKind::OutOfMemory, ErrorContext::None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::{
+        adapters::system_paths::SystemLibraryEntry,
+        registry::{QuiescenceResolution, SystemSnapshotOutcome},
+        test_support::{publish_candidates, with_loader_stack},
+    };
+    use blueos_test_macro::test;
+
+    static CATALOG: SystemLibraryPaths = SystemLibraryPaths::new(&[SystemLibraryEntry {
+        lookup_name: b"libsnapshot.so",
+        path: "/system/lib/libsnapshot.so",
+        keep_cached: false,
+    }]);
+
+    #[test]
+    fn runtime_load_reuses_registry_snapshot_without_a_file() {
+        with_loader_stack(|| {
+            let registry = SystemDsoRegistry::new();
+            let memory = FlatImageMemory::new();
+            let path = CATALOG.resolve_name(b"libsnapshot.so").unwrap().path;
+            let key = SystemLibraryKey::from_bytes(path.as_bytes()).unwrap();
+            let (owners, _) = publish_candidates(
+                &registry,
+                &memory,
+                &[path.as_bytes()],
+                &[path.as_bytes()],
+                &[Vec::new()],
+                &[Vec::new()],
+            );
+            let namespace = ApplicationNamespace::from_launch_path(
+                "app.elf",
+                "/apps/snapshot-test",
+                super::super::board_dynamic_profile(),
+            )
+            .unwrap();
+            let group = ThreadGroup::new(&registry);
+            let loader = ApplicationLoader::new(&CATALOG, registry.clone(), memory.clone());
+            // No ELF was installed at this path. The real kernel backend must
+            // carry the discovery lease into its publication receipt.
+            let (loaded, init) = loader
+                .link_shared(&namespace, path, &group, Vec::new(), Vec::new())
+                .unwrap();
+            assert!(registry
+                .finish_initialization_batch(init)
+                .unwrap()
+                .is_empty());
+            let root = loaded.images().next().unwrap();
+            assert_eq!(root.identity(), path.as_bytes());
+            assert!(!loaded.is_new(root));
+            assert!(loaded.entry().is_none());
+            assert!(loaded.startup().is_empty());
+            drop(owners);
+            assert!(registry.resolve_quiescence(&key).is_none());
+            drop(loaded);
+            let Some(QuiescenceResolution::Unloaded(mut batch)) = registry.resolve_quiescence(&key)
+            else {
+                panic!("dropping the reused receipt releases its snapshot pin");
+            };
+            let mut releasing = memory.clone();
+            for backing in batch.take_backings() {
+                releasing.release_committed(backing.allocation);
+            }
+            registry.finish_unload(batch).unwrap();
+            assert!(matches!(
+                registry.snapshot(key).unwrap(),
+                SystemSnapshotOutcome::Vacant
+            ));
+        });
+    }
 }

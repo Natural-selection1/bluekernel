@@ -26,7 +26,7 @@ use crate::{
 use alloc::sync::Arc;
 use blueos_loader::{
     error::{ErrorContext, LoadErrorKind},
-    LoadError, LoadResult,
+    ImageDependency, ImageHandle, LoadError, LoadResult,
 };
 
 #[derive(Clone)]
@@ -56,7 +56,7 @@ impl<'a> NamespaceSourceResolver<'a> {
     ) -> Self {
         Self { namespace, catalog }
     }
-    /// Select resource ownership; the loader determines the ELF object type.
+    /// Select resource ownership independently of the caller's loading purpose.
     pub(crate) fn root(&self, path: &str, private: bool) -> KernelSource {
         KernelSource {
             path: Arc::from(path),
@@ -72,6 +72,7 @@ impl<'a> NamespaceSourceResolver<'a> {
         &self,
         requester: &KernelSource,
         name: &[u8],
+        existing: &[ImageHandle],
     ) -> LoadResult<KernelSource> {
         let request = core::str::from_utf8(name).map_err(|_| unresolved(name))?;
         let directory = parent_dir(requester.path());
@@ -90,6 +91,15 @@ impl<'a> NamespaceSourceResolver<'a> {
                 request,
             );
             let path = private.first().ok_or_else(|| unresolved(name))?;
+            if existing
+                .iter()
+                .any(|image| image.identity() == path.as_bytes() && !image.is_shared())
+            {
+                return Ok(KernelSource {
+                    path: Arc::from(path.as_str()),
+                    shared: false,
+                });
+            }
             // Only absence allows catalog fallback. A corrupt or inaccessible
             // private file remains selected and fails in the loader.
             if matches!(open_path(path, libc::O_RDONLY, 0), Err(error) if error == code::ENOENT || error == code::ENOTDIR)
@@ -110,6 +120,20 @@ impl<'a> NamespaceSourceResolver<'a> {
             return Err(unresolved(name));
         }
         Ok(self.root(path, false))
+    }
+
+    pub(crate) fn source_from_snapshot(
+        &self,
+        dependency: &ImageDependency,
+    ) -> LoadResult<KernelSource> {
+        let path = core::str::from_utf8(dependency.identity()).map_err(|_| backend_error())?;
+        if dependency.is_shared() && self.catalog.resolve_path(path).is_none() {
+            return Err(backend_error());
+        }
+        Ok(KernelSource {
+            path: Arc::from(path),
+            shared: dependency.is_shared(),
+        })
     }
 }
 
@@ -198,7 +222,7 @@ mod tests {
     fn resolve_relative_from_requester_directory() {
         with_resolver(|resolver, root| {
             let image = resolver
-                .resolve(&root, b"./lib/../lib/libextra.so")
+                .resolve(&root, b"./lib/../lib/libextra.so", &[])
                 .unwrap();
             assert_eq!(image.path(), "/apps/resolve-test/lib/libextra.so");
             assert!(!image.shared());
@@ -207,23 +231,43 @@ mod tests {
     #[test]
     fn resolve_catalog_absolute_path_as_shared() {
         with_resolver(|resolver, root| {
-            let image = resolver.resolve(&root, b"/system/lib/libextra.so").unwrap();
+            let image = resolver
+                .resolve(&root, b"/system/lib/libextra.so", &[])
+                .unwrap();
             assert!(image.shared());
         });
     }
     #[test]
     fn resolve_missing_private_file_uses_catalog() {
         with_resolver(|resolver, root| {
-            let image = resolver.resolve(&root, b"libextra.so").unwrap();
+            let image = resolver.resolve(&root, b"libextra.so", &[]).unwrap();
             assert_eq!(image.path(), "/system/lib/libextra.so");
             assert!(image.shared());
+        });
+    }
+    #[test]
+    fn resolve_loaded_private_file_before_catalog_fallback() {
+        crate::application::test_support::with_loader_stack(|| {
+            use crate::application::{
+                adapters::flat_memory::FlatImageMemory, test_support::load_image,
+            };
+            let memory = FlatImageMemory::new();
+            let loaded = load_image(&memory, b"/apps/resolve-test/lib/libextra.so", false);
+            let existing = loaded.images().next().unwrap().clone();
+            with_resolver(|resolver, root| {
+                let image = resolver
+                    .resolve(&root, b"libextra.so", core::slice::from_ref(&existing))
+                    .unwrap();
+                assert_eq!(image.path(), "/apps/resolve-test/lib/libextra.so");
+                assert!(!image.shared());
+            });
         });
     }
     #[test]
     fn resolve_present_broken_private_file_keeps_exact_path() {
         with_resolver(|resolver, root| {
             write_file("/apps/resolve-test/lib/libextra.so", &[0; 16]);
-            let image = resolver.resolve(&root, b"libextra.so").unwrap();
+            let image = resolver.resolve(&root, b"libextra.so", &[]).unwrap();
             assert_eq!(image.path(), "/apps/resolve-test/lib/libextra.so");
             assert!(!image.shared());
         });
@@ -234,13 +278,16 @@ mod tests {
             write_file("/apps/resolve-test/lib/libextra.so", &[0; 16]);
             let system = resolver.root("/system/lib/libextra.so", false);
             assert_eq!(
-                resolver.resolve(&system, b"libextra.so").unwrap().path(),
+                resolver
+                    .resolve(&system, b"libextra.so", &[])
+                    .unwrap()
+                    .path(),
                 system.path()
             );
             assert!(resolver
-                .resolve(&system, b"/apps/resolve-test/lib/libextra.so")
+                .resolve(&system, b"/apps/resolve-test/lib/libextra.so", &[])
                 .is_err());
-            assert!(resolver.resolve(&system, b"libunknown.so").is_err());
+            assert!(resolver.resolve(&system, b"libunknown.so", &[]).is_err());
         });
     }
 }
