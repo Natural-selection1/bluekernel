@@ -34,6 +34,7 @@ impl<T: Default> Default for NoLock<T> {
 }
 
 #[derive(Debug)]
+#[must_use]
 pub struct NoLockWriteGuard<'a, T: 'a + ?Sized> {
     inner: *mut T,
     _a: PhantomData<&'a mut T>,
@@ -53,6 +54,7 @@ impl<T: ?Sized> DerefMut for NoLockWriteGuard<'_, T> {
 }
 
 #[derive(Debug)]
+#[must_use]
 pub struct NoLockReadGuard<'a, T: 'a + ?Sized> {
     inner: *const T,
     _a: PhantomData<&'a mut T>,
@@ -142,7 +144,7 @@ impl<T: Sized, A: Adapter<T>> INoLock<T, A> {
     }
 
     #[inline]
-    pub fn read(&self) -> NoLockReadGuard<T> {
+    pub fn read(&self) -> NoLockReadGuard<'_, T> {
         let inner = self.this() as *const T;
         NoLockReadGuard {
             inner,
