@@ -73,7 +73,7 @@ impl InsertByPrio {
     pub const VALUE: u8 = 0;
 }
 
-/// Const type for InsertToEnd  
+/// Const type for InsertToEnd
 pub struct InsertToEnd;
 impl InsertToEnd {
     pub const MODE: InsertMode = InsertMode::InsertToEnd;
@@ -143,7 +143,7 @@ impl ContextSwitchHookHolder {
     }
 
     pub unsafe fn next_thread(&self) -> &Thread {
-        &*self.next_thread
+        unsafe { &*self.next_thread }
     }
 }
 
@@ -156,9 +156,9 @@ fn prepare_signal_handling(t: &ThreadNode) {
     let ctx = l.saved_sp() as *mut arch::Context;
     let ctx = unsafe { &mut *ctx };
     // Update ctx so that signal context will be restored.
-    ctx.set_return_address(arch::switch_stack as usize)
+    ctx.set_return_address(arch::switch_stack as *const () as usize)
         .set_arg(0, l.signal_handler_sp())
-        .set_arg(1, signal::handler_entry as usize);
+        .set_arg(1, signal::handler_entry as *const () as usize);
 }
 
 #[inline]
@@ -237,6 +237,9 @@ fn switch_current_thread(next: ThreadNode, old_sp: usize) -> usize {
     old.increment_cycles(cycles);
     if old.state() == thread::RETIRED {
         GlobalQueueVisitor::remove(&mut old);
+        if let Some(process) = old.process() {
+            process.remove_thread(&mut old);
+        }
         if ThreadNode::strong_count(&old) != 1 {
             // TODO: Add warning log that there are still references to the old thread.
         }
@@ -279,9 +282,10 @@ pub fn retire_me() -> ! {
     let retiring = current_thread_ref();
     #[cfg(procfs)]
     {
-        let _ = crate::vfs::trace_thread_close(unsafe { Arc::clone_from(retiring) });
+        use blueos_infra::no_let_underscore::IgnoreResult;
+        crate::vfs::trace_thread_close(unsafe { Arc::clone_from(retiring) }).ignore_result();
     }
-    let next = next_ready_thread().map_or_else(idle::current_idle_thread, |v| v);
+    let next = next_ready_thread().unwrap_or_else(idle::current_idle_thread);
     debug_assert_eq!(next.state(), thread::READY);
     let mut hooks = ContextSwitchHookHolder::new(next);
     retiring.disable_preempt();
@@ -360,7 +364,7 @@ pub fn suspend_me_until<T>(deadline: Tick, wq: Option<SpinLockGuard<'_, T>>) -> 
     let old = current_thread_ref();
     let current_idle = idle::current_idle_thread_ref();
     debug_assert_ne!(Thread::id(old), Thread::id(current_idle));
-    let next = next_ready_thread().map_or_else(|| unsafe { Arc::clone_from(current_idle) }, |v| v);
+    let next = next_ready_thread().unwrap_or_else(|| unsafe { Arc::clone_from(current_idle) });
     debug_assert_eq!(next.state(), thread::READY);
     #[cfg(debugging_scheduler)]
     crate::trace!(

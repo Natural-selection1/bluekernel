@@ -25,6 +25,7 @@ use crate::{
     iter::{NullTerminated, NullTerminatedInclusive},
     stdio::StringWriter,
 };
+use blueos_infra::no_let_underscore::IgnoreResult;
 use core::{
     cmp::Ordering,
     ffi::{c_char, c_int, c_long, c_longlong, c_size_t, c_void},
@@ -145,9 +146,9 @@ pub unsafe extern "C" fn strerror(errnum: c_int) -> *mut c_char {
     let mut w = StringWriter(buf.as_mut_ptr(), 256);
 
     if errnum >= 0 && errnum < STR_ERROR.len() as c_int {
-        let _ = w.write_str(STR_ERROR[errnum as usize]);
+        w.write_str(STR_ERROR[errnum as usize]).ignore_result();
     } else {
-        let _ = w.write_str("Unknown error {}");
+        w.write_str("Unknown error {}").ignore_result();
     }
 
     buf.as_mut_ptr() as *mut c_char
@@ -306,7 +307,7 @@ pub unsafe extern "C" fn strcspn(s1: *const c_char, s2: *const c_char) -> c_size
     let s2 = slice::from_raw_parts(s2 as *const u8, strlen(s2) as usize);
 
     for (i, &c) in s1.iter().enumerate() {
-        if s2.iter().any(|&x| x == c) {
+        if s2.contains(&c) {
             return i as c_size_t;
         }
     }
@@ -376,7 +377,7 @@ pub unsafe extern "C" fn strspn(s1: *const c_char, s2: *const c_char) -> c_size_
     let s2 = slice::from_raw_parts(s2 as *const u8, strlen(s2) as usize);
 
     for (i, &c) in s1.iter().enumerate() {
-        if !s2.iter().any(|&x| x == c) {
+        if !s2.contains(&c) {
             return i as c_size_t;
         }
     }
