@@ -19,9 +19,9 @@
 //! allocation receipt and startup storage into it, then the runtime attaches
 //! member threads and drives the two-phase exit.
 //!
-//! Membership stays entirely inside this backend. Member threads receive an
-//! ordinary retirement cleanup, so neither [`crate::thread::Thread`] nor the
-//! scheduler depends on application types.
+//! Membership stays entirely inside this backend. Member threads explicitly
+//! register deferred retirement cleanups, so neither [`crate::thread::Thread`]
+//! nor the scheduler depends on application types.
 
 use crate::sync::SpinLock;
 use alloc::{

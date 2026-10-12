@@ -29,6 +29,10 @@
 //!
 //! Nothing in this module frees anything. It moves the *timing* of a cleanup to
 //! a context where the cleanup is allowed to do whatever it does.
+//!
+//! Only callbacks installed with `Thread::set_deferred_cleanup` are posted.
+//! Ordinary `Thread::set_cleanup` callbacks keep their synchronous retirement
+//! behavior even when the dynamic application runtime is enabled.
 
 use crate::{
     sync::{atomic_wake, spinlock::SpinLock},

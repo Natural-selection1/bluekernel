@@ -418,13 +418,14 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
                 let _ = GlobalQueueVisitor::remove(&mut t);
                 return -1;
             }
-            // The existing cleanup slot carries a weak, backend-neutral
-            // retirement action. Run any caller cleanup first so application
-            // code cannot be unloaded while it is still executing.
+            // This member's cleanup may enter application code or wake its
+            // exit coordinator, so explicitly request ordinary thread context.
+            // Run caller cleanup before removing membership to keep its code
+            // mapped until the callback has finished.
             let membership = group.membership();
             let cleanup = spawn_args.cleanup;
             let cleanup_arg = spawn_args.arg;
-            t.lock().set_cleanup(Entry::Closure(Box::new(move || {
+            t.lock().set_deferred_cleanup(Entry::Closure(Box::new(move || {
                 if let Some(cleanup) = cleanup {
                     cleanup(cleanup_arg);
                 }

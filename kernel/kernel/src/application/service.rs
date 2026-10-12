@@ -377,7 +377,7 @@ impl ApplicationService {
         }
         let main_id = thread::Thread::id(&main);
         let membership = group.membership();
-        main.lock().set_cleanup(Entry::Closure(Box::new(move || {
+        main.lock().set_deferred_cleanup(Entry::Closure(Box::new(move || {
             if let Some(group) = membership.upgrade() {
                 let _ = group.remove_member(main_id);
             }
@@ -407,7 +407,7 @@ mod tests {
         registry::SystemSnapshotOutcome,
         test_support::{install_elf, lifecycle_elf, remove_elf, with_loader_stack},
     };
-    use blueos_header::application::BlueOsApplicationStartInfo;
+    use blueos_header::{application::BlueOsApplicationStartInfo, thread::SpawnArgs};
     use blueos_test_macro::test;
     use spin::Mutex;
 
@@ -418,6 +418,68 @@ mod tests {
     static FINI_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FINI_THREAD: AtomicUsize = AtomicUsize::new(0);
     static CHILD_HANDLE: Mutex<Option<ApplicationHandle>> = Mutex::new(None);
+
+    static CLEANUP_CHILD_ID: AtomicUsize = AtomicUsize::new(0);
+    static CLEANUP_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static CLEANUP_RELEASE: AtomicUsize = AtomicUsize::new(0);
+    static CLEANUP_DONE: AtomicUsize = AtomicUsize::new(0);
+    static CLEANUP_APP_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static CLEANUP_APP_RELEASE: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn record_cleanup_child(id: usize, _: *mut SpawnArgs) {
+        CLEANUP_CHILD_ID.store(id, Ordering::Release);
+    }
+
+    extern "C" fn cleanup_child_entry(_: *mut core::ffi::c_void) {}
+
+    extern "C" fn application_child_cleanup(_: *mut core::ffi::c_void) {
+        assert!(
+            crate::arch::local_irq_enabled(),
+            "application cleanup needs ordinary thread context"
+        );
+        let child_id = CLEANUP_CHILD_ID.load(Ordering::Acquire);
+        assert_ne!(scheduler::current_thread_id(), child_id);
+        let group = ApplicationService::get()
+            .unwrap()
+            .manager
+            .group_for_thread(child_id)
+            .expect("membership must retain the image throughout cleanup");
+        assert_eq!(group.member_count(), 2);
+        CLEANUP_STARTED.store(1, Ordering::Release);
+        while CLEANUP_RELEASE.load(Ordering::Acquire) == 0 {
+            let _ = crate::sync::atomic_wait(&CLEANUP_RELEASE, 0, Tick::from_millis(50));
+        }
+        assert!(group.contains_member(child_id));
+        CLEANUP_DONE.fetch_add(1, Ordering::Release);
+        let _ = crate::sync::atomic_wake(&CLEANUP_DONE, usize::MAX);
+    }
+
+    extern "C" fn cleanup_app_entry(info: *const BlueOsApplicationStartInfo) {
+        let group = ApplicationService::get()
+            .unwrap()
+            .manager
+            .group_for_thread(scheduler::current_thread_id())
+            .unwrap();
+        let stack = thread::Stack::from_size(crate::config::DEFAULT_STACK_SIZE).unwrap();
+        let args = SpawnArgs {
+            spawn_hook: Some(record_cleanup_child),
+            stack_start: stack.base(),
+            stack_size: stack.size(),
+            entry: cleanup_child_entry,
+            arg: core::ptr::null_mut(),
+            cleanup: Some(application_child_cleanup),
+        };
+        assert!(crate::syscalls::create_thread::handle(&args) != -1);
+        wait_until(
+            || CLEANUP_DONE.load(Ordering::Acquire) == 1 && group.member_count() == 1,
+            "application child cleanup did not finish and remove membership",
+        );
+        // CreateThread borrows this stack. Release it only after the child's
+        // cleanup completed, and before the raw main entry retires without unwinding.
+        drop(stack);
+        drop(group);
+        run_app(info, &CLEANUP_APP_STARTED, &CLEANUP_APP_RELEASE);
+    }
 
     extern "C" fn parent_entry(info: *const BlueOsApplicationStartInfo) {
         run_app(info, &PARENT_STARTED, &PARENT_RELEASE);
@@ -485,6 +547,57 @@ mod tests {
                 Tick::from_millis(10),
             );
         }
+    }
+
+    #[test]
+    fn application_child_cleanup_is_deferred_and_retains_membership_until_return() {
+        with_loader_stack(|| {
+            for atom in [
+                &CLEANUP_CHILD_ID,
+                &CLEANUP_STARTED,
+                &CLEANUP_RELEASE,
+                &CLEANUP_DONE,
+                &CLEANUP_APP_STARTED,
+                &CLEANUP_APP_RELEASE,
+            ] {
+                atom.store(0, Ordering::Release);
+            }
+            let path = "/apps/lifecycle/cleanup.elf";
+            install_elf(
+                path,
+                &lifecycle_elf(false, &[], None, None, Some(cleanup_app_entry as usize)),
+            );
+            let service = crate::application::runtime::init();
+            let handle = service.spawn(path, Vec::new(), Vec::new()).unwrap();
+            wait_until(
+                || CLEANUP_STARTED.load(Ordering::Acquire) == 1,
+                "deferred application child cleanup did not enter",
+            );
+            let child_id = CLEANUP_CHILD_ID.load(Ordering::Acquire);
+            let group = service.manager.group_for_thread(child_id).unwrap();
+            assert_eq!(group.handle(), Some(handle));
+            assert_eq!(group.member_count(), 2);
+            assert_eq!(CLEANUP_DONE.load(Ordering::Acquire), 0);
+
+            CLEANUP_RELEASE.store(1, Ordering::Release);
+            let _ = crate::sync::atomic_wake(&CLEANUP_RELEASE, usize::MAX);
+            wait_until(
+                || CLEANUP_APP_STARTED.load(Ordering::Acquire) == 1,
+                "application main did not resume after its child's cleanup",
+            );
+            assert_eq!(CLEANUP_DONE.load(Ordering::Acquire), 1);
+            assert_eq!(group.member_count(), 1);
+            assert!(!group.contains_member(child_id));
+
+            CLEANUP_APP_RELEASE.store(1, Ordering::Release);
+            let _ = crate::sync::atomic_wake(&CLEANUP_APP_RELEASE, usize::MAX);
+            wait_until(
+                || !service.manager.contains(handle),
+                "deferred application main cleanup did not allow reaping",
+            );
+            assert!(group.is_empty());
+            remove_elf(path);
+        });
     }
 
     #[test]

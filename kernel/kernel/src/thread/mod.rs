@@ -71,6 +71,14 @@ impl core::fmt::Debug for Entry {
     }
 }
 
+/// The execution context explicitly selected when installing a retirement cleanup.
+#[derive(Debug)]
+pub(crate) enum Cleanup {
+    Inline(Entry),
+    #[cfg(all(enable_vfs, dynamic_loader))]
+    Deferred(Entry),
+}
+
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub enum ThreadKind {
     AsyncPoller,
@@ -197,8 +205,9 @@ impl core::fmt::Debug for SignalContext {
 pub struct Thread {
     global: GlobalQueueListHead,
     sched_node: IlistHead<Thread, OffsetOfSchedNode>,
-    // Cleanup function will be invoked when retiring.
-    cleanup: Option<Entry>,
+    // Ordinary cleanups run while switching off the retired thread. Only
+    // explicitly deferred cleanups are handed to an ordinary worker thread.
+    cleanup: Option<Cleanup>,
     kind: ThreadKind,
     // The stack backing records its own generic ownership policy and is
     // released only after the scheduler has switched away from this thread.
@@ -397,13 +406,24 @@ impl Thread {
     }
 
     #[inline]
-    pub fn take_cleanup(&mut self) -> Option<Entry> {
+    pub(crate) fn take_cleanup(&mut self) -> Option<Cleanup> {
         self.cleanup.take()
     }
 
+    /// Install a cleanup that runs synchronously during retirement, with
+    /// interrupts disabled and the next thread already published. The callback
+    /// must be safe in that context; it cannot block or issue system calls.
     #[inline]
     pub fn set_cleanup(&mut self, cleanup: Entry) {
-        self.cleanup = Some(cleanup);
+        self.cleanup = Some(Cleanup::Inline(cleanup));
+    }
+
+    /// Install a cleanup that needs ordinary thread context. The application
+    /// runtime must have started its reaper before this thread can retire.
+    #[cfg(all(enable_vfs, dynamic_loader))]
+    #[inline]
+    pub(crate) fn set_deferred_cleanup(&mut self, cleanup: Entry) {
+        self.cleanup = Some(Cleanup::Deferred(cleanup));
     }
 
     #[inline]
@@ -856,3 +876,74 @@ impl Drop for PreemptGuard {
 
 impl !Send for Thread {}
 unsafe impl Sync for Thread {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate as blueos;
+    use blueos_header::thread::SpawnArgs;
+    use blueos_test_macro::test;
+
+    static INLINE_CLEANED: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn empty_entry() {}
+    extern "C" fn empty_posix_entry(_: *mut core::ffi::c_void) {}
+
+    fn record_inline_cleanup() {
+        assert!(
+            !arch::local_irq_enabled(),
+            "ordinary cleanup must run during the retirement context switch"
+        );
+        INLINE_CLEANED.fetch_add(1, Ordering::Release);
+    }
+
+    extern "C" fn inline_cleanup() {
+        record_inline_cleanup();
+    }
+
+    extern "C" fn inline_posix_cleanup(arg: *mut core::ffi::c_void) {
+        assert_eq!(arg as usize, 0x37);
+        record_inline_cleanup();
+    }
+
+    fn wait_for_inline_cleanup() {
+        let deadline = crate::time::now() + core::time::Duration::from_secs(10);
+        while INLINE_CLEANED.load(Ordering::Acquire) == 0 {
+            assert!(crate::time::now() < deadline, "ordinary cleanup did not run");
+            scheduler::yield_me();
+        }
+        assert_eq!(INLINE_CLEANED.load(Ordering::Acquire), 1);
+    }
+
+    #[test(repeat = 2)]
+    fn ordinary_cleanup_is_inline_for_every_entry_kind() {
+        for cleanup in [
+            Entry::C(inline_cleanup),
+            Entry::Closure(Box::new(record_inline_cleanup)),
+            Entry::Posix(inline_posix_cleanup, 0x37usize as *mut core::ffi::c_void),
+        ] {
+            INLINE_CLEANED.store(0, Ordering::Release);
+            let thread = Builder::new(Entry::C(empty_entry)).build();
+            thread.lock().set_cleanup(cleanup);
+            scheduler::queue_ready_thread(IDLE, thread).unwrap();
+            wait_for_inline_cleanup();
+        }
+    }
+
+    #[test(repeat = 2)]
+    fn nongroup_create_thread_keeps_inline_cleanup() {
+        INLINE_CLEANED.store(0, Ordering::Release);
+        let stack = Stack::from_size(config::DEFAULT_STACK_SIZE).unwrap();
+        let args = SpawnArgs {
+            spawn_hook: None,
+            stack_start: stack.base(),
+            stack_size: stack.size(),
+            entry: empty_posix_entry,
+            arg: 0x37usize as *mut core::ffi::c_void,
+            cleanup: Some(inline_posix_cleanup),
+        };
+        let id = crate::syscalls::create_thread::handle(&args);
+        assert!(id != -1);
+        wait_for_inline_cleanup();
+    }
+}
