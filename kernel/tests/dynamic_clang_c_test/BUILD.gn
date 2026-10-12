@@ -24,6 +24,7 @@ build_rust("dynamic_clang_c_test") {
   deps = [
     "//external/vendor/semihosting-0.1.20:semihosting",
     "//kernel/kernel:blueos",
+    "//kernel/tests/support:dynamic_test_support",
     "//kernel/rsrt",
     "//libc",
     "//librs",

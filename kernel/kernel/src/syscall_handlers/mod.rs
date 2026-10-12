@@ -1066,13 +1066,14 @@ mod application_syscalls {
         };
         match service.complete_init(&group, handle) {
             Ok(()) => {
-                // Init completion marks the public
-                // Loading → Running transition.
-                log::info!(
-                    "APP_INIT_COMPLETE handle={}:{}",
-                    handle.slot,
-                    handle.generation
-                );
+                let event = crate::application::trace::Event::InitComplete { handle };
+                if !crate::application::trace::emit(event) {
+                    log::debug!(
+                        "APP_INIT_COMPLETE handle={}:{}",
+                        handle.slot,
+                        handle.generation
+                    );
+                }
                 0
             }
             Err(_) => -(libc::EINVAL as c_long),

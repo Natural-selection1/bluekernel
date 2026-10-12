@@ -68,11 +68,13 @@ fn rust_std_vertical() {
 
 #[no_mangle]
 pub fn dynamic_rust_std_test_runner(tests: &[&dyn Fn()]) {
+    blueos_dynamic_test_support::start();
     println!("Dynamic Rust std test started");
     println!("Running {} tests", tests.len());
     for test in tests {
         test();
     }
+    blueos_dynamic_test_support::finish();
     println!("Dynamic Rust std test ended");
 }
 

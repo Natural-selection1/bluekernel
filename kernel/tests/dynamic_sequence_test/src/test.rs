@@ -14,7 +14,7 @@
 // COUNT: APP_REAP handle=.* private_images=1 imported_dsos=1 == 1
 // COUNT: APP_REAP handle=.* private_images=4 imported_dsos=1 == 2
 // COUNT: APP_REAP handle=.* private_images=3 imported_dsos=1 == 1
-// COUNT: application prepare: link application failed: LoadError \{ stage: LinkRelocate.* == 1
+// COUNT: LOAD_FAILED error=LoadError \{ stage: LinkRelocate.* == 1
 // COUNT: NS_LOAD path=/apps/multi/lib/libfoo\.so\.1 == 1
 // COUNT: NS_LOAD path=/apps/multi/lib/libbar\.so\.1 == 1
 // COUNT: NS_LOAD path=/apps/multi/lib/libcommon\.so\.1 == 1
@@ -100,11 +100,13 @@ fn different_elf_closures_are_isolated() {
 
 #[no_mangle]
 pub fn dynamic_sequence_test_runner(tests: &[&dyn Fn()]) {
+    blueos_dynamic_test_support::start();
     println!("Dynamic sequence test started");
     println!("Running {} tests", tests.len());
     for test in tests {
         test();
     }
+    blueos_dynamic_test_support::finish();
     println!("Dynamic sequence test ended");
 }
 

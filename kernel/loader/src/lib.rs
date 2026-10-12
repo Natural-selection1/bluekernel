@@ -41,6 +41,7 @@ pub mod error;
 pub mod memory;
 pub mod profile;
 pub mod reader;
+pub mod trace;
 
 // Loading and linking implementation details.
 mod address;

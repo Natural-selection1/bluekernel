@@ -31,6 +31,7 @@ build_rust("dynamic_scope_test") {
   deps = [
     "//external/vendor/semihosting-0.1.20:semihosting",
     "//kernel/kernel:blueos",
+    "//kernel/tests/support:dynamic_test_support",
     "//kernel/loader:blueos_loader",
     "//kernel/rsrt",
     "//libc",

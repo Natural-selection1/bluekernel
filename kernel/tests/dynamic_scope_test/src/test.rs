@@ -191,11 +191,13 @@ fn concurrent_system_closure() {
 
 #[no_mangle]
 pub fn dynamic_scope_test_runner(tests: &[&dyn Fn()]) {
+    blueos_dynamic_test_support::start();
     println!("Dynamic scope test started");
     println!("Running {} tests", tests.len());
     for test in tests {
         test();
     }
+    blueos_dynamic_test_support::finish();
     println!("Dynamic scope test ended");
 }
 

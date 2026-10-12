@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::{
-    api::{invalid, oom, overflow},
+    api::{emit, invalid, oom, overflow},
     dynamic_linker::{
         ArtifactIdentity, ArtifactResolver, ArtifactRole, DependencyName, DependencyRequest,
         DependencyResolution, ImageOwnership, ResolvedArtifact,
     },
     error::{ErrorContext, LoadErrorKind},
     image::ScannedArtifact,
+    trace::LoadEvent,
     ImageHandle, LoadRequest, LoadResult, LoaderBackend,
 };
 use alloc::vec::Vec;
@@ -211,6 +212,15 @@ impl<S: Clone, R> LoadPlan<S, R> {
                     provider,
                     needed_index: u16::try_from(needed_index).map_err(|_| overflow())?,
                 });
+                emit(
+                    backend,
+                    LoadEvent::Dependency {
+                        requester: plan.images[requester].identity.as_bytes(),
+                        name: name.as_bytes(),
+                        provider: plan.images[provider].identity.as_bytes(),
+                        frozen: reuse_required,
+                    },
+                );
             }
         }
         request.limits.check_image_count(plan.images.len() as u32)?;
@@ -266,6 +276,14 @@ fn scan<B: LoaderBackend>(
                     .transpose()?,
                 needed,
             };
+            emit(
+                backend,
+                LoadEvent::Inspected {
+                    path: identity.as_bytes(),
+                    system: shared,
+                    snapshot: true,
+                },
+            );
             return Ok(PlannedImage {
                 source,
                 identity,
@@ -287,6 +305,14 @@ fn scan<B: LoaderBackend>(
         role,
         *request.limits.per_image(),
     )?;
+    emit(
+        backend,
+        LoadEvent::Inspected {
+            path: identity.as_bytes(),
+            system: shared,
+            snapshot: false,
+        },
+    );
     Ok(PlannedImage {
         source,
         identity,
@@ -310,9 +336,9 @@ pub(crate) struct PlannedResolver<'a, B: LoaderBackend> {
 
 impl<B: LoaderBackend> PlannedResolver<'_, B> {
     pub(crate) fn load_root(&mut self) -> LoadResult<ResolvedArtifact<B::Reader>> {
-        self.load_index(0, false)
+        self.load_index(0)
     }
-    fn load_index(&mut self, index: usize, trace: bool) -> LoadResult<ResolvedArtifact<B::Reader>> {
+    fn load_index(&mut self, index: usize) -> LoadResult<ResolvedArtifact<B::Reader>> {
         let image = &mut self.plan.images[index];
         // Every new source transfers its original reader exactly once.
         let reader = image.reader.take().ok_or_else(invalid)?;
@@ -321,14 +347,15 @@ impl<B: LoaderBackend> PlannedResolver<'_, B> {
         } else {
             ImageOwnership::SessionPrivate
         };
-        if trace && !image.traced {
+        if !image.traced {
             image.traced = true;
-            let path = core::str::from_utf8(image.identity.as_bytes()).unwrap_or("<non-utf8>");
-            self.backend.trace(format_args!(
-                "{} path={}",
-                if image.shared { "DSO_LOAD" } else { "NS_LOAD" },
-                path
-            ));
+            emit(
+                self.backend,
+                LoadEvent::ImageLoadStarted {
+                    path: image.identity.as_bytes(),
+                    system: image.shared,
+                },
+            );
         }
         Ok(ResolvedArtifact::new(
             image.identity.try_clone()?,
@@ -346,12 +373,15 @@ impl<B: LoaderBackend> PlannedResolver<'_, B> {
             .iter()
             .find(|provider| provider.identity() == image.identity.as_bytes())
         {
-            if image.shared && !image.traced {
+            if !image.traced {
                 image.traced = true;
-                self.backend.trace(format_args!(
-                    "DSO_REUSE path={}",
-                    core::str::from_utf8(provider.identity()).unwrap_or("<non-utf8>")
-                ));
+                emit(
+                    self.backend,
+                    LoadEvent::ImageReused {
+                        path: provider.identity(),
+                        system: image.shared,
+                    },
+                );
             }
             return Ok(DependencyResolution::Import(provider.imported()));
         }
@@ -361,7 +391,7 @@ impl<B: LoaderBackend> PlannedResolver<'_, B> {
             }
             return Ok(DependencyResolution::Existing(image.identity.try_clone()?));
         }
-        self.load_index(index, true).map(DependencyResolution::Load)
+        self.load_index(index).map(DependencyResolution::Load)
     }
 }
 

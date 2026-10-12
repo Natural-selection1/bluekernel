@@ -215,16 +215,21 @@ impl ApplicationReaper {
         }
         match self.reap(group) {
             Ok(report) => {
-                // The checker asserts the private-image
-                // count and the imported-DSO count of every reap.
                 if let Some(handle) = group.handle() {
-                    log::info!(
-                        "APP_REAP handle={}:{} private_images={} imported_dsos={}",
-                        handle.slot,
-                        handle.generation,
-                        report.private_images,
-                        report.imported_dsos
-                    );
+                    let event = super::trace::Event::Reaped {
+                        handle,
+                        private_images: report.private_images,
+                        imported_dsos: report.imported_dsos,
+                    };
+                    if !super::trace::emit(event) {
+                        log::debug!(
+                            "APP_REAP handle={}:{} private_images={} imported_dsos={}",
+                            handle.slot,
+                            handle.generation,
+                            report.private_images,
+                            report.imported_dsos
+                        );
+                    }
                 }
             }
             Err(_) => {
@@ -304,11 +309,16 @@ impl ApplicationReaper {
                                     function();
                                 }
                             }
-                            log::info!(
-                                "DSO_FINI path={}",
-                                core::str::from_utf8(backing.key.as_bytes())
-                                    .unwrap_or("<non-utf8>")
-                            );
+                            let event = super::trace::Event::DsoFini {
+                                path: backing.key.as_bytes(),
+                            };
+                            if !super::trace::emit(event) {
+                                log::debug!(
+                                    "DSO_FINI path={}",
+                                    core::str::from_utf8(backing.key.as_bytes())
+                                        .unwrap_or("<non-utf8>")
+                                );
+                            }
                         }
                         for backing in backings {
                             let crate::application::registry::SystemUnloadBacking {
@@ -318,10 +328,15 @@ impl ApplicationReaper {
                                 dependencies,
                             } = backing;
                             memory.release_committed(allocation);
-                            log::info!(
-                                "DSO_UNLOAD path={}",
-                                core::str::from_utf8(key.as_bytes()).unwrap_or("<non-utf8>")
-                            );
+                            let event = super::trace::Event::DsoUnload {
+                                path: key.as_bytes(),
+                            };
+                            if !super::trace::emit(event) {
+                                log::debug!(
+                                    "DSO_UNLOAD path={}",
+                                    core::str::from_utf8(key.as_bytes()).unwrap_or("<non-utf8>")
+                                );
+                            }
                             // Actual global providers may not occur in this
                             // application's declared closure. Queue them when
                             // releasing retention leases so they are reaped too.

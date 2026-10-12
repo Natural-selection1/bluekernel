@@ -183,10 +183,13 @@ pub extern "C" fn main() -> i32 {
     librs::pthread::register_my_posix_tcb();
     println!("Dynamic dlopen test started");
     dynamic_dlopen_test_main();
+    blueos_dynamic_test_support::finish();
     println!("Dynamic dlopen test ended");
     semihosting::process::exit(0);
 }
 fn dynamic_dlopen_test_runner(tests: &[&dyn Fn()]) {
+    // The runtime corpus performs many exec/dlopen operations in one batch.
+    blueos_dynamic_test_support::start_with_capacity(256 * 1024);
     println!("Running {} tests", tests.len());
     for test in tests {
         test();

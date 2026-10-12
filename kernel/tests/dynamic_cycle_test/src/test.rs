@@ -63,11 +63,13 @@ fn private_cycle_vertical() {
 
 #[no_mangle]
 pub fn dynamic_cycle_test_runner(tests: &[&dyn Fn()]) {
+    blueos_dynamic_test_support::start();
     println!("Dynamic cycle test started");
     println!("Running {} tests", tests.len());
     for test in tests {
         test();
     }
+    blueos_dynamic_test_support::finish();
     println!("Dynamic cycle test ended");
 }
 

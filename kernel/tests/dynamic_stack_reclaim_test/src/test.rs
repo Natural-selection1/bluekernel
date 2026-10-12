@@ -137,11 +137,13 @@ fn released_slots_do_not_retain_membership_storage() {
 
 #[no_mangle]
 pub fn stack_reclaim_test_runner(tests: &[&dyn Fn()]) {
+    blueos_dynamic_test_support::start();
     println!("Dynamic stack reclaim test started");
     println!("Running {} tests", tests.len());
     for test in tests {
         test();
     }
+    blueos_dynamic_test_support::finish();
     println!("Dynamic stack reclaim test ended");
 }
 

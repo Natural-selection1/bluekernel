@@ -25,6 +25,7 @@ build_rust("dynamic_dlopen_test") {
     "//external/vendor/semihosting-0.1.20:semihosting",
     "//kernel/header:blueos_header",
     "//kernel/kernel:blueos",
+    "//kernel/tests/support:dynamic_test_support",
     "//kernel/rsrt",
     "//kernel/scal:blueos_scal",
     "//libc",

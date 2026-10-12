@@ -20,11 +20,30 @@ use crate::{
     profile::{LoadLimits, LoadProfile, SessionLimits},
     reader::ElfReader,
     tests::fixture::{SharedMemory, SliceElfReader},
+    trace::{LoadEvent, LoadPhase},
     CommittedAllocations, ImageDependency, ImageHandle, LoadError, LoadRequest, LoadResult,
     LoadedImage, LoaderBackend, Publication,
 };
 use alloc::{rc::Rc, vec::Vec};
 use blueos_test_macro::test;
+use core::cell::RefCell;
+
+// Avoid linking recursive Debug formatters into the small-board test image.
+#[derive(Eq, PartialEq)]
+enum Observation {
+    Started,
+    Phase(LoadPhase, bool),
+    Inspected(bool),
+    Dependency(Vec<u8>, Vec<u8>),
+    Reused(Vec<u8>),
+    Retry(usize),
+    Completed,
+    Failed {
+        cancels: usize,
+        releases: usize,
+        backings: usize,
+    },
+}
 
 struct Reader(Rc<[u8]>);
 impl ElfReader for Reader {
@@ -60,6 +79,8 @@ struct Backend {
     commits: usize,
     aborts: usize,
     cancels: usize,
+    tracing: bool,
+    observations: RefCell<Vec<Observation>>,
 }
 impl Backend {
     fn new(files: Vec<(&'static str, Vec<u8>)>) -> Self {
@@ -80,6 +101,8 @@ impl Backend {
             commits: 0,
             aborts: 0,
             cancels: 0,
+            tracing: false,
+            observations: RefCell::new(Vec::new()),
         }
     }
 }
@@ -202,6 +225,139 @@ impl LoaderBackend for Backend {
     fn cancel_load(&mut self) {
         self.cancels += 1;
     }
+    fn trace_enabled(&self) -> bool {
+        self.tracing
+    }
+    fn trace(&self, event: LoadEvent<'_>) {
+        let observation = match event {
+            LoadEvent::Started { .. } => Observation::Started,
+            LoadEvent::Phase { phase, completed } => Observation::Phase(phase, completed),
+            LoadEvent::Inspected { snapshot, .. } => Observation::Inspected(snapshot),
+            LoadEvent::Dependency {
+                requester,
+                provider,
+                ..
+            } => Observation::Dependency(requester.to_vec(), provider.to_vec()),
+            LoadEvent::ImageReused { path, .. } => Observation::Reused(path.to_vec()),
+            LoadEvent::Retry => Observation::Retry(self.cancels),
+            LoadEvent::Completed => Observation::Completed,
+            LoadEvent::Failed { .. } => Observation::Failed {
+                cancels: self.cancels,
+                releases: self.memory.releases.get(),
+                backings: self.memory.mappers.borrow().len(),
+            },
+            _ => return,
+        };
+        self.observations.borrow_mut().push(observation);
+    }
+}
+
+#[test]
+fn load_observations_are_opt_in_and_complete_after_installation() {
+    for tracing in [false, true] {
+        let (bytes, profile) = super::linker::native_fixture();
+        let mut backend = Backend::new(alloc::vec![("root", bytes)]);
+        backend.tracing = tracing;
+        let loaded = load(
+            LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
+            &mut backend,
+        )
+        .expect("observing a load must not change ownership");
+        let observations = backend.observations.borrow();
+        if tracing {
+            assert!(observations.first() == Some(&Observation::Started));
+            assert!(observations.last() == Some(&Observation::Completed));
+            assert!(observations.contains(&Observation::Inspected(false)));
+            let phases: Vec<_> = observations
+                .iter()
+                .filter_map(|event| match event {
+                    Observation::Phase(phase, completed) => Some((*phase, *completed)),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                phases
+                    == [
+                        (LoadPhase::Discover, false),
+                        (LoadPhase::Discover, true),
+                        (LoadPhase::Acquire, false),
+                        (LoadPhase::Acquire, true),
+                        (LoadPhase::Link, false),
+                        (LoadPhase::Link, true),
+                        (LoadPhase::Publish, false),
+                        (LoadPhase::Publish, true),
+                        (LoadPhase::Install, false),
+                        (LoadPhase::Install, true),
+                    ]
+            );
+        } else {
+            assert!(observations.is_empty());
+        }
+        assert_eq!(backend.commits, 1);
+        drop(observations);
+        drop(loaded.into_receipt());
+        assert_eq!(backend.memory.releases.get(), 1);
+    }
+}
+
+#[test]
+fn load_failure_is_observed_after_rollback_without_a_completion() {
+    for reject_complete in [false, true] {
+        let (bytes, profile) = super::linker::native_fixture();
+        let mut backend = Backend::new(alloc::vec![("root", bytes)]);
+        backend.tracing = true;
+        backend.reject_complete = reject_complete;
+        backend.reject_publish = !reject_complete;
+        assert!(load(
+            LoadRequest::executable("root", profile, SessionLimits::DEFAULT),
+            &mut backend,
+        )
+        .is_err());
+        let observations = backend.observations.borrow();
+        assert!(!observations.contains(&Observation::Completed));
+        assert!(
+            observations.last()
+                == Some(&Observation::Failed {
+                    cancels: 1,
+                    // Uncommitted storage rolls back through RAII; this fixture
+                    // counts only explicit release_committed calls.
+                    releases: usize::from(reject_complete),
+                    backings: 0,
+                })
+        );
+    }
+}
+
+#[test]
+fn load_observes_snapshot_reuse_without_reopening_the_provider() {
+    let (_, profile) = super::linker::native_fixture();
+    let mut provider = Backend::new(alloc::vec![("C", native_dso(&[]))]);
+    provider.shared = true;
+    let loaded_provider = load(
+        LoadRequest::shared_object("C", profile, SessionLimits::DEFAULT),
+        &mut provider,
+    )
+    .expect("load provider");
+    let mut backend = Backend::new(alloc::vec![("root", native_dso(&["C"]))]);
+    backend.shared = true;
+    backend.tracing = true;
+    backend.sources.push("C");
+    backend
+        .ready
+        .push(loaded_provider.images().next().unwrap().clone());
+    let loaded = load(
+        LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT),
+        &mut backend,
+    )
+    .expect("reuse the published provider without its file");
+    assert_eq!(backend.opens, alloc::vec!["root"]);
+    let observations = backend.observations.borrow();
+    assert!(observations.contains(&Observation::Inspected(true)));
+    assert!(observations.contains(&Observation::Reused(b"C".to_vec())));
+    assert!(observations.contains(&Observation::Dependency(b"root".to_vec(), b"C".to_vec())));
+    drop(observations);
+    drop(loaded);
+    drop(loaded_provider);
 }
 
 #[test]
@@ -639,6 +795,7 @@ fn load_concurrent_ready_provider_replans_its_frozen_closure() {
     ]);
     backend.shared = true;
     backend.ready_after_acquire = original.images().cloned().collect();
+    backend.tracing = true;
     backend.files.retain(|(source, _)| *source != "C");
     let loaded = load(
         LoadRequest::shared_object("root", profile, SessionLimits::DEFAULT),
@@ -660,6 +817,10 @@ fn load_concurrent_ready_provider_replans_its_frozen_closure() {
     );
     assert_eq!(backend.memory.allocations.get(), 1);
     assert_eq!(backend.opens, ["root", "B", "D", "root"]);
+    assert!(backend
+        .observations
+        .borrow()
+        .contains(&Observation::Retry(1)));
 }
 
 fn native_dso(needed: &[&str]) -> Vec<u8> {

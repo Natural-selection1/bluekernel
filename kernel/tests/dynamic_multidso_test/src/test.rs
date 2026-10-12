@@ -113,11 +113,13 @@ fn multidso_namespace_vertical() {
 
 #[no_mangle]
 pub fn dynamic_multidso_test_runner(tests: &[&dyn Fn()]) {
+    blueos_dynamic_test_support::start();
     println!("Dynamic multidso test started");
     println!("Running {} tests", tests.len());
     for test in tests {
         test();
     }
+    blueos_dynamic_test_support::finish();
     println!("Dynamic multidso test ended");
 }
 

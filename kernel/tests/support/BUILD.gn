@@ -1,0 +1,33 @@
+# Copyright (c) 2026 vivo Mobile Communication Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//build/templates/build_template.gni")
+
+build_rust("dynamic_test_support") {
+  testonly = true
+  crate_name = "blueos_dynamic_test_support"
+  crate_type = "rlib"
+  edition = "2021"
+  sources = [ "src/lib.rs" ]
+  deps = [
+    "//external/vendor/semihosting-0.1.20:semihosting",
+    "//kernel/kernel:blueos",
+    "//kernel/loader:blueos_loader",
+  ]
+}
+
+run_clippy("dynamic_test_support_clippy") {
+  testonly = true
+  deps = [ ":dynamic_test_support" ]
+}

@@ -57,11 +57,13 @@ fn clang_cxx_private_dso_vertical() {
 
 #[no_mangle]
 pub fn dynamic_clang_cxx_test_runner(tests: &[&dyn Fn()]) {
+    blueos_dynamic_test_support::start();
     println!("Dynamic Clang CXX test started");
     println!("Running {} tests", tests.len());
     for test in tests {
         test();
     }
+    blueos_dynamic_test_support::finish();
     println!("Dynamic Clang CXX test ended");
 }
 

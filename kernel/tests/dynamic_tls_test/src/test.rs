@@ -57,11 +57,13 @@ fn emutls_vertical() {
 
 #[no_mangle]
 pub fn dynamic_tls_test_runner(tests: &[&dyn Fn()]) {
+    blueos_dynamic_test_support::start();
     println!("Dynamic TLS test started");
     println!("Running {} tests", tests.len());
     for test in tests {
         test();
     }
+    blueos_dynamic_test_support::finish();
     println!("Dynamic TLS test ended");
 }
 

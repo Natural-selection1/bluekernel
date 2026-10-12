@@ -252,14 +252,18 @@ impl ApplicationService {
         // is recycled together with its `Failed` slot.
         self.reaper.register(&group);
         if let Ok(handle) = result {
-            // Record the launch so the shell and QEMU checker can correlate
-            // applications, DSO generations and reaps.
-            log::info!(
-                "APP_LAUNCHED handle={}:{} path={}",
-                handle.slot,
-                handle.generation,
-                launch_path
-            );
+            let event = super::trace::Event::Launched {
+                handle,
+                path: &launch_path,
+            };
+            if !super::trace::emit(event) {
+                log::debug!(
+                    "APP_LAUNCHED handle={}:{} path={}",
+                    handle.slot,
+                    handle.generation,
+                    launch_path
+                );
+            }
         }
         result
     }

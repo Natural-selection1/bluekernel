@@ -30,6 +30,7 @@ use crate::application::{
         AcquireBatchOutcome, LoadPermit, PreparedSystemBatch, SystemCandidateBacking,
         SystemDsoLease, SystemDsoRegistry, SystemInitBatch, SystemSnapshotOutcome,
     },
+    trace,
 };
 use alloc::vec::Vec;
 use blueos_loader::{
@@ -116,6 +117,7 @@ struct KernelLoaderBackend<'a> {
     snapshots: Vec<ImageHandle>,
     batch: Option<SystemInitBatch>,
     runtime: bool,
+    trace_id: usize,
 }
 
 impl<'a> KernelLoaderBackend<'a> {
@@ -137,6 +139,7 @@ impl<'a> KernelLoaderBackend<'a> {
             snapshots: Vec::new(),
             batch: None,
             runtime,
+            trace_id: trace::new_load_id(),
         }
     }
 
@@ -371,8 +374,15 @@ impl LoaderBackend for KernelLoaderBackend<'_> {
         self.snapshots.clear();
         self.publisher.cancel();
     }
-    fn trace(&self, message: core::fmt::Arguments<'_>) {
-        log::info!("{}", message);
+    fn trace_enabled(&self) -> bool {
+        self.trace_id != 0
+    }
+    fn trace(&self, event: blueos_loader::trace::LoadEvent<'_>) {
+        trace::emit(trace::Event::Load {
+            application: self.group.handle(),
+            operation: self.trace_id,
+            event,
+        });
     }
 }
 

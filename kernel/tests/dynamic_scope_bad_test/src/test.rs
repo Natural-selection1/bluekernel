@@ -3,7 +3,7 @@
 // ASSERT-FAIL: Backtrace in Panic.*
 // ASSERT-FAIL: ASSERTION FAILED.*
 // COUNT: DSO_LOAD path=/system/lib/libc\.so\.1 == 1
-// COUNT: application prepare: link application failed: LoadError \{ stage: LinkRelocate.* == 1
+// COUNT: LOAD_FAILED error=LoadError \{ stage: LinkRelocate.* == 1
 // COUNT: APP_LAUNCHED .*scope_bad.* == 0
 
 #![no_main]
@@ -40,11 +40,13 @@ fn undefined_weak_call_is_rejected() {
 
 #[no_mangle]
 pub fn dynamic_scope_bad_test_runner(tests: &[&dyn Fn()]) {
+    blueos_dynamic_test_support::start();
     println!("Dynamic scope bad test started");
     println!("Running {} tests", tests.len());
     for test in tests {
         test();
     }
+    blueos_dynamic_test_support::finish();
     println!("Dynamic scope bad test ended");
 }
 

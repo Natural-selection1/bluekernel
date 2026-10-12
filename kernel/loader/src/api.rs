@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::fmt;
 
 pub use crate::dynamic_linker::ImageDependency;
 
@@ -29,6 +28,7 @@ use crate::{
     planning::{LoadPlan, PlannedResolver},
     profile::{LoadProfile, SessionLimits},
     reader::ElfReader,
+    trace::{ImageIds, LifecycleKind, LoadEvent, LoadPhase},
     LoadError, LoadResult,
 };
 
@@ -98,8 +98,16 @@ pub trait LoaderBackend {
     fn abort_publication(&mut self, receipt: Self::Receipt);
     /// Cancel remaining reservations and imported references on a failed load.
     fn cancel_load(&mut self) {}
-    /// Optional diagnostics; no internal graph or relocation types cross this hook.
-    fn trace(&self, _message: fmt::Arguments<'_>) {}
+    /// Opt into load observations. Disabled by default; detailed product walks
+    /// are skipped when disabled. Keep this choice stable during one load.
+    fn trace_enabled(&self) -> bool {
+        false
+    }
+    /// Synchronous, borrowed observations; no internal graph or relocation
+    /// types cross this hook. Copy fields before retaining them. The observer
+    /// must not panic or reenter loading, and must not change load ownership.
+    /// It is called outside the infallible allocation-commit operation.
+    fn trace(&self, _event: LoadEvent<'_>) {}
 }
 
 /// An opaque loaded provider. Its allocation and reference counts belong to
@@ -342,11 +350,32 @@ pub fn load<B: LoaderBackend>(
     request: LoadRequest<B::Source>,
     backend: &mut B,
 ) -> LoadResult<LoadedImage<B::Receipt>> {
+    emit(
+        backend,
+        LoadEvent::Started {
+            path: backend.identity(&request.source),
+            executable: request.role == ArtifactRole::ExecutableRoot,
+        },
+    );
     let result = load_inner(request, backend);
-    if result.is_err() {
-        backend.cancel_load();
+    match &result {
+        Ok(_) => emit(backend, LoadEvent::Completed),
+        Err(error) => {
+            backend.cancel_load();
+            emit(backend, LoadEvent::Failed { error });
+        }
     }
     result
+}
+
+pub(crate) fn emit<B: LoaderBackend>(backend: &B, event: LoadEvent<'_>) {
+    if backend.trace_enabled() {
+        backend.trace(event);
+    }
+}
+
+fn phase<B: LoaderBackend>(backend: &B, phase: LoadPhase, completed: bool) {
+    emit(backend, LoadEvent::Phase { phase, completed });
 }
 
 fn load_inner<B: LoaderBackend>(
@@ -362,13 +391,24 @@ fn load_inner<B: LoaderBackend>(
         }
     }
     let (mut plan, ready) = loop {
+        phase(backend, LoadPhase::Discover, false);
         let plan = LoadPlan::build(&request, backend)?;
+        emit(
+            backend,
+            LoadEvent::Closure {
+                images: plan.images.len(),
+                dependencies: plan.edges.len(),
+            },
+        );
+        phase(backend, LoadPhase::Discover, true);
         let sources = plan
             .images
             .iter()
             .map(|image| image.source.clone())
             .collect::<Vec<_>>();
+        phase(backend, LoadPhase::Acquire, false);
         let ready = backend.acquire(&sources, &request.existing)?;
+        phase(backend, LoadPhase::Acquire, true);
         for image in &ready {
             if image.descriptor.snapshot().profile() != request.profile {
                 return Err(LoadError::new(
@@ -390,6 +430,7 @@ fn load_inner<B: LoaderBackend>(
         // Release this whole reservation before planning its frozen closure;
         // never enlarge a batch while holding partial load permits.
         backend.cancel_load();
+        emit(backend, LoadEvent::Retry);
     };
     let mut providers = request.existing;
     providers
@@ -410,6 +451,7 @@ fn load_inner<B: LoaderBackend>(
         .collect();
     let globals = request.global.iter().map(ImageHandle::imported).collect();
     let connections = plan.connections()?;
+    phase(backend, LoadPhase::Link, false);
     let mut memory = backend.memory();
     let mut resolver = PlannedResolver {
         plan: &mut plan,
@@ -427,13 +469,16 @@ fn load_inner<B: LoaderBackend>(
         connections,
     );
     let prepared = prepare_link(request, &mut resolver, &mut memory)?;
+    phase(backend, LoadPhase::Link, true);
     let mut publisher = BackendPublisher {
         backend,
         plan: &plan,
         facts: None,
         allocations: Vec::new(),
     };
+    phase(publisher.backend, LoadPhase::Publish, false);
     let product = prepared.publish(&mut publisher)?;
+    phase(publisher.backend, LoadPhase::Publish, true);
     let mut facts = publisher
         .facts
         .take()
@@ -446,10 +491,12 @@ fn load_inner<B: LoaderBackend>(
         receipt: product.into_publication(),
         facts,
     };
+    phase(publisher.backend, LoadPhase::Install, false);
     if let Err(error) = publisher.backend.complete_load(&mut loaded) {
         publisher.backend.abort_publication(loaded.into_receipt());
         return Err(error);
     }
+    phase(publisher.backend, LoadPhase::Install, true);
     Ok(loaded)
 }
 
@@ -734,81 +781,63 @@ pub(crate) fn oom() -> LoadError {
 }
 
 fn trace_product<B: LoaderBackend>(backend: &B, product: &LinkProduct<B::Receipt>) {
+    if !backend.trace_enabled() {
+        return;
+    }
     let plans = product.lifecycle_plans();
     for (index, entry) in plans.startup().iter().enumerate() {
-        backend.trace(format_args!(
-            "LIFECYCLE_INIT index={} owner={} address={:#x}",
+        backend.trace(LoadEvent::LifecyclePlan {
+            kind: LifecycleKind::Startup,
             index,
-            entry.owner().get(),
-            entry.function().get()
-        ));
+            owner: entry.owner().get(),
+            address: entry.function().get(),
+        });
     }
     for (index, entry) in plans.group_fini().iter().enumerate() {
-        backend.trace(format_args!(
-            "LIFECYCLE_GROUP_FINI index={} owner={}",
+        backend.trace(LoadEvent::LifecyclePlan {
+            kind: LifecycleKind::GroupFini,
             index,
-            entry.owner().get()
-        ));
+            owner: entry.owner().get(),
+            address: entry.function().get(),
+        });
     }
     for plan in plans.system_fini() {
-        for entry in plan.plan().iter() {
-            backend.trace(format_args!(
-                "LIFECYCLE_SYSTEM_FINI owner={}",
-                entry.owner().get()
-            ));
+        for (index, entry) in plan.plan().iter().enumerate() {
+            backend.trace(LoadEvent::LifecyclePlan {
+                kind: LifecycleKind::SystemFini,
+                index,
+                owner: entry.owner().get(),
+                address: entry.function().get(),
+            });
         }
     }
     for edge in product.context().graph_edges() {
-        backend.trace(format_args!(
-            "LINK_EDGE requester={} provider={}",
-            edge.requester().get(),
-            edge.provider().get()
-        ));
+        backend.trace(LoadEvent::ProviderEdge {
+            requester: edge.requester().get(),
+            provider: edge.provider().get(),
+        });
     }
     for entry in product.link_map() {
-        backend.trace(format_args!(
-            "LINK_MAP owner={} soname={} bias={:#x}",
-            entry.owner().get(),
-            entry
-                .soname()
-                .map(|name| core::str::from_utf8(name.as_bytes()).unwrap_or("<non-utf8>"))
-                .unwrap_or("-"),
-            entry.load_bias().get()
-        ));
+        backend.trace(LoadEvent::Image {
+            owner: entry.owner().get(),
+            soname: entry.soname().map(|name| name.as_bytes()),
+            bias: entry.load_bias().get(),
+        });
     }
     for (group, members) in plans.sccs().iter().enumerate() {
-        struct Members<'a>(&'a [crate::dynamic_linker::ImageId]);
-        impl fmt::Debug for Members<'_> {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.debug_list()
-                    .entries(self.0.iter().map(|id| id.get()))
-                    .finish()
-            }
-        }
-        backend.trace(format_args!(
-            "LIFECYCLE_SCC group={} members={:?}",
+        backend.trace(LoadEvent::Component {
             group,
-            Members(members)
-        ));
+            members: ImageIds::new(members),
+        });
     }
     for binding in product.relocation_bindings() {
         if binding.name().is_empty() {
             continue;
         }
-        let name = core::str::from_utf8(binding.name()).unwrap_or("<non-utf8>");
-        if let Some(provider) = binding.provider() {
-            backend.trace(format_args!(
-                "SCOPE_BIND requester={} name={} provider={}",
-                binding.requester().get(),
-                name,
-                provider.get()
-            ));
-        } else {
-            backend.trace(format_args!(
-                "SCOPE_BIND requester={} name={} provider=none",
-                binding.requester().get(),
-                name
-            ));
-        }
+        backend.trace(LoadEvent::SymbolBinding {
+            requester: binding.requester().get(),
+            name: binding.name(),
+            provider: binding.provider().map(|id| id.get()),
+        });
     }
 }
