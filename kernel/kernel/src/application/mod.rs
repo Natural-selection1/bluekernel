@@ -68,6 +68,3 @@ pub mod runtime;
 pub mod seed;
 pub mod service;
 pub mod start_storage;
-
-#[cfg(test)]
-mod test_support;
