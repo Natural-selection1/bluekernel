@@ -95,6 +95,20 @@ pub struct FlatImageMemory {
 }
 
 impl FlatImageMemory {
+    #[cfg(test)]
+    pub(crate) fn allocation_containing(&self, address: usize) -> Option<ImageAllocation> {
+        self.service
+            .lock()
+            .entries
+            .iter()
+            .find(|entry| {
+                let allocation = entry.allocation;
+                let offset = (address as u64).checked_sub(allocation.base().get());
+                offset.is_some_and(|offset| offset < allocation.len())
+            })
+            .map(|entry| entry.allocation)
+    }
+
     /// Create a new shared service and return its first handle.
     ///
     /// The boot path creates exactly one service and keeps a handle alive for

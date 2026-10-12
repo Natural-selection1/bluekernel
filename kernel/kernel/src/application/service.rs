@@ -398,3 +398,198 @@ fn prepare_failed(step: &str, error: &blueos_loader::LoadError) -> ApplicationLa
     log::error!("application prepare: {step} failed: {:?}", error);
     ApplicationLaunchError::PrepareFailed
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::{
+        adapters::system_paths::SystemLibraryKey,
+        registry::SystemSnapshotOutcome,
+        test_support::{install_elf, lifecycle_elf, remove_elf, with_loader_stack},
+    };
+    use blueos_header::application::BlueOsApplicationStartInfo;
+    use blueos_test_macro::test;
+    use spin::Mutex;
+
+    static PARENT_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static CHILD_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static PARENT_RELEASE: AtomicUsize = AtomicUsize::new(0);
+    static CHILD_RELEASE: AtomicUsize = AtomicUsize::new(0);
+    static FINI_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FINI_THREAD: AtomicUsize = AtomicUsize::new(0);
+    static CHILD_HANDLE: Mutex<Option<ApplicationHandle>> = Mutex::new(None);
+
+    extern "C" fn parent_entry(info: *const BlueOsApplicationStartInfo) {
+        run_app(info, &PARENT_STARTED, &PARENT_RELEASE);
+    }
+    extern "C" fn child_entry(info: *const BlueOsApplicationStartInfo) {
+        run_app(info, &CHILD_STARTED, &CHILD_RELEASE);
+    }
+    fn run_app(
+        info: *const BlueOsApplicationStartInfo,
+        started: &AtomicUsize,
+        release: &AtomicUsize,
+    ) {
+        let service = ApplicationService::get().unwrap();
+        let id = thread::Thread::id(&scheduler::current_thread());
+        let group = service
+            .manager
+            .group_for_thread(id)
+            .expect("spawned entry belongs to its group");
+        let handle = group.handle().unwrap();
+        // Execute the start plan and report normal init/exit just as the
+        // dynamic startup runtime does, while keeping an explicit test gate.
+        let info = unsafe { &*info };
+        assert!(info.abi_version != 0);
+        for index in 0..info.init_plan.count {
+            let target = unsafe { *info.init_plan.entries.add(index) };
+            let init: extern "C" fn() = unsafe { core::mem::transmute(target) };
+            init();
+        }
+        service.complete_init(&group, handle).unwrap();
+        started.fetch_add(1, Ordering::SeqCst);
+        while release.load(Ordering::Acquire) == 0 {
+            let _ = crate::sync::atomic_wait(release, 0, Tick::from_millis(50));
+        }
+        service.manager.begin_exit(handle).unwrap();
+        group.begin_exit().unwrap();
+        assert_eq!(info.fini_plan.count, 0);
+        group.finish_fini().unwrap();
+        // A raw application entry has no return trampoline. Drop the local
+        // group reference before retiring, so deferred cleanup can reap it.
+        drop(group);
+        scheduler::retire_me();
+    }
+
+    extern "C" fn launch_child_from_fini() {
+        let service = ApplicationService::get().unwrap();
+        FINI_THREAD.store(
+            thread::Thread::id(&scheduler::current_thread()),
+            Ordering::SeqCst,
+        );
+        let path = "/apps/lifecycle/nested.elf";
+        let child = service
+            .spawn(path, alloc::vec![path.as_bytes().to_vec()], Vec::new())
+            .expect("system destructor launches an application");
+        *CHILD_HANDLE.lock() = Some(child);
+        FINI_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool, reason: &str) {
+        let deadline = crate::time::now() + core::time::Duration::from_secs(10);
+        while !condition() {
+            assert!(crate::time::now() < deadline, "{reason}");
+            let _ = crate::sync::atomic_wait(
+                &FINI_CALLS,
+                FINI_CALLS.load(Ordering::Acquire),
+                Tick::from_millis(10),
+            );
+        }
+    }
+
+    #[test]
+    fn system_destructor_spawns_an_application_and_reaper_keeps_both_children() {
+        with_loader_stack(|| {
+            for atom in [
+                &PARENT_STARTED,
+                &CHILD_STARTED,
+                &PARENT_RELEASE,
+                &CHILD_RELEASE,
+                &FINI_CALLS,
+                &FINI_THREAD,
+            ] {
+                atom.store(0, Ordering::SeqCst);
+            }
+            *CHILD_HANDLE.lock() = None;
+            let service = crate::application::runtime::init();
+            // Use the existing unloadable catalog entry. Only this test's
+            // tmpfs contains the tiny callback ELF; no production policy changes.
+            let library = service
+                .runtime_catalog()
+                .resolve_name(b"libscope_sys.so")
+                .unwrap();
+            assert!(!library.keep_cached);
+            install_elf(
+                library.path,
+                &lifecycle_elf(true, &[], None, Some(launch_child_from_fini as usize), None),
+            );
+            install_elf(
+                "/apps/lifecycle/parent.elf",
+                &lifecycle_elf(
+                    false,
+                    &[b"libscope_sys.so"],
+                    None,
+                    None,
+                    Some(parent_entry as usize),
+                ),
+            );
+            let child_elf = lifecycle_elf(false, &[], None, None, Some(child_entry as usize));
+            install_elf("/apps/lifecycle/survivor.elf", &child_elf);
+            install_elf("/apps/lifecycle/nested.elf", &child_elf);
+            let survivor = service
+                .spawn("/apps/lifecycle/survivor.elf", Vec::new(), Vec::new())
+                .unwrap();
+            wait_until(
+                || CHILD_STARTED.load(Ordering::Acquire) == 1,
+                "survivor entry did not run",
+            );
+            let parent = service
+                .spawn("/apps/lifecycle/parent.elf", Vec::new(), Vec::new())
+                .unwrap();
+            wait_until(
+                || PARENT_STARTED.load(Ordering::Acquire) == 1,
+                "parent entry did not run",
+            );
+            PARENT_RELEASE.store(1, Ordering::Release);
+            let _ = crate::sync::atomic_wake(&PARENT_RELEASE, usize::MAX);
+            wait_until(
+                || FINI_CALLS.load(Ordering::Acquire) == 1,
+                "destructor spawn blocked, possibly under the reaper pending lock",
+            );
+            wait_until(
+                || CHILD_STARTED.load(Ordering::Acquire) == 2,
+                "application spawned by destructor did not enter",
+            );
+            wait_until(
+                || !service.manager.contains(parent),
+                "parent slot was not recycled after its destructor",
+            );
+            let child = CHILD_HANDLE.lock().unwrap();
+            assert!(service.manager.contains(survivor));
+            assert!(service.manager.contains(child));
+            assert_ne!(
+                FINI_THREAD.load(Ordering::Acquire),
+                thread::Thread::id(&scheduler::current_thread()),
+                "system fini must run on the deferred reaper"
+            );
+            assert!(matches!(
+                service
+                    .loader
+                    .registry()
+                    .snapshot(SystemLibraryKey::from_bytes(library.path.as_bytes()).unwrap())
+                    .unwrap(),
+                SystemSnapshotOutcome::Vacant
+            ));
+
+            CHILD_RELEASE.store(1, Ordering::Release);
+            let _ = crate::sync::atomic_wake(&CHILD_RELEASE, usize::MAX);
+            wait_until(
+                || !service.manager.contains(child),
+                "reaper lost the group registered during fini",
+            );
+            wait_until(
+                || !service.manager.contains(survivor),
+                "reaper lost the survivor from its detached pass",
+            );
+            assert_eq!(FINI_CALLS.load(Ordering::Acquire), 1);
+            for path in [
+                library.path,
+                "/apps/lifecycle/parent.elf",
+                "/apps/lifecycle/survivor.elf",
+                "/apps/lifecycle/nested.elf",
+            ] {
+                remove_elf(path);
+            }
+        });
+    }
+}

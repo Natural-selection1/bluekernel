@@ -272,6 +272,142 @@ fn elf(shared: bool) -> Vec<u8> {
     }
     bytes
 }
+
+/// Native code tail-calls a kernel test callback, preserving the entry ABI.
+/// These ELF fixtures go through VFS, parsing, mapping and lifecycle planning;
+/// callback bodies can observe state after the real mapped code was entered.
+pub(super) fn lifecycle_elf(
+    shared: bool,
+    needed: &[&[u8]],
+    init: Option<usize>,
+    fini: Option<usize>,
+    entry: Option<usize>,
+) -> Vec<u8> {
+    let profile = super::board_dynamic_profile();
+    let mut bytes = elf(shared);
+    bytes.resize(1024, 0);
+    let thumb = usize::from(profile.entry_mode().is_thumb());
+    let mut tags = Vec::new();
+    if !needed.is_empty() {
+        let mut names = alloc::vec![0];
+        for name in needed {
+            tags.push((1, names.len() as u64)); // DT_NEEDED
+            names.extend_from_slice(name);
+            names.push(0);
+        }
+        assert!(384 + names.len() <= 448, "fixture dependency names");
+        bytes[384..384 + names.len()].copy_from_slice(&names);
+        tags.push((5, 0x1180)); // DT_STRTAB
+        tags.push((10, names.len() as u64)); // DT_STRSZ
+        tags.push((6, 0x1200)); // DT_SYMTAB: the mandatory null symbol
+        tags.push((
+            11,
+            if profile.class() == ElfClass::Elf32 {
+                16
+            } else {
+                24
+            },
+        ));
+        tags.push((4, 0x1240)); // DT_HASH: one bucket and one null-symbol chain
+        put32(&mut bytes, 576, 1);
+        put32(&mut bytes, 580, 1);
+    }
+    for (tag, at, target) in [(12, 320, init), (13, 352, fini)] {
+        if let Some(target) = target {
+            write_callback(&mut bytes[at..at + 32], target);
+            tags.push((tag, (0x1000 + at + thumb) as u64));
+        }
+    }
+    tags.push((0, 0));
+    if !shared {
+        let entry = entry.expect("an executable fixture needs its entry callback");
+        write_callback(&mut bytes[448..480], entry);
+    }
+    if profile.class() == ElfClass::Elf32 {
+        if !shared {
+            put32(&mut bytes, 24, (0x11c0 + thumb) as u32);
+        }
+        put32(&mut bytes, 68, 1024);
+        put32(&mut bytes, 72, 1024);
+        put32(&mut bytes, 100, (tags.len() * 8) as u32);
+        put32(&mut bytes, 104, (tags.len() * 8) as u32);
+        assert!(116 + tags.len() * 8 <= 320);
+        for (index, (tag, value)) in tags.into_iter().enumerate() {
+            put32(&mut bytes, 116 + index * 8, tag as u32);
+            put32(&mut bytes, 120 + index * 8, value as u32);
+        }
+    } else {
+        if !shared {
+            put64(&mut bytes, 24, (0x11c0 + thumb) as u64);
+        }
+        put64(&mut bytes, 96, 1024);
+        put64(&mut bytes, 104, 1024);
+        put64(&mut bytes, 152, (tags.len() * 16) as u64);
+        put64(&mut bytes, 160, (tags.len() * 16) as u64);
+        assert!(176 + tags.len() * 16 <= 320);
+        for (index, (tag, value)) in tags.into_iter().enumerate() {
+            put64(&mut bytes, 176 + index * 16, tag);
+            put64(&mut bytes, 184 + index * 16, value);
+        }
+    }
+    bytes
+}
+
+fn write_callback(bytes: &mut [u8], callback: usize) {
+    match super::board_dynamic_profile().machine() {
+        ElfMachine::Arm => {
+            put16(bytes, 0, 0x4b00); // ldr r3, [pc, #0]
+            put16(bytes, 2, 0x4718); // bx r3
+            put32(bytes, 4, callback as u32);
+        }
+        ElfMachine::Riscv => {
+            put32(bytes, 0, 0x0000_0297); // auipc t0, 0
+            put32(bytes, 8, 0x0002_8067); // jr t0
+            if super::board_dynamic_profile().class() == ElfClass::Elf32 {
+                put32(bytes, 4, 0x00c2_a283); // lw t0, 12(t0)
+                put32(bytes, 12, callback as u32);
+            } else {
+                put32(bytes, 4, 0x0102_b283); // ld t0, 16(t0)
+                put64(bytes, 16, callback as u64);
+            }
+        }
+        ElfMachine::Aarch64 => {
+            put32(bytes, 0, 0x5800_0050); // ldr x16, .+8
+            put32(bytes, 4, 0xd61f_0200); // br x16
+            put64(bytes, 8, callback as u64);
+        }
+        _ => unreachable!("native loader fixture architecture"),
+    }
+}
+
+pub(super) fn install_elf(path: &str, bytes: &[u8]) {
+    for (index, _) in path.match_indices('/').skip(1) {
+        let mut directory = path.as_bytes()[..index].to_vec();
+        directory.push(0);
+        let rc = unsafe { crate::vfs::syscalls::mkdir(directory.as_ptr().cast(), 0o755) };
+        assert!(rc == 0 || rc == -libc::EEXIST);
+    }
+    let mut name = path.as_bytes().to_vec();
+    name.push(0);
+    let fd = crate::vfs::syscalls::open(
+        name.as_ptr().cast(),
+        libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+        0o644,
+    );
+    assert!(fd >= 0, "install {path}");
+    assert_eq!(
+        crate::vfs::syscalls::write(fd, bytes.as_ptr(), bytes.len()),
+        bytes.len() as isize
+    );
+    assert_eq!(crate::vfs::syscalls::close(fd), 0);
+}
+
+pub(super) fn remove_elf(path: &str) {
+    let mut name = path.as_bytes().to_vec();
+    name.push(0);
+    assert_eq!(crate::vfs::syscalls::unlink(name.as_ptr().cast()), 0);
+}
+
 fn put16(bytes: &mut [u8], at: usize, value: u16) {
     bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
 }
