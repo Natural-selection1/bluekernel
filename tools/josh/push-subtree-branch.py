@@ -26,39 +26,47 @@ def main():
     parser.add_argument(
         "--source-rev",
         required=True,
-        help="Source BlueKernel commit (range end included); branch, SHA or Git expression",
+        help=
+        "Source BlueKernel commit (range end included); branch, SHA or Git expression",
     )
     parser.add_argument(
         "--source-base",
-        help="Excluded BlueKernel baseline; branch, SHA or Git expression; requires --target-base",
+        help=
+        "Excluded BlueKernel baseline; branch, SHA or Git expression; requires --target-base",
     )
-    parser.add_argument("--target-remote", required=True, help="Configured Josh remote")
+    parser.add_argument("--target-remote",
+                        required=True,
+                        help="Configured Josh remote")
     parser.add_argument("--repo", required=True, choices=PATH_MAP)
+    parser.add_argument("--target-branch",
+                        required=True,
+                        help="Child branch to update or create")
+    parser.add_argument("--repo-root",
+                        type=Path,
+                        default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--push",
+                        action="store_true",
+                        help="Actually push; default is dry-run")
+    parser.add_argument("--force",
+                        "-f",
+                        action="store_true",
+                        help="Pass --force to Josh push")
     parser.add_argument(
-        "--target-branch", required=True, help="Child branch to update or create"
-    )
-    parser.add_argument(
-        "--repo-root", type=Path, default=Path(__file__).resolve().parents[2]
-    )
-    parser.add_argument(
-        "--push", action="store_true", help="Actually push; default is dry-run"
-    )
-    parser.add_argument(
-        "--force", "-f", action="store_true", help="Pass --force to Josh push"
-    )
-    parser.add_argument(
-        "--target-base", help="Child branch to replay onto; requires --source-base"
-    )
+        "--target-base",
+        help="Child branch to replay onto; requires --source-base")
     args = parser.parse_args()
     if (args.source_base is None) != (args.target_base is None):
-        parser.error("--source-base and --target-base must be supplied together")
+        parser.error(
+            "--source-base and --target-base must be supplied together")
 
     def run(*command, capture=False, check=True):
         if not capture:
             print(f"$ {shlex.join(command)}", flush=True)
-        return subprocess.run(
-            command, cwd=args.repo_root, text=True, capture_output=capture, check=check
-        )
+        return subprocess.run(command,
+                              cwd=args.repo_root,
+                              text=True,
+                              capture_output=capture,
+                              check=check)
 
     def git(*command):
         return run("git", *command, capture=True).stdout.strip()
@@ -67,13 +75,16 @@ def main():
         count = git("rev-list", "--count", revision)
         limit = " (showing latest 20, oldest first)" if int(count) > 20 else ""
         print(f"  {label}: {count}{limit}", flush=True)
-        entries = git("log", "--reverse", "--format=%h %s", "--max-count=20", revision)
+        entries = git("log", "--reverse", "--format=%h %s", "--max-count=20",
+                      revision)
         for entry in entries.splitlines():
             print(f"    {entry}", flush=True)
 
     try:
-        if args.target_remote.startswith("-") or args.target_branch.startswith("-"):
-            raise ValueError("Remote and target branch names cannot start with '-'")
+        if args.target_remote.startswith("-") or args.target_branch.startswith(
+                "-"):
+            raise ValueError(
+                "Remote and target branch names cannot start with '-'")
         destination = f"refs/heads/{args.target_branch}"
         tracking = f"refs/remotes/{args.target_remote}/{args.target_branch}"
         export_ref = f"refs/export/{args.target_remote}/{args.target_branch}"
@@ -87,7 +98,8 @@ def main():
         )
         path = PATH_MAP[args.repo]
         if git("cat-file", "-t", f"{source_oid}:{path}") != "tree":
-            raise ValueError(f"Source revision has no subtree directory: {path}")
+            raise ValueError(
+                f"Source revision has no subtree directory: {path}")
         print(f"Source commit: {source_oid}", flush=True)
         base_oid = None
         if args.source_base is not None:
@@ -98,13 +110,13 @@ def main():
                 f"{args.source_base}^{{commit}}",
             )
             if run(
-                "git",
-                "merge-base",
-                "--is-ancestor",
-                base_oid,
-                source_oid,
-                capture=True,
-                check=False,
+                    "git",
+                    "merge-base",
+                    "--is-ancestor",
+                    base_oid,
+                    source_oid,
+                    capture=True,
+                    check=False,
             ).returncode:
                 raise ValueError(
                     "--source-base must be an ancestor of --source-rev (or the same commit)"
@@ -118,20 +130,18 @@ def main():
                 flush=True,
             )
         run("josh", "fetch", "--remote", args.target_remote)
-        exists = (
-            run(
-                "git",
-                "show-ref",
-                "--verify",
-                "--quiet",
-                tracking,
-                capture=True,
-                check=False,
-            ).returncode
-            == 0
-        )
+        exists = (run(
+            "git",
+            "show-ref",
+            "--verify",
+            "--quiet",
+            tracking,
+            capture=True,
+            check=False,
+        ).returncode == 0)
         if exists and git("cat-file", "-t", f"{tracking}:{path}") != "tree":
-            raise ValueError(f"Josh remote does not expose prefix {path}: {tracking}")
+            raise ValueError(
+                f"Josh remote does not expose prefix {path}: {tracking}")
         run("josh-filter", f"::{path}/", source_oid, "--update", export_ref)
         if base_oid is not None:
             base_ref = f"refs/export-bases/{args.target_remote}/{args.target_branch}"
@@ -141,12 +151,15 @@ def main():
             filtered_base = git("rev-parse", base_ref)
             filtered_head = git("rev-parse", export_ref)
             git("merge-base", "--is-ancestor", filtered_base, filtered_head)
-            if git("rev-parse", f"{filtered_base}^{{tree}}") != git(
-                "rev-parse", f"{onto_oid}^{{tree}}"
-            ):
-                raise ValueError("Center base files differ from child target base")
-            with tempfile.TemporaryDirectory(prefix="bluekernel-josh-export-") as worktree:
-                run("git", "worktree", "add", "--detach", worktree, filtered_head)
+            if git("rev-parse",
+                   f"{filtered_base}^{{tree}}") != git("rev-parse",
+                                                       f"{onto_oid}^{{tree}}"):
+                raise ValueError(
+                    "Center base files differ from child target base")
+            with tempfile.TemporaryDirectory(
+                    prefix="bluekernel-josh-export-") as worktree:
+                run("git", "worktree", "add", "--detach", worktree,
+                    filtered_head)
                 try:
                     run(
                         "git",
@@ -181,9 +194,7 @@ def main():
         push_command = ["josh", "push", args.target_remote, refspec]
         # Keep the current raw history when the candidate extends its projection.
         # Overriding Josh's base in that case can fold existing commits into a new one.
-        if base_oid is not None and (
-            not exists
-            or run(
+        if base_oid is not None and (not exists or run(
                 "git",
                 "merge-base",
                 "--is-ancestor",
@@ -191,8 +202,7 @@ def main():
                 export_ref,
                 capture=True,
                 check=False,
-            ).returncode
-        ):
+        ).returncode):
             push_command.extend(["--base", args.target_base])
         if args.force:
             push_command.append("--force")
@@ -201,7 +211,8 @@ def main():
         # rather than treating the prefixed center projection as the result.
         preview = run(*push_command, "--dry-run", capture=True, check=False)
         pattern = rf"^Pushing ([0-9a-f]{{40}}) to {re.escape(args.target_remote)}/{re.escape(destination)}$"
-        match = re.search(pattern, preview.stderr + preview.stdout, re.MULTILINE)
+        match = re.search(pattern, preview.stderr + preview.stdout,
+                          re.MULTILINE)
         # Successful Josh previews say "Pushed", even though no ref was pushed.
         # Show our explicit before/after summary; retain raw output on failure.
         if preview.returncode or not match:
@@ -222,9 +233,8 @@ def main():
             current = git("rev-parse", raw_ref) if exists else None
             title = "PUSH PREVIEW" if args.push else "DRY RUN"
             print(f"\n[{title}] Proposed update (not pushed yet)", flush=True)
-            print(
-                f"Target branch: {args.target_remote}/{args.target_branch}", flush=True
-            )
+            print(f"Target branch: {args.target_remote}/{args.target_branch}",
+                  flush=True)
             child_base = None
             if base_oid is not None:
                 child_base = git(
@@ -241,30 +251,24 @@ def main():
             )
             if current:
                 show_commits(
-                    f"Commits above {args.target_base}"
-                    if child_base
-                    else "Current commits absent from the proposed result",
+                    f"Commits above {args.target_base}" if child_base else
+                    "Current commits absent from the proposed result",
                     f"{child_base or candidate}..{current}",
                 )
             print(f"\nAFTER (proposed, not pushed): {candidate}", flush=True)
             show_commits(
-                f"Commits above {args.target_base}"
-                if child_base
-                else "New commits compared with the current remote",
+                f"Commits above {args.target_base}" if child_base else
+                "New commits compared with the current remote",
                 f"{child_base or current}..{candidate}"
-                if child_base or current
-                else candidate,
+                if child_base or current else candidate,
             )
             added = git(
                 "rev-list",
                 "--count",
                 f"{current}..{candidate}" if current else candidate,
             )
-            removed = (
-                git("rev-list", "--count", f"{candidate}..{current}")
-                if current
-                else "0"
-            )
+            removed = (git("rev-list", "--count", f"{candidate}..{current}")
+                       if current else "0")
             print(
                 f"\nHistory changes (compared by SHA): {added} added, {removed} removed.",
                 flush=True,
@@ -276,12 +280,10 @@ def main():
                 )
             files = f"Files: match source subtree '{path}'"
             if current:
-                same = git("rev-parse", f"{current}^{{tree}}") == candidate_tree
-                files += (
-                    "; identical to the current remote"
-                    if same
-                    else "; different from the current remote"
-                )
+                same = git("rev-parse",
+                           f"{current}^{{tree}}") == candidate_tree
+                files += ("; identical to the current remote"
+                          if same else "; different from the current remote")
             print(f"{files}.", flush=True)
         if preview.returncode:
             raise ValueError("Josh push dry-run failed; nothing was pushed")
@@ -296,14 +298,13 @@ def main():
             )
         return 0
     except (
-        subprocess.CalledProcessError,
-        OSError,
-        ValueError,
-        KeyboardInterrupt,
+            subprocess.CalledProcessError,
+            OSError,
+            ValueError,
+            KeyboardInterrupt,
     ) as error:
-        detail = (
-            error.stderr if isinstance(error, subprocess.CalledProcessError) else None
-        )
+        detail = (error.stderr if isinstance(
+            error, subprocess.CalledProcessError) else None)
         print(
             f"Push stopped: {(detail or str(error)).strip() or 'interrupted'}",
             file=sys.stderr,

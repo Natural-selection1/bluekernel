@@ -21,39 +21,42 @@ PATH_MAP = {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("--source-remote", required=True, help="Configured Josh remote")
-    parser.add_argument(
-        "--source-branch", required=True, help="Child repository branch"
-    )
+    parser.add_argument("--source-remote",
+                        required=True,
+                        help="Configured Josh remote")
+    parser.add_argument("--source-branch",
+                        required=True,
+                        help="Child repository branch")
     parser.add_argument("--repo", required=True, choices=PATH_MAP)
     parser.add_argument(
         "--target-base",
         default="main",
         help="BlueKernel mapping baseline; branch, SHA or Git expression",
     )
-    parser.add_argument(
-        "--target-branch", required=True, help="Branch to create or merge into"
-    )
-    parser.add_argument(
-        "--repo-root", type=Path, default=Path(__file__).resolve().parents[2]
-    )
+    parser.add_argument("--target-branch",
+                        required=True,
+                        help="Branch to create or merge into")
+    parser.add_argument("--repo-root",
+                        type=Path,
+                        default=Path(__file__).resolve().parents[2])
     args = parser.parse_args()
     git_dir = None
 
     def run(*command, capture=False, check=True):
         if not capture:
             print(f"$ {shlex.join(command)}", flush=True)
-        return subprocess.run(
-            command, cwd=args.repo_root, text=True, capture_output=capture, check=check
-        )
+        return subprocess.run(command,
+                              cwd=args.repo_root,
+                              text=True,
+                              capture_output=capture,
+                              check=check)
 
     def git(*command):
         return run("git", *command, capture=True).stdout.strip()
 
     def commit(revision):
-        return git(
-            "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"
-        )
+        return git("rev-parse", "--verify", "--end-of-options",
+                   f"{revision}^{{commit}}")
 
     def require_clean():
         states = (
@@ -66,36 +69,33 @@ def main():
         )
         if any((git_dir / state).exists() for state in states):  # type: ignore
             raise ValueError(
-                "Finish or abort the current Git operation before importing"
-            )
+                "Finish or abort the current Git operation before importing")
         if git("status", "--porcelain", "--untracked-files=no"):
-            raise ValueError("Commit or stash tracked changes before importing")
+            raise ValueError(
+                "Commit or stash tracked changes before importing")
 
     try:
         git_dir = Path(git("rev-parse", "--absolute-git-dir"))
         require_clean()
         if any(
-            name.startswith("-")
-            for name in (args.source_remote, args.source_branch, args.target_branch)
-        ):
+                name.startswith("-")
+                for name in (args.source_remote, args.source_branch,
+                             args.target_branch)):
             raise ValueError("Remote and branch names cannot start with '-'")
         target_ref = f"refs/heads/{args.target_branch}"
         source_ref = f"refs/remotes/{args.source_remote}/{args.source_branch}"
         git("check-ref-format", target_ref)
         git("check-ref-format", source_ref)
         base_oid = commit(args.target_base)
-        exists = (
-            run(
-                "git",
-                "show-ref",
-                "--verify",
-                "--quiet",
-                target_ref,
-                capture=True,
-                check=False,
-            ).returncode
-            == 0
-        )
+        exists = (run(
+            "git",
+            "show-ref",
+            "--verify",
+            "--quiet",
+            target_ref,
+            capture=True,
+            check=False,
+        ).returncode == 0)
         if exists:
             target_oid = commit(target_ref)
             ancestor = run(
@@ -109,17 +109,18 @@ def main():
             )
             if ancestor.returncode:
                 raise ValueError(
-                    "--target-base must be an ancestor of the existing target"
-                )
+                    "--target-base must be an ancestor of the existing target")
 
         path = PATH_MAP[args.repo]
         if git("cat-file", "-t", f"{base_oid}:{path}") != "tree":
-            raise ValueError(f"Starting revision has no subtree directory: {path}")
+            raise ValueError(
+                f"Starting revision has no subtree directory: {path}")
         print(f"Round starting commit: {base_oid}", flush=True)
         run("josh", "fetch", "--remote", args.source_remote)
         source_oid = commit(source_ref)
         if git("cat-file", "-t", f"{source_oid}:{path}") != "tree":
-            raise ValueError(f"Josh remote does not expose prefix {path}: {source_ref}")
+            raise ValueError(
+                f"Josh remote does not expose prefix {path}: {source_ref}")
 
         snapshot_ref = f"refs/import/{args.target_branch}/source/0"
         mapped_ref = f"refs/import/{args.target_branch}/mapped/0"
@@ -158,14 +159,13 @@ def main():
         print(f"\nUpdated branch: {args.target_branch}")
         return 0
     except (
-        subprocess.CalledProcessError,
-        OSError,
-        ValueError,
-        KeyboardInterrupt,
+            subprocess.CalledProcessError,
+            OSError,
+            ValueError,
+            KeyboardInterrupt,
     ) as error:
-        detail = (
-            error.stderr if isinstance(error, subprocess.CalledProcessError) else None
-        )
+        detail = (error.stderr if isinstance(
+            error, subprocess.CalledProcessError) else None)
         print(
             f"Import stopped: {(detail or str(error)).strip() or 'interrupted'}",
             file=sys.stderr,
