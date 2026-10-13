@@ -61,7 +61,7 @@ jobs:
             --arg source_repository "$SOURCE_REPOSITORY" \
             --arg source_sha "$SOURCE_SHA" \
             '{
-              event_type: "blueos-pull",
+              event_type: "bluekernel-pull",
               client_payload: {
                 source_repository: $source_repository,
                 source_sha: $source_sha
@@ -70,7 +70,7 @@ jobs:
 
           IFS=',' read -ra repositories <<< "$TARGET_REPOSITORIES"
           for repository in "${repositories[@]}"; do
-            echo "Dispatching blueos-pull to $TARGET_OWNER/$repository"
+            echo "Dispatching bluekernel-pull to $TARGET_OWNER/$repository"
             gh api \
               --method POST \
               "repos/$TARGET_OWNER/$repository/dispatches" \

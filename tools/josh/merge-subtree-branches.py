@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reverse-map a subtree branch and merge it into BlueOS."""
+"""Reverse-map a subtree branch and merge it into BlueKernel."""
 
 import argparse
 import shlex
@@ -29,7 +29,7 @@ def main():
     parser.add_argument(
         "--target-base",
         default="main",
-        help="BlueOS mapping baseline; branch, SHA or Git expression",
+        help="BlueKernel mapping baseline; branch, SHA or Git expression",
     )
     parser.add_argument(
         "--target-branch", required=True, help="Branch to create or merge into"
@@ -152,7 +152,7 @@ def main():
             "--no-ff",
             "--no-edit",
             "-m",
-            f"Import {args.source_remote}/{args.source_branch} into blueos",
+            f"Import {args.source_remote}/{args.source_branch} into bluekernel",
             mapped_oid,
         )
         print(f"\nUpdated branch: {args.target_branch}")

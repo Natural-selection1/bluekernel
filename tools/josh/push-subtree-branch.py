@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Filter a BlueOS revision and try pushing it to a child repository branch."""
+"""Filter a BlueKernel revision and try pushing it to a child repository branch."""
 
 import argparse
 import re
@@ -26,11 +26,11 @@ def main():
     parser.add_argument(
         "--source-rev",
         required=True,
-        help="Source BlueOS commit (range end included); branch, SHA or Git expression",
+        help="Source BlueKernel commit (range end included); branch, SHA or Git expression",
     )
     parser.add_argument(
         "--source-base",
-        help="Excluded BlueOS baseline; branch, SHA or Git expression; requires --target-base",
+        help="Excluded BlueKernel baseline; branch, SHA or Git expression; requires --target-base",
     )
     parser.add_argument("--target-remote", required=True, help="Configured Josh remote")
     parser.add_argument("--repo", required=True, choices=PATH_MAP)
@@ -145,7 +145,7 @@ def main():
                 "rev-parse", f"{onto_oid}^{{tree}}"
             ):
                 raise ValueError("Center base files differ from child target base")
-            with tempfile.TemporaryDirectory(prefix="blueos-josh-export-") as worktree:
+            with tempfile.TemporaryDirectory(prefix="bluekernel-josh-export-") as worktree:
                 run("git", "worktree", "add", "--detach", worktree, filtered_head)
                 try:
                     run(

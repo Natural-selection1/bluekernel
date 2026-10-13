@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: BlueOS CI
+name: BlueKernel CI
 on:
   pull_request:
     branches: [main]
@@ -21,7 +21,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: blueos-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  group: bluekernel-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
   static-checks:
@@ -108,7 +108,7 @@ jobs:
           ninja -C out/qemu_mps2_an385.debug.miri \
             kernel/allocator:check_allocator_by_miri
   gate:
-    name: BlueOS CI
+    name: BlueKernel CI
     if: ${{ always() }}
     needs: [static-checks, build, miri]
     runs-on: ubuntu-latest
