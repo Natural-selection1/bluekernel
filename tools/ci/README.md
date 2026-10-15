@@ -1,12 +1,12 @@
-# BlueOS PR CI
+# BlueKernel PR CI
 
-The root `BlueOS CI` workflow checks every pull request targeting `main`,
+The root `BlueKernel CI` workflow checks every pull request targeting `main`,
 including drafts. Each job checks out the PR's merge result and uses the existing
 `ghcr.io/vivoblueos/kernel:latest` toolchain image.
 
 The workflow runs format and license checks, 40 board build profiles, two host
 profiles, and the allocator's Miri Tree Borrows tests. Every ordinary profile
-runs `gn gen`, `ninja default`, and `ninja check_all`. The final `BlueOS CI` job
+runs `gn gen`, `ninja default`, and `ninja check_all`. The final `BlueKernel CI` job
 passes only when all jobs succeed and can be selected as a required PR check.
 
 The scripts live outside the synchronized component directories. Existing
