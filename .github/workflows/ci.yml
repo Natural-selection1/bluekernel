@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: BlueOS CI
+name: BlueKernel CI
 on:
   pull_request:
     branches: [main]
@@ -21,7 +21,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: blueos-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  group: bluekernel-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
   static-checks:
@@ -46,6 +46,34 @@ jobs:
           python3 tools/ci/check_changes.py \
             --base "$BASE_SHA" \
             --head "$HEAD_SHA"
+  build-esp32c3:
+    name: ${{ matrix.board }}.${{ matrix.build_type }}.${{ matrix.syscall_mode }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: ghcr.io/vivoblueos/kernel:latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        board: [seeed_xiao_esp32c3]
+        build_type: [debug, release]
+        syscall_mode: [swi, dsc]
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and test profile
+        env:
+          BOARD: ${{ matrix.board }}
+          BUILD_TYPE: ${{ matrix.build_type }}
+          SYSCALL_MODE: ${{ matrix.syscall_mode }}
+        run: |
+          python3 tools/ci/run_profile.py \
+            --board "$BOARD" \
+            --build-type "$BUILD_TYPE" \
+            --syscall-mode "$SYSCALL_MODE"
   build:
     name: ${{ matrix.board }}.${{ matrix.build_type }}.${{ matrix.syscall_mode }}
     runs-on: ubuntu-latest
@@ -54,19 +82,19 @@ jobs:
       image: ghcr.io/vivoblueos/kernel:latest
     strategy:
       fail-fast: false
+      max-parallel: 16
       matrix:
         board:
-          - none
+          - qemu_virt64_aarch64
+          - qemu_riscv64
+          - qemu_riscv32
           - qemu_mps2_an385
           - qemu_mps3_an547
-          - qemu_riscv64
-          - qemu_virt64_aarch64
-          - qemu_riscv32
           - gd32e507_eval
           - rk3568
           - gd32vw553_eval
-          - seeed_xiao_esp32c3
           - raspberry_pico2_cortexm
+          - none
         build_type: [debug, release]
         syscall_mode: [swi, dsc]
         exclude:
@@ -108,9 +136,9 @@ jobs:
           ninja -C out/qemu_mps2_an385.debug.miri \
             kernel/allocator:check_allocator_by_miri
   gate:
-    name: BlueOS CI
+    name: BlueKernel CI
     if: ${{ always() }}
-    needs: [static-checks, build, miri]
+    needs: [static-checks, build-esp32c3, build, miri]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
@@ -118,13 +146,16 @@ jobs:
       - name: Require every PR CI job to pass
         env:
           STATIC_CHECKS_RESULT: ${{ needs.static-checks.result }}
+          ESP32C3_BUILD_RESULT: ${{ needs.build-esp32c3.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           MIRI_RESULT: ${{ needs.miri.result }}
         run: |
           if [[ "$STATIC_CHECKS_RESULT" != "success" || \
+                "$ESP32C3_BUILD_RESULT" != "success" || \
                 "$BUILD_RESULT" != "success" || \
                 "$MIRI_RESULT" != "success" ]]; then
             echo "static-checks: $STATIC_CHECKS_RESULT"
+            echo "build-esp32c3: $ESP32C3_BUILD_RESULT"
             echo "build: $BUILD_RESULT"
             echo "miri: $MIRI_RESULT"
             exit 1

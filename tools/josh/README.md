@@ -17,7 +17,7 @@ Requires Python 3, Git, `josh`, and `josh-filter`. The verified Josh version
 is `r26.07.19`. Configure the remotes you need:
 
 ```bash
-cd /home/hegui/vivoblueos/blueos
+cd /home/hegui/vivoblueos/bluekernel
 josh remote add fork-build \
     https://github.com/Natural-selection1/build.git ':prefix=build'
 josh remote add fork-kernel \
@@ -33,7 +33,7 @@ python3 tools/josh/merge-subtree-branches.py \
     --source-branch miri/allocator \
     --repo build \
     --target-base main \
-    --target-branch blueos/miri/allocator
+    --target-branch bluekernel/miri/allocator
 ```
 
 | Parameter         | Purpose                                                  |
@@ -64,8 +64,8 @@ python3 tools/josh/merge-subtree-branches.py \
     --source-remote fork-kernel \
     --source-branch miri/allocator \
     --repo kernel \
-    --target-base blueos/miri/allocator \
-    --target-branch blueos/miri/allocator
+    --target-base bluekernel/miri/allocator \
+    --target-branch bluekernel/miri/allocator
 ```
 
 `--target-base` may name the target branch itself. The script resolves the
@@ -147,7 +147,7 @@ python3 tools/josh/push-subtree-branch.py \
 ```
 
 This is still a dry run. Add `--push` to perform the push. For a linear
-branch, use `--source-rev blueos/miri/allocator`. You can also use a SHA or a
+branch, use `--source-rev bluekernel/miri/allocator`. You can also use a SHA or a
 Git expression such as `HEAD`. `--source-base` must be an ancestor of
 `--source-rev` or the same commit, and may be a merge commit. Equal endpoints
 select an empty range. The central baseline is not chosen or recorded
@@ -193,7 +193,7 @@ To filter the selected commit's entire reachable history, supply only
 
 ```bash
 python3 tools/josh/push-subtree-branch.py \
-    --source-rev blueos/miri/allocator \
+    --source-rev bluekernel/miri/allocator \
     --target-remote fork-build \
     --repo build \
     --target-branch miri/allocator
@@ -221,7 +221,7 @@ Preview and actual push use the same Josh force option.
 
 ```bash
 python3 tools/josh/push-subtree-branch.py \
-    --source-rev blueos/miri/allocator \
+    --source-rev bluekernel/miri/allocator \
     --target-remote fork-build \
     --repo build \
     --target-branch miri/allocator \
