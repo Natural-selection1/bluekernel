@@ -20,6 +20,9 @@ PATH_MAP = {
     "librs": "librs",
 }
 
+# These files are maintained by the subtree sync automation, not developers.
+SYNC_VERSION_FILES = ("bluekernel-version", "blueos-version")
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
@@ -70,6 +73,16 @@ def main():
 
     def git(*command):
         return run("git", *command, capture=True).stdout.strip()
+
+    def check_files(left, right, message, prefix=""):
+        paths = ["."]
+        if args.source_base is not None:
+            paths.extend(f":(top,exclude,literal){prefix}{name}"
+                         for name in SYNC_VERSION_FILES)
+        differences = git("diff", "--no-ext-diff", "--no-textconv",
+                          "--name-only", left, right, "--", *paths)
+        if differences:
+            raise ValueError(f"{message}:\n{differences}")
 
     def show_commits(label, revision):
         count = git("rev-list", "--count", revision)
@@ -142,20 +155,25 @@ def main():
         if exists and git("cat-file", "-t", f"{tracking}:{path}") != "tree":
             raise ValueError(
                 f"Josh remote does not expose prefix {path}: {tracking}")
-        run("josh-filter", f"::{path}/", source_oid, "--update", export_ref)
+        export_filter = f"::{path}/"
+        if base_oid is not None:
+            # Remove marker changes before replay, including marker-only commits.
+            # Rebase then carries the target base's markers through unchanged.
+            markers = ",".join(f"::{path}/{name}"
+                               for name in SYNC_VERSION_FILES)
+            export_filter += f":exclude[{markers}]"
+        run("josh-filter", export_filter, source_oid, "--update", export_ref)
         if base_oid is not None:
             base_ref = f"refs/export-bases/{args.target_remote}/{args.target_branch}"
             onto_ref = f"refs/remotes/{args.target_remote}/{args.target_base}"
             onto_oid = git("rev-parse", "--verify", f"{onto_ref}^{{commit}}")
-            run("josh-filter", f"::{path}/", base_oid, "--update", base_ref)
+            run("josh-filter", export_filter, base_oid, "--update", base_ref)
             filtered_base = git("rev-parse", base_ref)
             filtered_head = git("rev-parse", export_ref)
             git("merge-base", "--is-ancestor", filtered_base, filtered_head)
-            if git("rev-parse",
-                   f"{filtered_base}^{{tree}}") != git("rev-parse",
-                                                       f"{onto_oid}^{{tree}}"):
-                raise ValueError(
-                    "Center base files differ from child target base")
+            check_files(filtered_base, onto_oid,
+                        "Center base files differ from child target base",
+                        f"{path}/")
             with tempfile.TemporaryDirectory(
                     prefix="bluekernel-josh-export-") as worktree:
                 run("git", "worktree", "add", "--detach", worktree,
@@ -177,7 +195,9 @@ def main():
                         filtered_base,
                     )
                     candidate = git("-C", worktree, "rev-parse", "HEAD")
-                    git("diff", "--exit-code", filtered_head, candidate)
+                    check_files(filtered_head, candidate,
+                                "Replayed files differ from filtered source",
+                                f"{path}/")
                     run("git", "update-ref", export_ref, candidate)
                 finally:
                     run(
@@ -225,10 +245,14 @@ def main():
         if match:
             candidate = match.group(1)
             candidate_tree = git("rev-parse", f"{candidate}^{{tree}}")
-            if candidate_tree != git("rev-parse", f"{source_oid}:{path}"):
-                raise ValueError(
-                    "Josh result files differ from the selected source subtree"
-                )
+            check_files(
+                f"{source_oid}:{path}", candidate_tree,
+                "Josh result files differ from the selected source subtree")
+            if base_oid is not None:
+                # Verify Josh's reverse mapping also preserves the target markers.
+                git("diff", "--no-ext-diff", "--no-textconv", "--exit-code",
+                    f"{onto_oid}:{path}", candidate_tree, "--",
+                    *(f":(top,literal){name}" for name in SYNC_VERSION_FILES))
             raw_ref = f"refs/josh/remotes/{args.target_remote}/{args.target_branch}"
             current = git("rev-parse", raw_ref) if exists else None
             title = "PUSH PREVIEW" if args.push else "DRY RUN"
@@ -279,6 +303,9 @@ def main():
                     flush=True,
                 )
             files = f"Files: match source subtree '{path}'"
+            if base_oid is not None:
+                files += (" except sync version files "
+                          "(preserved from target base)")
             if current:
                 same = git("rev-parse",
                            f"{current}^{{tree}}") == candidate_tree

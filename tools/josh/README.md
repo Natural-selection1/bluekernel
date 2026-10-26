@@ -155,9 +155,14 @@ automatically.
 
 `--target-base` explicitly selects the child branch that receives the replay,
 usually the PR's target branch. The selected subtree of the central
-`--source-base` must contain the same files as the child's `--target-base`.
+`--source-base` must contain the same files as the child's `--target-base`,
+except for the automation-managed `bluekernel-version` and legacy
+`blueos-version` files at the child repository root. Range mode filters out
+changes to these files before replay, including commits that only change
+them, and preserves their contents or absence from the child's `--target-base`.
+Child repositories using the legacy filename do not need to migrate first.
 Only then does the script rebase the filtered range onto the child baseline,
-verify that the final files are unchanged, and attempt the push. The two
+verify that all other final files are unchanged, and attempt the push. The two
 baselines are independent and need not share a name. The `--target-base`
 branch itself is not modified.
 
@@ -260,12 +265,16 @@ missing, the script returns an error without performing an actual push.
 Without `--force`, a normal push rejects non-fast-forward updates.
 
 The script checks whether the actual Josh candidate's files match the
-selected source directory. A mismatch returns an error without performing
-an actual push. This check depends on the candidate SHA output line above.
+selected source directory. In range mode, `bluekernel-version` and
+`blueos-version` must instead match the target base, including whether each
+file exists. A mismatch returns
+an error without performing an actual push. This check depends on the
+candidate SHA output line above.
 The selected child directory must exist in the source commit.
 
-Using only `--source-rev` preserves the entire reachable history. A SHA
-selects a branch tip, not a commit range. Central import merges and old sync
+Using only `--source-rev` preserves the entire reachable history, including
+sync version files and their changes. A SHA selects a branch tip, not a
+commit range. Central import merges and old sync
 commits may also appear in the exported history. To exclude that old
 history, explicitly supply `--source-base` and `--target-base`; force does
 not identify business boundaries automatically. Range commits that do not
